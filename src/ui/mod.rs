@@ -2,4 +2,5 @@
 
 pub mod actions;
 pub mod nav;
+pub mod shell;
 pub mod style;
