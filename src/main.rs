@@ -7,6 +7,12 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+mod engine;
+
+use engine::geometry::*;
+use engine::session::*;
+use engine::zoom::*;
 use std::rc::Rc;
 
 use gtk::gdk;
@@ -15,15 +21,12 @@ use gtk::{gio, glib};
 
 const APP_ID: &str = "com.example.VisorPdf";
 const WINDOW_TITLE: &str = "Visor PDF";
-const PAGE_GAP: i32 = 12;
 const PAGE_LABEL_EMPTY: &str = "—";
 /// Navigation history is bounded so a long session cannot grow it forever.
 const HISTORY_LIMIT: usize = 100;
 /// Upper bound on highlighted search hits, so one common word cannot make the
 /// search or the highlight rendering explode.
 const SEARCH_HIT_LIMIT: usize = 300;
-/// How many recently opened files are remembered.
-const RECENT_LIMIT: usize = 8;
 /// Width of the thumbnails in the side panel, in logical pixels.
 const THUMB_WIDTH: i32 = 120;
 /// Interface scale steps, independent of the document zoom.
@@ -79,15 +82,6 @@ entry.page-number > text {
 .paper { background: #ffffff; }
 .paper-dark { background: #000000; }
 ";
-
-/// Discrete zoom levels, smallest first. 1.0 draws the page at its point size.
-const ZOOM_STEPS: [f64; 8] = [0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
-const ZOOM_DEFAULT: f64 = 1.0;
-
-/// Accumulated scroll delta needed before one zoom step, so a trackpad gesture
-/// does not change the zoom on every event while a single mouse-wheel notch
-/// (delta 0.5 or 1.0 depending on the toolkit) still counts as one step.
-const SCROLL_ZOOM_THRESHOLD: f64 = 0.5;
 
 /// Cairo's `ARGB32` is native-endian premultiplied BGRA on little-endian hosts.
 /// Declaring it explicitly keeps GDK's channel interpretation aligned.
@@ -189,51 +183,6 @@ fn install_viewer(
     });
 
     owner
-}
-
-/// Next larger zoom step, clamped at the top of `ZOOM_STEPS`.
-fn next_zoom(current: f64) -> f64 {
-    ZOOM_STEPS
-        .iter()
-        .copied()
-        .find(|step| *step > current + f64::EPSILON)
-        .unwrap_or(ZOOM_STEPS[ZOOM_STEPS.len() - 1])
-}
-
-/// Next smaller zoom step, clamped at the bottom of `ZOOM_STEPS`.
-fn previous_zoom(current: f64) -> f64 {
-    ZOOM_STEPS
-        .iter()
-        .rev()
-        .copied()
-        .find(|step| *step < current - f64::EPSILON)
-        .unwrap_or(ZOOM_STEPS[0])
-}
-
-/// Turns accumulated Ctrl+scroll motion into at most one zoom step.
-///
-/// Returns the new accumulator and, when the threshold was crossed, the
-/// direction: `-1` zoom in, `1` zoom out. A direction change discards the
-/// leftover so opposite gestures never cancel each other.
-fn scroll_zoom_step(accumulated: f64, dy: f64) -> (f64, Option<i8>) {
-    if dy == 0.0 {
-        return (accumulated, None);
-    }
-
-    let same_direction = accumulated == 0.0 || accumulated.signum() == dy.signum();
-    let total = if same_direction { accumulated + dy } else { dy };
-
-    if total.abs() < SCROLL_ZOOM_THRESHOLD {
-        (total, None)
-    } else if total > 0.0 {
-        (0.0, Some(1))
-    } else {
-        (0.0, Some(-1))
-    }
-}
-
-fn zoom_text(zoom: f64) -> String {
-    format!("{:.0} %", zoom * 100.0)
 }
 
 fn display_name(path: &Path) -> String {
@@ -2902,163 +2851,6 @@ impl Viewer {
     }
 }
 
-/// Last page whose top edge is at or above `position`, i.e. the page covering the
-/// middle of the viewport.
-/// Vertical layout of the rendered pages: normally one page per row, two when
-/// the spread view is on. Everything that needs page geometry asks here, so the
-/// single- and two-page views share one model.
-#[derive(Default)]
-struct PageLayout {
-    rows: Vec<PageRow>,
-    /// Row index for every page, parallel to the page sizes.
-    row_of_page: Vec<usize>,
-}
-
-struct PageRow {
-    height: f64,
-    pages: Vec<usize>,
-}
-
-impl PageLayout {
-    fn build(sizes: &[(f64, f64)], zoom: f64, spread: bool, cover_alone: bool) -> Self {
-        let mut layout = PageLayout::default();
-        let per_row = if spread { 2 } else { 1 };
-
-        // With a separate cover the first row holds page 1 alone and the pairs
-        // start after it, like a printed book.
-        let mut pending = 0usize;
-        if spread && cover_alone && !sizes.is_empty() {
-            pending = 1;
-            let height = (sizes[0].1 * zoom).ceil();
-            layout.row_of_page.push(0);
-            layout.rows.push(PageRow {
-                height,
-                pages: vec![0],
-            });
-        }
-
-        for start in (pending..sizes.len()).step_by(per_row) {
-            let pages: Vec<usize> = (start..(start + per_row).min(sizes.len())).collect();
-            let height = pages
-                .iter()
-                .map(|page| (sizes[*page].1 * zoom).ceil())
-                .fold(0.0_f64, f64::max);
-
-            let row = layout.rows.len();
-            for _ in &pages {
-                layout.row_of_page.push(row);
-            }
-            layout.rows.push(PageRow { height, pages });
-        }
-        layout
-    }
-
-    fn page_count(&self) -> usize {
-        self.row_of_page.len()
-    }
-
-    fn row_offset(&self, row: usize) -> f64 {
-        let gap = f64::from(PAGE_GAP);
-        gap + self
-            .rows
-            .iter()
-            .take(row)
-            .map(|row| row.height + gap)
-            .sum::<f64>()
-    }
-
-    fn page_offset(&self, page: usize) -> f64 {
-        self.row_of_page
-            .get(page)
-            .map(|row| self.row_offset(*row))
-            .unwrap_or(0.0)
-    }
-
-    fn row_height(&self, page: usize) -> f64 {
-        self.row_of_page
-            .get(page)
-            .and_then(|row| self.rows.get(*row))
-            .map(|row| row.height)
-            .unwrap_or(0.0)
-    }
-
-    /// First page of the row that covers `position`.
-    fn page_at(&self, position: f64) -> usize {
-        let mut page = 0;
-        for row in 0..self.rows.len() {
-            if position >= self.row_offset(row) {
-                page = self.rows[row].pages.first().copied().unwrap_or(0);
-            } else {
-                break;
-            }
-        }
-        page
-    }
-
-    fn max_row_height(&self) -> f64 {
-        self.rows.iter().map(|row| row.height).fold(0.0, f64::max)
-    }
-}
-
-/// Vertical offset of a page inside the scrolled content: outer margin plus every
-/// previous page and its gap.
-/// What survives between runs: last file, where the reader was, recent files.
-#[derive(Default)]
-struct Session {
-    last: Option<PathBuf>,
-    page: usize,
-    zoom: f64,
-    recent: Vec<PathBuf>,
-}
-
-fn state_file() -> PathBuf {
-    glib::user_config_dir().join("visor_pdf").join("state.txt")
-}
-
-fn load_session() -> Session {
-    let mut session = Session {
-        zoom: ZOOM_DEFAULT,
-        ..Session::default()
-    };
-    let Ok(text) = std::fs::read_to_string(state_file()) else {
-        return session;
-    };
-
-    for line in text.lines() {
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        match key {
-            "last" => session.last = Some(PathBuf::from(value)),
-            "page" => session.page = value.parse().unwrap_or(0),
-            "zoom" => session.zoom = value.parse().unwrap_or(ZOOM_DEFAULT),
-            "recent" => session.recent.push(PathBuf::from(value)),
-            _ => {}
-        }
-    }
-    session
-}
-
-fn save_session(session: &Session) {
-    let path = state_file();
-    if let Some(parent) = path.parent()
-        && std::fs::create_dir_all(parent).is_err()
-    {
-        return;
-    }
-
-    let mut text = String::new();
-    if let Some(last) = &session.last {
-        text.push_str(&format!("last={}\n", last.display()));
-    }
-    text.push_str(&format!("page={}\n", session.page));
-    text.push_str(&format!("zoom={}\n", session.zoom));
-    for file in &session.recent {
-        text.push_str(&format!("recent={}\n", file.display()));
-    }
-    let _ = std::fs::write(path, text);
-}
-
 /// A page in the document: a fixed-size placeholder that holds a rasterized
 /// texture only while it is near the viewport.
 /// One drag selection, in PDF points, on a single page.
@@ -3373,60 +3165,6 @@ fn render_page(
     Ok((texture.upcast(), out_width, out_height))
 }
 
-/// Width in points of the widest row: one page, or two plus the gap between
-/// them when the spread view is on, honouring a separate cover page.
-fn widest_row_width(sizes: &[(f64, f64)], spread: bool, cover_alone: bool) -> f64 {
-    if sizes.is_empty() {
-        return 0.0;
-    }
-
-    let gap = f64::from(PAGE_GAP);
-    let per_row = if spread { 2 } else { 1 };
-    let mut index = 0usize;
-    let mut widest = 0.0_f64;
-
-    if spread && cover_alone {
-        widest = sizes[0].0;
-        index = 1;
-    }
-
-    while index < sizes.len() {
-        let count = per_row.min(sizes.len() - index);
-        let row_width = sizes[index..index + count]
-            .iter()
-            .map(|(width, _)| *width)
-            .sum::<f64>()
-            + gap * (count as f64 - 1.0);
-        widest = widest.max(row_width);
-        index += count;
-    }
-    widest
-}
-
-/// Maps a point from PDF space to the rotated view space.
-fn forward_rotation(point: (f64, f64), page: (f64, f64), rotation: i32) -> (f64, f64) {
-    let (x, y) = point;
-    let (width, height) = page;
-    match rotation.rem_euclid(360) {
-        90 => (height - y, x),
-        180 => (width - x, height - y),
-        270 => (y, width - x),
-        _ => (x, y),
-    }
-}
-
-/// Inverse of `forward_rotation`: view space back to PDF space.
-fn inverse_rotation(point: (f64, f64), page: (f64, f64), rotation: i32) -> (f64, f64) {
-    let (x, y) = point;
-    let (width, height) = page;
-    match rotation.rem_euclid(360) {
-        90 => (y, height - x),
-        180 => (width - x, height - y),
-        270 => (width - y, x),
-        _ => (x, y),
-    }
-}
-
 /// Poppler rectangle for a selection: `(x1, y1)` is the anchor and `(x2, y2)`
 /// the current end of the drag.
 fn selection_rectangle(selection: Selection) -> poppler::ffi::PopplerRectangle {
@@ -3500,36 +3238,6 @@ unsafe fn selected_text(
     Some(unsafe { glib::GString::from_glib_full(text) }.to_string())
 }
 
-/// Applies the view rotation around the page origin, so the drawn page fills the
-/// surface. Shared by on-screen rendering and printing.
-fn apply_rotation(context: &cairo::Context, size: (f64, f64), rotation: i32) {
-    let (width, height) = size;
-    match rotation.rem_euclid(360) {
-        90 => {
-            context.translate(height, 0.0);
-            context.rotate(std::f64::consts::FRAC_PI_2);
-        }
-        180 => {
-            context.translate(width, height);
-            context.rotate(std::f64::consts::PI);
-        }
-        270 => {
-            context.translate(0.0, width);
-            context.rotate(-std::f64::consts::FRAC_PI_2);
-        }
-        _ => {}
-    }
-}
-
-/// Page size after applying the view rotation: 90° and 270° swap the axes.
-fn oriented_size(size: (f64, f64), rotation: i32) -> (f64, f64) {
-    if rotation.rem_euclid(180) == 90 {
-        (size.1, size.0)
-    } else {
-        size
-    }
-}
-
 fn show_error(parent: &impl IsA<gtk::Window>, message: &str, detail: &str) {
     let builder = gtk::AlertDialog::builder().modal(true).message(message);
     let dialog = if detail.is_empty() {
@@ -3598,36 +3306,6 @@ trailer\n<< /Root 1 0 R /Size 5 >>\n%%EOF\n";
 
         assert_eq!((width_pt, height_pt), (200.0, 100.0));
         assert_eq!((texture.width(), texture.height()), (400, 200));
-    }
-
-    #[test]
-    fn zoom_steps_advance_one_level_and_clamp() {
-        assert_eq!(next_zoom(1.0), 1.5);
-        assert_eq!(next_zoom(1.5), 2.0);
-        assert_eq!(next_zoom(6.0), 6.0, "top step must clamp");
-        assert_eq!(previous_zoom(1.0), 0.75);
-        assert_eq!(previous_zoom(0.75), 0.5);
-        assert_eq!(previous_zoom(0.5), 0.5, "bottom step must clamp");
-    }
-
-    #[test]
-    fn scroll_zoom_accumulates_and_discards_on_direction_change() {
-        // Below the threshold: only the accumulator moves.
-        assert_eq!(scroll_zoom_step(0.0, 0.4), (0.4, None));
-        // Crossing the threshold fires exactly one step and resets.
-        assert_eq!(scroll_zoom_step(0.4, 0.6), (0.0, Some(1)));
-        assert_eq!(scroll_zoom_step(0.0, -1.0), (0.0, Some(-1)));
-        // Opposite direction discards the leftover instead of cancelling it.
-        assert_eq!(scroll_zoom_step(0.7, -0.2), (-0.2, None));
-        // Zero deltas never step.
-        assert_eq!(scroll_zoom_step(0.7, 0.0), (0.7, None));
-    }
-
-    #[test]
-    fn zoom_text_is_a_percentage() {
-        assert_eq!(zoom_text(1.0), "100 %");
-        assert_eq!(zoom_text(0.5), "50 %");
-        assert_eq!(zoom_text(1.5), "150 %");
     }
 
     /// `open_document` must build a file URI: poppler-glib rejects bare paths.
