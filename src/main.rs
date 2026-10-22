@@ -162,7 +162,7 @@ fn install_viewer(
 
     app.connect_activate(move |app| {
         let viewer = Viewer::new(app);
-        viewer.window.present();
+        viewer.ui.window.present();
         if let Some(path) = initial.as_ref() {
             viewer.open_reporting(path);
         } else {
@@ -171,7 +171,7 @@ fn install_viewer(
 
         // Persist the reading position when the window goes away.
         let weak = Rc::downgrade(&viewer);
-        viewer.window.connect_close_request(move |_| {
+        viewer.ui.window.connect_close_request(move |_| {
             if let Some(viewer) = weak.upgrade() {
                 viewer.save_state();
             }
@@ -194,6 +194,19 @@ fn display_name(path: &Path) -> String {
 /// Held behind `Rc`: signal handlers keep only `Weak` references, because the
 /// window owns the widgets that own those handlers (strong refs would cycle).
 struct Viewer {
+    ui: UiHandles,
+    doc: DocumentState,
+    view: ViewState,
+    nav: NavigationState,
+    search: SearchState,
+    sel: SelectionState,
+    input: InteractionState,
+    /// Weak handle to self, so methods can build long-lived closures.
+    me: RefCell<std::rc::Weak<Viewer>>,
+}
+
+/// Widgets and models the viewer owns.
+struct UiHandles {
     window: gtk::ApplicationWindow,
     pages: gtk::Box,
     scroller: gtk::ScrolledWindow,
@@ -202,76 +215,81 @@ struct Viewer {
     /// One entry per navigation bar: the controls appear twice (toolbar centre
     /// and bottom bar), so all of them must stay in sync.
     navs: Vec<NavBar>,
-    document: RefCell<Option<poppler::Document>>,
-    zoom: Cell<f64>,
-    scroll_delta: Cell<f64>,
-    /// Row geometry of the rendered pages, single or two-page per row.
-    layout: RefCell<PageLayout>,
-    /// Zero-based page the reader is on. Explicit state, not derived: when the
-    /// whole document fits the viewport there is nothing to scroll, and a
-    /// viewport-centre guess would always resolve to the last page.
-    current: Cell<usize>,
-    /// One placeholder per page. Only the slots near the viewport own a
-    /// texture, so a 666-page document does not rasterize 666 pages.
-    slots: RefCell<Vec<PageSlot>>,
-    /// Page size in points per rendered page (logical size at zoom 1.0), used
-    /// by fit-to-width and fit-to-page.
-    page_sizes: RefCell<Vec<(f64, f64)>>,
-    /// Navigation history and the cursor inside it.
-    history: RefCell<Vec<usize>>,
-    history_pos: Cell<usize>,
-    dark_mode: Cell<bool>,
-    /// View rotation in degrees: 0, 90, 180 or 270.
-    rotation: Cell<i32>,
-    /// Presentation mode hides the chrome and goes fullscreen.
-    presentation: Cell<bool>,
-    /// Widgets hidden while presenting (menu bar, toolbar, bottom bar).
+    /// Widgets hidden while presenting.
     chrome: Vec<gtk::Widget>,
-    /// Search field in the toolbar, and the hits of the last search keyed by
-    /// page index (rectangles in PDF points).
     search_entry: gtk::Entry,
-    search_hits: RefCell<HashMap<i32, Vec<(f64, f64, f64, f64)>>>,
-    /// Pages with hits, in search order, plus the cursor over them.
-    search_hit_pages: RefCell<Vec<usize>>,
-    search_cursor: Cell<usize>,
     search_status: gtk::Label,
-    search_epoch: Cell<u32>,
-    /// Current drag selection and its per-line rectangles (PDF points).
-    selection: RefCell<Option<Selection>>,
-    selection_rects: RefCell<Vec<(f64, f64, f64, f64)>>,
-    selection_start: Cell<Option<(f64, f64)>>,
-    /// Weak handle to self, so methods can build long-lived closures.
-    me: RefCell<std::rc::Weak<Viewer>>,
-    /// Watches the open file so external changes can be announced.
-    file_monitor: RefCell<Option<gio::FileMonitor>>,
-    /// Thumbnail side panel and its model.
     sidebar: gtk::ScrolledWindow,
     thumbs_store: gio::ListStore,
     thumbs_selection: gtk::SingleSelection,
-    /// `(page_count, spread, cover_alone)` of the last full widget build. When
-    /// it matches, a zoom or rotation only has to resize the existing widgets
-    /// instead of destroying and recreating hundreds of them.
+    scale_provider: gtk::CssProvider,
+}
+
+/// The open document and everything derived from it.
+struct DocumentState {
+    document: RefCell<Option<poppler::Document>>,
+    current_path: RefCell<Option<PathBuf>>,
+    recent: RefCell<Vec<PathBuf>>,
+    /// Row geometry of the rendered pages, single or two-page per row.
+    layout: RefCell<PageLayout>,
+    /// Page size in points per rendered page, used by fit-to-width/page.
+    page_sizes: RefCell<Vec<(f64, f64)>>,
+    /// One placeholder per page. Only the slots near the viewport own a
+    /// texture, so a 666-page document does not rasterize 666 pages.
+    slots: RefCell<Vec<PageSlot>>,
+    /// `(page_count, spread, cover_alone)` of the last full widget build.
     structure: RefCell<(usize, bool, bool)>,
+    /// Watches the open file so external changes can be announced.
+    file_monitor: RefCell<Option<gio::FileMonitor>>,
+}
+
+/// How the document is presented.
+struct ViewState {
+    zoom: Cell<f64>,
+    scroll_delta: Cell<f64>,
+    /// View rotation in degrees: 0, 90, 180 or 270.
+    rotation: Cell<i32>,
+    spread: Cell<bool>,
+    cover_alone: Cell<bool>,
+    dark_mode: Cell<bool>,
+    ui_scale: Cell<usize>,
+    /// Presentation mode hides the chrome and goes fullscreen.
+    presentation: Cell<bool>,
+}
+
+/// Where the reader is, and the history of where they were.
+struct NavigationState {
+    /// Zero-based page the reader is on. Explicit state, not derived: when the
+    /// whole document fits the viewport there is nothing to scroll.
+    current: Cell<usize>,
+    history: RefCell<Vec<usize>>,
+    history_pos: Cell<usize>,
+}
+
+/// Last search: hits by page, the pages with hits, and the cursor over them.
+struct SearchState {
+    search_hits: RefCell<HashMap<i32, Vec<(f64, f64, f64, f64)>>>,
+    search_hit_pages: RefCell<Vec<usize>>,
+    search_cursor: Cell<usize>,
+    search_epoch: Cell<u32>,
+}
+
+/// Current drag selection and its per-line rectangles (PDF points).
+struct SelectionState {
+    selection: RefCell<Option<Selection>>,
+    selection_rects: RefCell<Vec<(f64, f64, f64, f64)>>,
+    selection_start: Cell<Option<(f64, f64)>>,
+}
+
+/// Transient interaction state.
+struct InteractionState {
+    hand_mode: Cell<bool>,
+    drag_origin: Cell<(f64, f64)>,
     /// Guards selection <-> page synchronisation against feedback loops.
     thumb_sync: Cell<bool>,
     /// Set when a view change reshapes the viewport: the zoom is refitted once
-    /// the new width is known, not before.
+    /// the new width is known.
     refit_pending: Cell<bool>,
-    /// Recently opened files, most recent first.
-    recent: RefCell<Vec<PathBuf>>,
-    /// Last opened file, for reload and the properties dialog.
-    current_path: RefCell<Option<PathBuf>>,
-    /// Interface scale: a CSS provider rewritten on demand, plus its step.
-    scale_provider: gtk::CssProvider,
-    ui_scale: Cell<usize>,
-    /// Two-page view: pages are laid out in rows of two.
-    spread: Cell<bool>,
-    /// In the two-page view, show the first page alone.
-    cover_alone: Cell<bool>,
-    /// Space toggles the hand tool: while active, dragging pans the view.
-    hand_mode: Cell<bool>,
-    /// Scroll offsets captured when a hand drag starts.
-    drag_origin: Cell<(f64, f64)>,
 }
 
 impl Viewer {
@@ -404,65 +422,78 @@ impl Viewer {
         }
 
         let viewer = Rc::new(Self {
-            window,
-            pages,
-            scroller,
-            title,
-            zoom_label,
-            navs: vec![toolbar_nav, bottom_nav],
-            document: RefCell::new(None),
-            zoom: Cell::new(ZOOM_DEFAULT),
-            scroll_delta: Cell::new(0.0),
-            slots: RefCell::new(Vec::new()),
-            layout: RefCell::new(PageLayout::default()),
-            spread: Cell::new(false),
-            cover_alone: Cell::new(false),
-            scale_provider: scale_provider.clone(),
-            ui_scale: Cell::new(UI_SCALE_DEFAULT),
-            page_sizes: RefCell::new(Vec::new()),
-            history: RefCell::new(Vec::new()),
-            history_pos: Cell::new(0),
-            dark_mode: Cell::new(false),
-            current: Cell::new(0),
-            rotation: Cell::new(0),
-            presentation: Cell::new(false),
-            // The header bar is part of the chrome: swapping the titlebar on a
-            // realized window is unsupported (GTK warns), so it is hidden
-            // instead of replaced.
-            chrome: vec![
-                menu_bar.clone().upcast(),
-                toolbar.clone().upcast(),
-                bottom_bar.upcast(),
-                header.clone().upcast(),
-                sidebar.clone().upcast(),
-            ],
-            sidebar: sidebar.clone(),
-            thumbs_store: thumbs_store.clone(),
-            thumbs_selection: thumbs_selection.clone(),
-            structure: RefCell::new((0, false, false)),
-            thumb_sync: Cell::new(false),
-            refit_pending: Cell::new(false),
-            search_entry: search_entry.clone(),
-            search_hits: RefCell::new(HashMap::new()),
-            search_hit_pages: RefCell::new(Vec::new()),
-            search_cursor: Cell::new(0),
-            search_status: search_status.clone(),
-            file_monitor: RefCell::new(None),
-            selection: RefCell::new(None),
-            selection_rects: RefCell::new(Vec::new()),
-            selection_start: Cell::new(None),
+            ui: UiHandles {
+                window,
+                pages,
+                scroller,
+                title,
+                zoom_label,
+                navs: vec![toolbar_nav, bottom_nav],
+                // The header bar is part of the chrome: swapping the titlebar on
+                // a realized window is unsupported, so it is hidden instead.
+                chrome: vec![
+                    menu_bar.clone().upcast(),
+                    toolbar.clone().upcast(),
+                    bottom_bar.upcast(),
+                    header.clone().upcast(),
+                    sidebar.clone().upcast(),
+                ],
+                search_entry: search_entry.clone(),
+                search_status: search_status.clone(),
+                sidebar: sidebar.clone(),
+                thumbs_store: thumbs_store.clone(),
+                thumbs_selection: thumbs_selection.clone(),
+                scale_provider: scale_provider.clone(),
+            },
+            doc: DocumentState {
+                document: RefCell::new(None),
+                current_path: RefCell::new(None),
+                recent: RefCell::new(load_session().recent),
+                layout: RefCell::new(PageLayout::default()),
+                page_sizes: RefCell::new(Vec::new()),
+                slots: RefCell::new(Vec::new()),
+                structure: RefCell::new((0, false, false)),
+                file_monitor: RefCell::new(None),
+            },
+            view: ViewState {
+                zoom: Cell::new(ZOOM_DEFAULT),
+                scroll_delta: Cell::new(0.0),
+                rotation: Cell::new(0),
+                spread: Cell::new(false),
+                cover_alone: Cell::new(false),
+                dark_mode: Cell::new(false),
+                ui_scale: Cell::new(UI_SCALE_DEFAULT),
+                presentation: Cell::new(false),
+            },
+            nav: NavigationState {
+                current: Cell::new(0),
+                history: RefCell::new(Vec::new()),
+                history_pos: Cell::new(0),
+            },
+            search: SearchState {
+                search_hits: RefCell::new(HashMap::new()),
+                search_hit_pages: RefCell::new(Vec::new()),
+                search_cursor: Cell::new(0),
+                search_epoch: Cell::new(0),
+            },
+            sel: SelectionState {
+                selection: RefCell::new(None),
+                selection_rects: RefCell::new(Vec::new()),
+                selection_start: Cell::new(None),
+            },
+            input: InteractionState {
+                hand_mode: Cell::new(false),
+                drag_origin: Cell::new((0.0, 0.0)),
+                thumb_sync: Cell::new(false),
+                refit_pending: Cell::new(false),
+            },
             me: RefCell::new(std::rc::Weak::new()),
-            search_epoch: Cell::new(0),
-            current_path: RefCell::new(None),
-            recent: RefCell::new(load_session().recent),
-            hand_mode: Cell::new(false),
-            drag_origin: Cell::new((0.0, 0.0)),
         });
 
         *viewer.me.borrow_mut() = Rc::downgrade(&viewer);
         Self::connect_click(&viewer, &zoom_in_button, |viewer| viewer.zoom_in());
         Self::connect_click(&viewer, &zoom_out_button, |viewer| viewer.zoom_out());
-        for index in 0..viewer.navs.len() {
+        for index in 0..viewer.ui.navs.len() {
             Self::install_nav(&viewer, index);
         }
         let weak = Rc::downgrade(&viewer);
@@ -556,7 +587,7 @@ impl Viewer {
                 let Some(viewer) = weak.upgrade() else {
                     return;
                 };
-                if viewer.thumb_sync.get() {
+                if viewer.input.thumb_sync.get() {
                     return;
                 }
                 let index = selection.selected() as usize;
@@ -579,6 +610,7 @@ impl Viewer {
     fn install_page_sync(viewer: &Rc<Self>) {
         let weak = Rc::downgrade(viewer);
         viewer
+            .ui
             .scroller
             .vadjustment()
             .connect_value_changed(move |_| {
@@ -590,7 +622,7 @@ impl Viewer {
 
         // Viewport resized: the visible range changed without scrolling.
         let weak = Rc::downgrade(viewer);
-        viewer.scroller.vadjustment().connect_changed(move |_| {
+        viewer.ui.scroller.vadjustment().connect_changed(move |_| {
             if let Some(viewer) = weak.upgrade() {
                 viewer.refresh_visible();
             }
@@ -599,11 +631,11 @@ impl Viewer {
         // The horizontal adjustment carries the viewport width, so this is where
         // a pending refit (show/hide thumbnails) can measure the new space.
         let weak = Rc::downgrade(viewer);
-        viewer.scroller.hadjustment().connect_changed(move |_| {
+        viewer.ui.scroller.hadjustment().connect_changed(move |_| {
             let Some(viewer) = weak.upgrade() else {
                 return;
             };
-            if viewer.refit_pending.replace(false) {
+            if viewer.input.refit_pending.replace(false) {
                 viewer.refit_view();
             }
         });
@@ -613,12 +645,12 @@ impl Viewer {
     /// content is taller than the viewport; otherwise scrolling cannot move and
     /// the page chosen with the buttons stays authoritative.
     fn sync_from_scroll(&self) {
-        let adjustment = self.scroller.vadjustment();
+        let adjustment = self.ui.scroller.vadjustment();
         if adjustment.upper() > adjustment.page_size() + 0.5 {
             let middle = adjustment.value() + adjustment.page_size() / 2.0;
-            self.current.set(self.layout.borrow().page_at(middle));
+            self.nav.current.set(self.doc.layout.borrow().page_at(middle));
         }
-        self.set_indicator(self.current.get());
+        self.set_indicator(self.nav.current.get());
     }
 
     /// Wires a button to a `Viewer` method without creating a reference cycle.
@@ -660,7 +692,7 @@ impl Viewer {
         Self::install_action(viewer, "search-next", |viewer| viewer.search_step(1));
         Self::install_action(viewer, "search-prev", |viewer| viewer.search_step(-1));
         Self::install_action(viewer, "search", |viewer| {
-            viewer.search_entry.grab_focus();
+            viewer.ui.search_entry.grab_focus();
         });
         Self::install_action(viewer, "print", |viewer| viewer.print_document());
         Self::install_action(viewer, "export-text", |viewer| viewer.export_text());
@@ -696,7 +728,7 @@ impl Viewer {
             let shortcut = gtk::Shortcut::new(Some(trigger), Some(gtk::NamedAction::new(action)));
             controller.add_shortcut(shortcut);
         }
-        viewer.window.add_controller(controller);
+        viewer.ui.window.add_controller(controller);
     }
 
     fn install_action<F>(viewer: &Rc<Self>, name: &str, action: F)
@@ -710,7 +742,7 @@ impl Viewer {
                 action(&viewer);
             }
         });
-        viewer.window.add_action(&simple);
+        viewer.ui.window.add_action(&simple);
     }
 
     fn install_ctrl_scroll(viewer: &Rc<Self>) {
@@ -738,7 +770,7 @@ impl Viewer {
             glib::Propagation::Stop
         });
 
-        viewer.window.add_controller(scroll);
+        viewer.ui.window.add_controller(scroll);
     }
 
     fn choose_file(self: &Rc<Self>) {
@@ -758,7 +790,7 @@ impl Viewer {
             .build();
 
         let weak = Rc::downgrade(self);
-        dialog.open(Some(&self.window), None::<&gio::Cancellable>, move |result| {
+        dialog.open(Some(&self.ui.window), None::<&gio::Cancellable>, move |result| {
             let Some(viewer) = weak.upgrade() else {
                 return;
             };
@@ -769,7 +801,7 @@ impl Viewer {
                 Err(error) if error.matches(gtk::DialogError::Dismissed) => return,
                 Err(error) => {
                     show_error(
-                        &viewer.window,
+                        &viewer.ui.window,
                         "No se pudo abrir el selector de archivos.",
                         &error.to_string(),
                     );
@@ -779,7 +811,7 @@ impl Viewer {
 
             let Some(path) = file.path() else {
                 show_error(
-                    &viewer.window,
+                    &viewer.ui.window,
                     "El archivo elegido no está en el disco local.",
                     "",
                 );
@@ -801,17 +833,17 @@ impl Viewer {
             return Err("El documento no tiene páginas.".to_string());
         }
 
-        *self.document.borrow_mut() = Some(document);
-        *self.current_path.borrow_mut() = Some(path.to_path_buf());
-        *self.selection.borrow_mut() = None;
-        self.selection_rects.borrow_mut().clear();
-        self.zoom.set(ZOOM_DEFAULT);
-        self.zoom_label.set_label(&zoom_text(ZOOM_DEFAULT));
-        self.title
+        *self.doc.document.borrow_mut() = Some(document);
+        *self.doc.current_path.borrow_mut() = Some(path.to_path_buf());
+        *self.sel.selection.borrow_mut() = None;
+        self.sel.selection_rects.borrow_mut().clear();
+        self.view.zoom.set(ZOOM_DEFAULT);
+        self.ui.zoom_label.set_label(&zoom_text(ZOOM_DEFAULT));
+        self.ui.title
             .set_label(&format!("{WINDOW_TITLE} — {}", display_name(path)));
 
-        self.history.borrow_mut().clear();
-        self.history_pos.set(0);
+        self.nav.history.borrow_mut().clear();
+        self.nav.history_pos.set(0);
         self.remember_recent(path);
 
         self.render()?;
@@ -825,7 +857,7 @@ impl Viewer {
         match self.open(path) {
             Ok(()) => self.install_file_monitor(),
             Err(message) if looks_encrypted(&message) => self.prompt_password(path),
-            Err(message) => show_error(&self.window, "No se pudo abrir el archivo.", &message),
+            Err(message) => show_error(&self.ui.window, "No se pudo abrir el archivo.", &message),
         }
     }
 
@@ -834,7 +866,7 @@ impl Viewer {
         let window = gtk::Window::builder()
             .title("Documento protegido")
             .modal(true)
-            .transient_for(&self.window)
+            .transient_for(&self.ui.window)
             .default_width(380)
             .build();
 
@@ -878,7 +910,7 @@ impl Viewer {
             window_ref.close();
             if let Err(message) = viewer.open_with_password(&path_owned, Some(&password)) {
                 show_error(
-                    &viewer.window,
+                    &viewer.ui.window,
                     "No se pudo abrir el documento.",
                     &message,
                 );
@@ -891,16 +923,16 @@ impl Viewer {
     }
 
     fn zoom_in(&self) {
-        self.set_zoom(next_zoom(self.zoom.get()));
+        self.set_zoom(next_zoom(self.view.zoom.get()));
     }
 
     fn zoom_out(&self) {
-        self.set_zoom(previous_zoom(self.zoom.get()));
+        self.set_zoom(previous_zoom(self.view.zoom.get()));
     }
 
     fn set_zoom(&self, zoom: f64) {
         let clamped = zoom.clamp(ZOOM_STEPS[0], ZOOM_STEPS[ZOOM_STEPS.len() - 1]);
-        if (clamped - self.zoom.get()).abs() < f64::EPSILON {
+        if (clamped - self.view.zoom.get()).abs() < f64::EPSILON {
             return;
         }
         self.apply_zoom(clamped);
@@ -912,18 +944,18 @@ impl Viewer {
         let clamped = zoom.clamp(ZOOM_STEPS[0], ZOOM_STEPS[ZOOM_STEPS.len() - 1]);
         let anchor = self.current_page();
 
-        self.zoom.set(clamped);
-        self.zoom_label.set_label(&zoom_text(clamped));
+        self.view.zoom.set(clamped);
+        self.ui.zoom_label.set_label(&zoom_text(clamped));
 
         match self.render() {
             Ok(()) => self.jump_to_page(anchor),
-            Err(message) => show_error(&self.window, "No se pudo cambiar el zoom.", &message),
+            Err(message) => show_error(&self.ui.window, "No se pudo cambiar el zoom.", &message),
         }
     }
 
     fn zoom_by_scroll(&self, dy: f64) {
-        let (accumulated, direction) = scroll_zoom_step(self.scroll_delta.get(), dy);
-        self.scroll_delta.set(accumulated);
+        let (accumulated, direction) = scroll_zoom_step(self.view.scroll_delta.get(), dy);
+        self.view.scroll_delta.set(accumulated);
 
         match direction {
             Some(1) => self.zoom_out(),
@@ -940,12 +972,12 @@ impl Viewer {
     /// Rebuilds the page geometry for the current zoom and rasterizes only the
     /// pages near the viewport.
     fn render(&self) -> Result<(), String> {
-        let document = self.document.borrow();
+        let document = self.doc.document.borrow();
         let Some(document) = document.as_ref() else {
             return Ok(());
         };
 
-        let zoom = self.zoom.get();
+        let zoom = self.view.zoom.get();
         let count = document.n_pages().max(0) as usize;
         if count == 0 {
             return Err("El documento no tiene páginas.".to_string());
@@ -958,15 +990,15 @@ impl Viewer {
             let page = document
                 .page(index as i32)
                 .ok_or_else(|| format!("No se pudo leer la página {}.", index + 1))?;
-            sizes.push(oriented_size(page.size(), self.rotation.get()));
+            sizes.push(oriented_size(page.size(), self.view.rotation.get()));
         }
 
-        let structure = (count, self.spread.get(), self.cover_alone.get());
-        let reuse = *self.structure.borrow() == structure && self.slots.borrow().len() == count;
+        let structure = (count, self.view.spread.get(), self.view.cover_alone.get());
+        let reuse = *self.doc.structure.borrow() == structure && self.doc.slots.borrow().len() == count;
 
         if reuse {
             // Same pages, same grouping: only sizes and textures change.
-            let slots = self.slots.borrow();
+            let slots = self.doc.slots.borrow();
             for (index, (width, height)) in sizes.iter().enumerate() {
                 let logical = ((width * zoom).ceil() as i32, (height * zoom).ceil() as i32);
                 let slot = &slots[index];
@@ -977,12 +1009,12 @@ impl Viewer {
             }
             drop(slots);
 
-            *self.page_sizes.borrow_mut() = sizes;
-            *self.layout.borrow_mut() = PageLayout::build(
-                &self.page_sizes.borrow(),
+            *self.doc.page_sizes.borrow_mut() = sizes;
+            *self.doc.layout.borrow_mut() = PageLayout::build(
+                &self.doc.page_sizes.borrow(),
                 zoom,
-                self.spread.get(),
-                self.cover_alone.get(),
+                self.view.spread.get(),
+                self.view.cover_alone.get(),
             );
 
             self.apply_page_background();
@@ -1032,14 +1064,14 @@ impl Viewer {
         let layout = PageLayout::build(
             &sizes,
             zoom,
-            self.spread.get(),
-            self.cover_alone.get(),
+            self.view.spread.get(),
+            self.view.cover_alone.get(),
         );
 
-        clear_pages(&self.pages);
+        clear_pages(&self.ui.pages);
         for row in &layout.rows {
             if row.pages.len() == 1 {
-                self.pages.append(&pictures[row.pages[0]]);
+                self.ui.pages.append(&pictures[row.pages[0]]);
                 continue;
             }
             let line = gtk::Box::new(gtk::Orientation::Horizontal, PAGE_GAP);
@@ -1047,13 +1079,13 @@ impl Viewer {
             for page in &row.pages {
                 line.append(&pictures[*page]);
             }
-            self.pages.append(&line);
+            self.ui.pages.append(&line);
         }
 
-        *self.slots.borrow_mut() = slots;
-        *self.page_sizes.borrow_mut() = sizes;
-        *self.layout.borrow_mut() = layout;
-        *self.structure.borrow_mut() = structure;
+        *self.doc.slots.borrow_mut() = slots;
+        *self.doc.page_sizes.borrow_mut() = sizes;
+        *self.doc.layout.borrow_mut() = layout;
+        *self.doc.structure.borrow_mut() = structure;
 
         self.apply_page_background();
         self.refresh_visible();
@@ -1062,8 +1094,8 @@ impl Viewer {
 
     /// Paints the page background so a placeholder already looks like paper.
     fn apply_page_background(&self) {
-        let dark = self.dark_mode.get();
-        for slot in self.slots.borrow().iter() {
+        let dark = self.view.dark_mode.get();
+        for slot in self.doc.slots.borrow().iter() {
             if dark {
                 slot.picture.remove_css_class("paper");
                 slot.picture.add_css_class("paper-dark");
@@ -1077,12 +1109,12 @@ impl Viewer {
     /// Rasterizes the pages that intersect the viewport (plus one page of margin
     /// on each side) and releases the textures that are far away.
     fn refresh_visible(&self) {
-        let layout = self.layout.borrow();
+        let layout = self.doc.layout.borrow();
         if layout.page_count() == 0 {
             return;
         }
 
-        let adjustment = self.scroller.vadjustment();
+        let adjustment = self.ui.scroller.vadjustment();
         let top = adjustment.value();
         let bottom = top + adjustment.page_size().max(1.0);
         // One row of margin, capped so a huge page cannot pull in many rows.
@@ -1111,7 +1143,7 @@ impl Viewer {
             self.ensure_rendered(index);
         }
 
-        let total = self.slots.borrow().len();
+        let total = self.doc.slots.borrow().len();
         for index in 0..total {
             if index < first || index > last {
                 self.release_rendered(index);
@@ -1122,13 +1154,13 @@ impl Viewer {
     /// Rasterizes one page if its texture does not match the current zoom/theme.
     fn ensure_rendered(&self, index: usize) {
         let key = (
-            self.zoom.get().to_bits(),
-            self.dark_mode.get(),
-            self.rotation.get(),
-            self.search_epoch.get(),
+            self.view.zoom.get().to_bits(),
+            self.view.dark_mode.get(),
+            self.view.rotation.get(),
+            self.search.search_epoch.get(),
         );
         {
-            let slots = self.slots.borrow();
+            let slots = self.doc.slots.borrow();
             let Some(slot) = slots.get(index) else {
                 return;
             };
@@ -1137,7 +1169,7 @@ impl Viewer {
             }
         }
 
-        let document = self.document.borrow();
+        let document = self.doc.document.borrow();
         let Some(document) = document.as_ref() else {
             return;
         };
@@ -1145,17 +1177,17 @@ impl Viewer {
             return;
         };
 
-        let pixel_scale = self.zoom.get() * self.device_scale();
+        let pixel_scale = self.view.zoom.get() * self.device_scale();
         let hits = self.hits_for(index);
         match render_page(
             &page,
             pixel_scale,
-            self.dark_mode.get(),
-            self.rotation.get(),
+            self.view.dark_mode.get(),
+            self.view.rotation.get(),
             &hits,
         ) {
             Ok((texture, _, _)) => {
-                let slots = self.slots.borrow();
+                let slots = self.doc.slots.borrow();
                 if let Some(slot) = slots.get(index) {
                     slot.picture.set_paintable(Some(&texture));
                     slot.rendered.set(Some(key));
@@ -1167,7 +1199,7 @@ impl Viewer {
     }
 
     fn release_rendered(&self, index: usize) {
-        let slots = self.slots.borrow();
+        let slots = self.doc.slots.borrow();
         let Some(slot) = slots.get(index) else {
             return;
         };
@@ -1178,20 +1210,20 @@ impl Viewer {
     }
 
     fn invalidate_textures(&self) {
-        for index in 0..self.slots.borrow().len() {
+        for index in 0..self.doc.slots.borrow().len() {
             self.release_rendered(index);
         }
         self.refresh_visible();
     }
 
     fn page_count(&self) -> usize {
-        self.layout.borrow().page_count()
+        self.doc.layout.borrow().page_count()
     }
 
     fn toggle_hand_mode(&self) {
-        let active = !self.hand_mode.get();
-        self.hand_mode.set(active);
-        self.scroller
+        let active = !self.input.hand_mode.get();
+        self.input.hand_mode.set(active);
+        self.ui.scroller
             .set_cursor_from_name(if active { Some("grab") } else { None });
     }
 
@@ -1206,13 +1238,13 @@ impl Viewer {
             let Some(viewer) = weak.upgrade() else {
                 return;
             };
-            if !viewer.hand_mode.get() {
+            if !viewer.input.hand_mode.get() {
                 return;
             }
-            let horizontal = viewer.scroller.hadjustment().value();
-            let vertical = viewer.scroller.vadjustment().value();
-            viewer.drag_origin.set((horizontal, vertical));
-            viewer.scroller.set_cursor_from_name(Some("grabbing"));
+            let horizontal = viewer.ui.scroller.hadjustment().value();
+            let vertical = viewer.ui.scroller.vadjustment().value();
+            viewer.input.drag_origin.set((horizontal, vertical));
+            viewer.ui.scroller.set_cursor_from_name(Some("grabbing"));
         });
 
         let weak = Rc::downgrade(viewer);
@@ -1220,15 +1252,17 @@ impl Viewer {
             let Some(viewer) = weak.upgrade() else {
                 return;
             };
-            if !viewer.hand_mode.get() {
+            if !viewer.input.hand_mode.get() {
                 return;
             }
-            let (horizontal, vertical) = viewer.drag_origin.get();
+            let (horizontal, vertical) = viewer.input.drag_origin.get();
             viewer
+                .ui
                 .scroller
                 .hadjustment()
                 .set_value(horizontal - offset_x);
             viewer
+                .ui
                 .scroller
                 .vadjustment()
                 .set_value(vertical - offset_y);
@@ -1239,12 +1273,12 @@ impl Viewer {
             let Some(viewer) = weak.upgrade() else {
                 return;
             };
-            if viewer.hand_mode.get() {
-                viewer.scroller.set_cursor_from_name(Some("grab"));
+            if viewer.input.hand_mode.get() {
+                viewer.ui.scroller.set_cursor_from_name(Some("grab"));
             }
         });
 
-        viewer.scroller.add_controller(gesture);
+        viewer.ui.scroller.add_controller(gesture);
     }
 
     fn page_prev(&self) {
@@ -1256,7 +1290,7 @@ impl Viewer {
     }
 
     fn current_page(&self) -> usize {
-        self.current.get().min(self.page_count().saturating_sub(1))
+        self.nav.current.get().min(self.page_count().saturating_sub(1))
     }
 
     /// User navigation: scrolls to `index` and records it in the history.
@@ -1271,8 +1305,8 @@ impl Viewer {
     }
 
     fn record_history(&self, page: usize) {
-        let mut history = self.history.borrow_mut();
-        let position = self.history_pos.get();
+        let mut history = self.nav.history.borrow_mut();
+        let position = self.nav.history_pos.get();
         if history.get(position) == Some(&page) {
             return;
         }
@@ -1283,32 +1317,32 @@ impl Viewer {
         if history.len() > HISTORY_LIMIT {
             history.remove(0);
         }
-        self.history_pos.set(history.len() - 1);
+        self.nav.history_pos.set(history.len() - 1);
     }
 
     fn history_back(&self) {
-        let position = self.history_pos.get();
+        let position = self.nav.history_pos.get();
         if position == 0 {
             return;
         }
-        self.history_pos.set(position - 1);
-        let page = self.history.borrow()[position - 1];
+        self.nav.history_pos.set(position - 1);
+        let page = self.nav.history.borrow()[position - 1];
         self.jump_to_page(page);
     }
 
     fn history_forward(&self) {
-        let position = self.history_pos.get();
-        if position + 1 >= self.history.borrow().len() {
+        let position = self.nav.history_pos.get();
+        if position + 1 >= self.nav.history.borrow().len() {
             return;
         }
-        self.history_pos.set(position + 1);
-        let page = self.history.borrow()[position + 1];
+        self.nav.history_pos.set(position + 1);
+        let page = self.nav.history.borrow()[position + 1];
         self.jump_to_page(page);
     }
 
     /// Focuses the page field of bar `index` with the current page selected.
     fn begin_page_edit(&self, index: usize) {
-        let Some(nav) = self.navs.get(index) else {
+        let Some(nav) = self.ui.navs.get(index) else {
             return;
         };
         if self.page_count() == 0 {
@@ -1320,25 +1354,25 @@ impl Viewer {
     }
 
     fn apply_page_edit(&self, index: usize) {
-        let Some(nav) = self.navs.get(index) else {
+        let Some(nav) = self.ui.navs.get(index) else {
             return;
         };
         let text = nav.entry.text().to_string();
-        gtk::prelude::GtkWindowExt::set_focus(&self.window, None::<&gtk::Widget>);
+        gtk::prelude::GtkWindowExt::set_focus(&self.ui.window, None::<&gtk::Widget>);
         self.goto_page_from_text(&text);
         nav.entry.set_text(&(self.current_page() + 1).to_string());
     }
 
     /// Restores the field to the page actually shown, discarding partial input.
     fn cancel_page_edit(&self, index: usize) {
-        if let Some(nav) = self.navs.get(index) {
+        if let Some(nav) = self.ui.navs.get(index) {
             nav.entry.set_text(&(self.current_page() + 1).to_string());
         }
     }
 
     /// Wires one navigation bar: buttons plus the editable counter.
     fn install_nav(viewer: &Rc<Self>, index: usize) {
-        let Some(nav) = viewer.navs.get(index) else {
+        let Some(nav) = viewer.ui.navs.get(index) else {
             return;
         };
         let (prev, next, entry) = (nav.prev.clone(), nav.next.clone(), nav.entry.clone());
@@ -1419,7 +1453,7 @@ impl Viewer {
         match text.trim().parse::<usize>() {
             Ok(number) if (1..=total).contains(&number) => self.goto_page(number - 1),
             _ => show_error(
-                &self.window,
+                &self.ui.window,
                 "Número de página inválido.",
                 &format!("El documento tiene {total} páginas."),
             ),
@@ -1428,8 +1462,8 @@ impl Viewer {
 
     /// Width, in points, that has to fit in the viewport for the current view.
     fn fit_zoom_row(&self) -> Option<f64> {
-        let sizes = self.page_sizes.borrow();
-        let width = widest_row_width(&sizes, self.spread.get(), self.cover_alone.get());
+        let sizes = self.doc.page_sizes.borrow();
+        let width = widest_row_width(&sizes, self.view.spread.get(), self.view.cover_alone.get());
         drop(sizes);
         self.fit_zoom(width, None)
     }
@@ -1437,9 +1471,9 @@ impl Viewer {
     /// Same, but also fitting the current page height (whole page visible).
     fn fit_zoom_page(&self) -> Option<f64> {
         let page = self.current_page();
-        let sizes = self.page_sizes.borrow();
+        let sizes = self.doc.page_sizes.borrow();
         let height = sizes.get(page).map(|(_, height)| *height)?;
-        let width = widest_row_width(&sizes, self.spread.get(), self.cover_alone.get());
+        let width = widest_row_width(&sizes, self.view.spread.get(), self.view.cover_alone.get());
         drop(sizes);
         self.fit_zoom(width, Some(height))
     }
@@ -1460,8 +1494,8 @@ impl Viewer {
     /// leaving the page gap as a margin on both sides.
     fn fit_zoom(&self, width: f64, height: Option<f64>) -> Option<f64> {
         let margin = f64::from(PAGE_GAP) * 2.0;
-        let viewport_width = self.scroller.hadjustment().page_size() - margin;
-        let viewport_height = self.scroller.vadjustment().page_size() - margin;
+        let viewport_width = self.ui.scroller.hadjustment().page_size() - margin;
+        let viewport_height = self.ui.scroller.vadjustment().page_size() - margin;
 
         if width <= 0.0 || viewport_width <= 0.0 {
             return None;
@@ -1475,15 +1509,15 @@ impl Viewer {
     }
 
     fn toggle_fullscreen(&self) {
-        if self.window.is_fullscreen() {
-            self.window.unfullscreen();
+        if self.ui.window.is_fullscreen() {
+            self.ui.window.unfullscreen();
         } else {
-            self.window.fullscreen();
+            self.ui.window.fullscreen();
         }
     }
 
     fn hits_for(&self, index: usize) -> Vec<(f64, f64, f64, f64)> {
-        self.search_hits
+        self.search.search_hits
             .borrow()
             .get(&(index as i32))
             .cloned()
@@ -1494,13 +1528,13 @@ impl Viewer {
     /// jumps to the first match. Hits are highlighted when the page is drawn.
     fn search(&self, query: &str) {
         let query = query.trim().to_string();
-        self.search_epoch.set(self.search_epoch.get().wrapping_add(1));
+        self.search.search_epoch.set(self.search.search_epoch.get().wrapping_add(1));
 
         if query.is_empty() {
-            self.search_hits.borrow_mut().clear();
-            self.search_hit_pages.borrow_mut().clear();
-            self.search_cursor.set(0);
-            self.search_status.set_label("");
+            self.search.search_hits.borrow_mut().clear();
+            self.search.search_hit_pages.borrow_mut().clear();
+            self.search.search_cursor.set(0);
+            self.ui.search_status.set_label("");
             self.invalidate_textures();
             return;
         }
@@ -1511,7 +1545,7 @@ impl Viewer {
         let mut found = 0usize;
 
         {
-            let document = self.document.borrow();
+            let document = self.doc.document.borrow();
             let Some(document) = document.as_ref() else {
                 return;
             };
@@ -1546,13 +1580,13 @@ impl Viewer {
             }
         }
 
-        *self.search_hits.borrow_mut() = hits;
-        *self.search_hit_pages.borrow_mut() = pages_hit;
-        self.search_cursor.set(0);
+        *self.search.search_hits.borrow_mut() = hits;
+        *self.search.search_hit_pages.borrow_mut() = pages_hit;
+        self.search.search_cursor.set(0);
         self.update_search_status();
         self.invalidate_textures();
 
-        self.window.announce(
+        self.ui.window.announce(
             &format!("{found} coincidencias"),
             gtk::AccessibleAnnouncementPriority::Medium,
         );
@@ -1560,7 +1594,7 @@ impl Viewer {
         match first_page {
             Some(index) => self.goto_page(index),
             None => show_error(
-                &self.window,
+                &self.ui.window,
                 "Sin resultados.",
                 &format!("No se encontró «{query}» en el documento."),
             ),
@@ -1568,42 +1602,42 @@ impl Viewer {
     }
 
     fn update_search_status(&self) {
-        let total = self.search_hit_pages.borrow().len();
+        let total = self.search.search_hit_pages.borrow().len();
         if total == 0 {
-            self.search_status.set_label("");
+            self.ui.search_status.set_label("");
             return;
         }
-        let index = self.search_cursor.get().min(total - 1);
-        self.search_status
+        let index = self.search.search_cursor.get().min(total - 1);
+        self.ui.search_status
             .set_label(&format!("{}/{}", index + 1, total));
     }
 
     /// Moves to the next (`1`) or previous (`-1`) page with matches.
     fn search_step(&self, direction: i32) {
-        let pages = self.search_hit_pages.borrow().clone();
+        let pages = self.search.search_hit_pages.borrow().clone();
         if pages.is_empty() {
             return;
         }
 
         let total = pages.len();
-        let cursor = self.search_cursor.get() as i32;
+        let cursor = self.search.search_cursor.get() as i32;
         let next = (cursor + direction).rem_euclid(total as i32) as usize;
-        self.search_cursor.set(next);
+        self.search.search_cursor.set(next);
         self.update_search_status();
         self.focus_hit(pages[next], direction);
     }
 
     /// Maps a widget point of `page` to PDF points, undoing zoom and rotation.
     fn view_to_pdf(&self, page: usize, x: f64, y: f64) -> Option<(f64, f64)> {
-        let zoom = self.zoom.get();
+        let zoom = self.view.zoom.get();
         if zoom <= 0.0 {
             return None;
         }
-        let size = *self.page_sizes.borrow().get(page)?;
+        let size = *self.doc.page_sizes.borrow().get(page)?;
         Some(inverse_rotation(
             (x / zoom, y / zoom),
             size,
-            self.rotation.get(),
+            self.view.rotation.get(),
         ))
     }
 
@@ -1615,7 +1649,7 @@ impl Viewer {
             let Some(viewer) = weak.upgrade() else {
                 return;
             };
-            if viewer.hand_mode.get() {
+            if viewer.input.hand_mode.get() {
                 // Let the hand tool own this drag instead of swallowing it.
                 gesture.set_state(gtk::EventSequenceState::Denied);
                 return;
@@ -1641,27 +1675,27 @@ impl Viewer {
     }
 
     fn begin_selection(&self, page: usize, x: f64, y: f64) {
-        if self.hand_mode.get() {
+        if self.input.hand_mode.get() {
             return;
         }
         let Some(anchor) = self.view_to_pdf(page, x, y) else {
             return;
         };
 
-        self.selection_start.set(Some((x, y)));
-        *self.selection.borrow_mut() = Some(Selection { page, anchor, head: anchor });
-        self.selection_rects.borrow_mut().clear();
+        self.sel.selection_start.set(Some((x, y)));
+        *self.sel.selection.borrow_mut() = Some(Selection { page, anchor, head: anchor });
+        self.sel.selection_rects.borrow_mut().clear();
         self.queue_page_draw(page);
     }
 
     fn update_selection(&self, page: usize, offset_x: f64, offset_y: f64) {
-        if self.hand_mode.get() {
+        if self.input.hand_mode.get() {
             return;
         }
-        let Some((start_x, start_y)) = self.selection_start.get() else {
+        let Some((start_x, start_y)) = self.sel.selection_start.get() else {
             return;
         };
-        if self.selection.borrow().as_ref().map(|s| s.page) != Some(page) {
+        if self.sel.selection.borrow().as_ref().map(|s| s.page) != Some(page) {
             return;
         }
         let Some(head) = self.view_to_pdf(page, start_x + offset_x, start_y + offset_y) else {
@@ -1669,7 +1703,7 @@ impl Viewer {
         };
 
         {
-            let mut selection = self.selection.borrow_mut();
+            let mut selection = self.sel.selection.borrow_mut();
             if let Some(selection) = selection.as_mut() {
                 selection.head = head;
             }
@@ -1679,7 +1713,7 @@ impl Viewer {
     }
 
     fn finish_selection(&self) {
-        let Some(selection) = *self.selection.borrow() else {
+        let Some(selection) = *self.sel.selection.borrow() else {
             return;
         };
 
@@ -1689,8 +1723,8 @@ impl Viewer {
             (selection.anchor.1 - selection.head.1).abs(),
         );
         if dx < 1.0 && dy < 1.0 {
-            *self.selection.borrow_mut() = None;
-            self.selection_rects.borrow_mut().clear();
+            *self.sel.selection.borrow_mut() = None;
+            self.sel.selection_rects.borrow_mut().clear();
         } else {
             self.recompute_selection_rects();
         }
@@ -1698,10 +1732,10 @@ impl Viewer {
     }
 
     fn recompute_selection_rects(&self) {
-        let Some(selection) = *self.selection.borrow() else {
+        let Some(selection) = *self.sel.selection.borrow() else {
             return;
         };
-        let document = self.document.borrow();
+        let document = self.doc.document.borrow();
         let Some(document) = document.as_ref() else {
             return;
         };
@@ -1710,11 +1744,11 @@ impl Viewer {
         };
 
         let rects = page_selection_region(&page, selection);
-        *self.selection_rects.borrow_mut() = rects;
+        *self.sel.selection_rects.borrow_mut() = rects;
     }
 
     fn queue_page_draw(&self, page: usize) {
-        if let Some(slot) = self.slots.borrow().get(page) {
+        if let Some(slot) = self.doc.slots.borrow().get(page) {
             slot.canvas.queue_draw();
         }
     }
@@ -1727,23 +1761,23 @@ impl Viewer {
         _width: i32,
         _height: i32,
     ) {
-        let Some(selection) = *self.selection.borrow() else {
+        let Some(selection) = *self.sel.selection.borrow() else {
             return;
         };
         if selection.page != page {
             return;
         }
 
-        let rects = self.selection_rects.borrow();
+        let rects = self.sel.selection_rects.borrow();
         if rects.is_empty() {
             return;
         }
-        let Some(size) = self.page_sizes.borrow().get(page).copied() else {
+        let Some(size) = self.doc.page_sizes.borrow().get(page).copied() else {
             return;
         };
 
-        let zoom = self.zoom.get();
-        let rotation = self.rotation.get();
+        let zoom = self.view.zoom.get();
+        let rotation = self.view.rotation.get();
         context.set_source_rgba(0.20, 0.45, 0.95, 0.35);
         for (x1, y1, x2, y2) in rects.iter() {
             let (px1, py1) = forward_rotation((*x1, *y1), size, rotation);
@@ -1760,13 +1794,13 @@ impl Viewer {
 
     /// Copies the current selection; falls back to the page text.
     fn copy_selection(&self) {
-        let Some(selection) = *self.selection.borrow() else {
+        let Some(selection) = *self.sel.selection.borrow() else {
             self.copy_page_text();
             return;
         };
 
         let text = {
-            let document = self.document.borrow();
+            let document = self.doc.document.borrow();
             let Some(document) = document.as_ref() else {
                 return;
             };
@@ -1778,14 +1812,14 @@ impl Viewer {
 
         match text {
             Some(text) if !text.trim().is_empty() => {
-                self.window.clipboard().set_text(&text);
-                self.window.announce(
+                self.ui.window.clipboard().set_text(&text);
+                self.ui.window.announce(
                     "Selección copiada",
                     gtk::AccessibleAnnouncementPriority::Medium,
                 );
             }
             _ => show_error(
-                &self.window,
+                &self.ui.window,
                 "No hay texto seleccionado.",
                 "Arrastrá sobre el texto de una página.",
             ),
@@ -1797,7 +1831,7 @@ impl Viewer {
     fn focus_hit(&self, page: usize, direction: i32) {
         self.goto_page(page);
 
-        if self.rotation.get().rem_euclid(360) != 0 {
+        if self.view.rotation.get().rem_euclid(360) != 0 {
             return;
         }
         let hits = self.hits_for(page);
@@ -1806,9 +1840,9 @@ impl Viewer {
         }
         let hit = if direction >= 0 { hits[0] } else { hits[hits.len() - 1] };
 
-        let zoom = self.zoom.get();
-        let offset = self.layout.borrow().page_offset(page) + hit.1 * zoom - f64::from(PAGE_GAP);
-        let adjustment = self.scroller.vadjustment();
+        let zoom = self.view.zoom.get();
+        let offset = self.doc.layout.borrow().page_offset(page) + hit.1 * zoom - f64::from(PAGE_GAP);
+        let adjustment = self.ui.scroller.vadjustment();
         let maximum = (adjustment.upper() - adjustment.page_size()).max(0.0);
         adjustment.set_value(offset.max(0.0).min(maximum));
     }
@@ -1817,7 +1851,7 @@ impl Viewer {
     fn notify(&self, title: &str, body: &str) {
         let notification = gio::Notification::new(title);
         notification.set_body(Some(body));
-        if let Some(application) = self.window.application() {
+        if let Some(application) = self.ui.window.application() {
             application.send_notification(Some("visor-pdf"), &notification);
         }
     }
@@ -1834,7 +1868,7 @@ impl Viewer {
 
         let weak = Rc::downgrade(viewer);
         dialog.save(
-            Some(&viewer.window),
+            Some(&viewer.ui.window),
             None::<&gio::Cancellable>,
             move |result| {
                 let Some(viewer) = weak.upgrade() else {
@@ -1845,7 +1879,7 @@ impl Viewer {
                     Err(error) if error.matches(gtk::DialogError::Dismissed) => return,
                     Err(error) => {
                         show_error(
-                            &viewer.window,
+                            &viewer.ui.window,
                             "No se pudo elegir el archivo de salida.",
                             &error.to_string(),
                         );
@@ -1853,7 +1887,7 @@ impl Viewer {
                     }
                 };
                 let Some(path) = file.path() else {
-                    show_error(&viewer.window, "La ruta elegida no es local.", "");
+                    show_error(&viewer.ui.window, "La ruta elegida no es local.", "");
                     return;
                 };
                 on_ready(&viewer, &path);
@@ -1862,7 +1896,7 @@ impl Viewer {
     }
 
     fn suggested_name(&self, extension: &str) -> String {
-        self.current_path
+        self.doc.current_path
             .borrow()
             .as_ref()
             .and_then(|path| path.file_stem())
@@ -1877,21 +1911,21 @@ impl Viewer {
                 Ok(text) => {
                     if let Err(error) = std::fs::write(path, text) {
                         show_error(
-                            &viewer.window,
+                            &viewer.ui.window,
                             "No se pudo escribir el archivo.",
                             &error.to_string(),
                         );
                     }
                 }
                 Err(message) => {
-                    show_error(&viewer.window, "No se pudo extraer el texto.", &message)
+                    show_error(&viewer.ui.window, "No se pudo extraer el texto.", &message)
                 }
             }
         });
     }
 
     fn document_text(&self) -> Result<String, String> {
-        let document = self.document.borrow();
+        let document = self.doc.document.borrow();
         let Some(document) = document.as_ref() else {
             return Err("No hay ningún documento abierto.".to_string());
         };
@@ -1917,14 +1951,14 @@ impl Viewer {
                 Ok(texture) => {
                     if let Err(error) = texture.save_to_png(path) {
                         show_error(
-                            &viewer.window,
+                            &viewer.ui.window,
                             "No se pudo guardar la imagen.",
                             &error.to_string(),
                         );
                     }
                 }
                 Err(message) => {
-                    show_error(&viewer.window, "No se pudo renderizar la página.", &message)
+                    show_error(&viewer.ui.window, "No se pudo renderizar la página.", &message)
                 }
             }
         });
@@ -1938,11 +1972,11 @@ impl Viewer {
             match viewer.render_page_texture(index) {
                 Ok(texture) => {
                     if let Err(message) = save_texture_as_jpeg(&texture, path) {
-                        show_error(&viewer.window, "No se pudo guardar la imagen.", &message);
+                        show_error(&viewer.ui.window, "No se pudo guardar la imagen.", &message);
                     }
                 }
                 Err(message) => {
-                    show_error(&viewer.window, "No se pudo renderizar la página.", &message)
+                    show_error(&viewer.ui.window, "No se pudo renderizar la página.", &message)
                 }
             }
         });
@@ -1957,7 +1991,7 @@ impl Viewer {
 
         let weak = Rc::downgrade(self);
         dialog.select_folder(
-            Some(&self.window),
+            Some(&self.ui.window),
             None::<&gio::Cancellable>,
             move |result| {
                 let Some(viewer) = weak.upgrade() else {
@@ -1968,7 +2002,7 @@ impl Viewer {
                     Err(error) if error.matches(gtk::DialogError::Dismissed) => return,
                     Err(error) => {
                         show_error(
-                            &viewer.window,
+                            &viewer.ui.window,
                             "No se pudo elegir la carpeta.",
                             &error.to_string(),
                         );
@@ -1976,7 +2010,7 @@ impl Viewer {
                     }
                 };
                 let Some(dir) = folder.path() else {
-                    show_error(&viewer.window, "La carpeta elegida no es local.", "");
+                    show_error(&viewer.ui.window, "La carpeta elegida no es local.", "");
                     return;
                 };
                 Self::export_pages_with_progress(&viewer, dir);
@@ -1989,14 +2023,14 @@ impl Viewer {
     fn export_pages_with_progress(viewer: &Rc<Self>, dir: PathBuf) {
         let total = viewer.page_count();
         if total == 0 {
-            show_error(&viewer.window, "No hay ningún documento abierto.", "");
+            show_error(&viewer.ui.window, "No hay ningún documento abierto.", "");
             return;
         }
 
         let window = gtk::Window::builder()
             .title("Exportando páginas")
             .modal(true)
-            .transient_for(&viewer.window)
+            .transient_for(&viewer.ui.window)
             .default_width(380)
             .build();
         let bar = gtk::ProgressBar::new();
@@ -2041,7 +2075,7 @@ impl Viewer {
 
             if let Err(message) = saved {
                 window_ref.close();
-                show_error(&viewer.window, "No se pudo exportar las páginas.", &message);
+                show_error(&viewer.ui.window, "No se pudo exportar las páginas.", &message);
                 return glib::ControlFlow::Break;
             }
 
@@ -2053,11 +2087,11 @@ impl Viewer {
     }
 
     fn render_page_texture(&self, index: usize) -> Result<gdk::Texture, String> {
-        self.render_page_texture_at(index, self.zoom.get())
+        self.render_page_texture_at(index, self.view.zoom.get())
     }
 
     fn render_page_texture_at(&self, index: usize, zoom: f64) -> Result<gdk::Texture, String> {
-        let document = self.document.borrow();
+        let document = self.doc.document.borrow();
         let Some(document) = document.as_ref() else {
             return Err("No hay ningún documento abierto.".to_string());
         };
@@ -2068,8 +2102,8 @@ impl Viewer {
         render_page(
             &page,
             zoom * self.device_scale(),
-            self.dark_mode.get(),
-            self.rotation.get(),
+            self.view.dark_mode.get(),
+            self.view.rotation.get(),
             &hits,
         )
         .map(|(texture, _, _)| texture)
@@ -2077,12 +2111,12 @@ impl Viewer {
 
     fn print_document(self: &Rc<Self>) {
         let (pages, job) = {
-            let document = self.document.borrow();
+            let document = self.doc.document.borrow();
             let Some(document) = document.as_ref() else {
-                show_error(&self.window, "No hay ningún documento abierto.", "");
+                show_error(&self.ui.window, "No hay ningún documento abierto.", "");
                 return;
             };
-            (document.n_pages(), self.title.label().to_string())
+            (document.n_pages(), self.ui.title.label().to_string())
         };
 
         let operation = gtk::PrintOperation::new();
@@ -2095,7 +2129,7 @@ impl Viewer {
             let Some(viewer) = weak.upgrade() else {
                 return;
             };
-            let document = viewer.document.borrow();
+            let document = viewer.doc.document.borrow();
             let Some(document) = document.as_ref() else {
                 return;
             };
@@ -2106,7 +2140,7 @@ impl Viewer {
             let cairo = context.cairo_context();
             let (area_width, area_height) = (context.width(), context.height());
             let (page_width, page_height) =
-                oriented_size(page.size(), viewer.rotation.get());
+                oriented_size(page.size(), viewer.view.rotation.get());
             if page_width <= 0.0 || page_height <= 0.0 {
                 return;
             }
@@ -2122,22 +2156,22 @@ impl Viewer {
             cairo.scale(scale, scale);
             cairo.set_source_rgb(1.0, 1.0, 1.0);
             let _ = cairo.paint();
-            apply_rotation(&cairo, page.size(), viewer.rotation.get());
+            apply_rotation(&cairo, page.size(), viewer.view.rotation.get());
             page.render(&cairo);
             let _ = cairo.restore();
         });
 
         if let Err(error) = operation.run(
             gtk::PrintOperationAction::PrintDialog,
-            Some(&self.window),
+            Some(&self.ui.window),
         ) {
-            show_error(&self.window, "No se pudo imprimir.", &error.to_string());
+            show_error(&self.ui.window, "No se pudo imprimir.", &error.to_string());
         }
     }
 
     fn remember_recent(&self, path: &Path) {
         {
-            let mut recent = self.recent.borrow_mut();
+            let mut recent = self.doc.recent.borrow_mut();
             recent.retain(|known| known != path);
             recent.insert(0, path.to_path_buf());
             recent.truncate(RECENT_LIMIT);
@@ -2147,10 +2181,10 @@ impl Viewer {
 
     fn save_state(&self) {
         let session = Session {
-            last: self.current_path.borrow().clone(),
+            last: self.doc.current_path.borrow().clone(),
             page: self.current_page(),
-            zoom: self.zoom.get(),
-            recent: self.recent.borrow().clone(),
+            zoom: self.view.zoom.get(),
+            recent: self.doc.recent.borrow().clone(),
         };
         save_session(&session);
     }
@@ -2184,14 +2218,14 @@ impl Viewer {
         let window = gtk::Window::builder()
             .title("Documentos recientes")
             .modal(true)
-            .transient_for(&self.window)
+            .transient_for(&self.ui.window)
             .default_width(520)
             .default_height(360)
             .build();
 
         let list = gtk::ListBox::new();
         list.add_css_class("boxed-list");
-        let recent = self.recent.borrow().clone();
+        let recent = self.doc.recent.borrow().clone();
         if recent.is_empty() {
             list.append(&gtk::Label::new(Some(
                 "Todavía no abriste ningún documento.",
@@ -2255,7 +2289,7 @@ impl Viewer {
         let window = gtk::Window::builder()
             .title("Atajos de teclado")
             .modal(true)
-            .transient_for(&self.window)
+            .transient_for(&self.ui.window)
             .default_width(420)
             .build();
         window.set_child(Some(&grid));
@@ -2264,7 +2298,7 @@ impl Viewer {
 
     /// Logical size of a page thumbnail at `THUMB_WIDTH`.
     fn thumbnail_size(&self, index: usize) -> Option<(i32, i32)> {
-        let document = self.document.borrow();
+        let document = self.doc.document.borrow();
         let document = document.as_ref()?;
         let page = document.page(index as i32)?;
         let (width, height) = oriented_size(page.size(), 0);
@@ -2286,7 +2320,7 @@ impl Viewer {
         if width <= 0 || height <= 0 {
             return;
         }
-        let document = self.document.borrow();
+        let document = self.doc.document.borrow();
         let Some(document) = document.as_ref() else {
             return;
         };
@@ -2314,38 +2348,38 @@ impl Viewer {
     }
 
     fn toggle_sidebar(&self) {
-        self.sidebar.set_visible(!self.sidebar.is_visible());
+        self.ui.sidebar.set_visible(!self.ui.sidebar.is_visible());
         // The viewport width is only known after the next layout pass, so the
         // refit is deferred to the horizontal adjustment change below.
-        self.refit_pending.set(true);
+        self.input.refit_pending.set(true);
     }
 
     /// Rebuilds the thumbnail model for the current document. Only called when
     /// the document changes: thumbnails are zoom-independent previews.
     fn sync_thumbnails(&self) {
-        self.thumb_sync.set(true);
+        self.input.thumb_sync.set(true);
         // One bulk splice instead of N appends: each append notifies the list
         // view separately, which measured ~1.5 s for a 666-page document.
         let items: Vec<glib::BoxedAnyObject> = (0..self.page_count())
             .map(|index| glib::BoxedAnyObject::new(index as u32))
             .collect();
-        self.thumbs_store
-            .splice(0, self.thumbs_store.n_items(), &items);
-        self.thumbs_selection.set_selected(0);
-        self.thumb_sync.set(false);
+        self.ui.thumbs_store
+            .splice(0, self.ui.thumbs_store.n_items(), &items);
+        self.ui.thumbs_selection.set_selected(0);
+        self.input.thumb_sync.set(false);
     }
 
     fn set_ui_scale(&self, index: usize) {
         let index = index.min(UI_SCALE_STEPS.len() - 1);
-        self.ui_scale.set(index);
+        self.view.ui_scale.set(index);
         let size = 11.0 * UI_SCALE_STEPS[index];
-        self.scale_provider.load_from_string(&format!(
+        self.ui.scale_provider.load_from_string(&format!(
             "window, popover, popover contents, menu {{\n  font-size: {size:.2}pt;\n}}"
         ));
     }
 
     fn shift_ui_scale(&self, delta: i32) {
-        let current = self.ui_scale.get() as i32;
+        let current = self.view.ui_scale.get() as i32;
         let next = (current + delta).clamp(0, UI_SCALE_STEPS.len() as i32 - 1);
         self.set_ui_scale(next as usize);
     }
@@ -2354,7 +2388,7 @@ impl Viewer {
     fn copy_page_text(&self) {
         let index = self.current_page();
         let text = {
-            let document = self.document.borrow();
+            let document = self.doc.document.borrow();
             let Some(document) = document.as_ref() else {
                 return;
             };
@@ -2365,19 +2399,19 @@ impl Viewer {
         };
 
         let Some(text) = text else {
-            show_error(&self.window, "La página no tiene texto.", "Puede ser un escaneo sin OCR.");
+            show_error(&self.ui.window, "La página no tiene texto.", "Puede ser un escaneo sin OCR.");
             return;
         };
 
-        self.window.clipboard().set_text(&text);
-        self.window.announce(
+        self.ui.window.clipboard().set_text(&text);
+        self.ui.window.announce(
             &format!("Texto de la página {} copiado", index + 1),
             gtk::AccessibleAnnouncementPriority::Medium,
         );
     }
 
     fn toggle_cover_alone(&self) {
-        self.cover_alone.set(!self.cover_alone.get());
+        self.view.cover_alone.set(!self.view.cover_alone.get());
         self.refit_view();
     }
 
@@ -2388,7 +2422,7 @@ impl Viewer {
             Some(zoom) => self.apply_zoom(zoom),
             None => {
                 if let Err(message) = self.render() {
-                    show_error(&self.window, "No se pudo cambiar la vista.", &message);
+                    show_error(&self.ui.window, "No se pudo cambiar la vista.", &message);
                     return;
                 }
                 self.jump_to_page(anchor);
@@ -2397,25 +2431,25 @@ impl Viewer {
     }
 
     fn toggle_spread(&self) {
-        self.spread.set(!self.spread.get());
+        self.view.spread.set(!self.view.spread.get());
         self.refit_view();
     }
 
     /// Print options dialog: fit vs actual size, margins and colour inversion.
     fn print_with_options(self: &Rc<Self>) {
         let (pages, job) = {
-            let document = self.document.borrow();
+            let document = self.doc.document.borrow();
             let Some(document) = document.as_ref() else {
-                show_error(&self.window, "No hay ningún documento abierto.", "");
+                show_error(&self.ui.window, "No hay ningún documento abierto.", "");
                 return;
             };
-            (document.n_pages(), self.title.label().to_string())
+            (document.n_pages(), self.ui.title.label().to_string())
         };
 
         let window = gtk::Window::builder()
             .title("Opciones de impresión")
             .modal(true)
-            .transient_for(&self.window)
+            .transient_for(&self.ui.window)
             .default_width(380)
             .build();
 
@@ -2424,7 +2458,7 @@ impl Viewer {
         let margin = gtk::SpinButton::with_range(0.0, 72.0, 1.0);
         margin.set_value(18.0);
         let invert = gtk::CheckButton::with_label("Invertir colores (borrador oscuro)");
-        invert.set_active(self.dark_mode.get());
+        invert.set_active(self.view.dark_mode.get());
         let accept = gtk::Button::with_label("Imprimir…");
         accept.add_css_class("suggested-action");
         let cancel = gtk::Button::with_label("Cancelar");
@@ -2485,7 +2519,7 @@ impl Viewer {
             let Some(viewer) = weak.upgrade() else {
                 return;
             };
-            let document = viewer.document.borrow();
+            let document = viewer.doc.document.borrow();
             let Some(document) = document.as_ref() else {
                 return;
             };
@@ -2495,7 +2529,7 @@ impl Viewer {
 
             let cairo = context.cairo_context();
             let (area_width, area_height) = (context.width(), context.height());
-            let (page_width, page_height) = oriented_size(page.size(), viewer.rotation.get());
+            let (page_width, page_height) = oriented_size(page.size(), viewer.view.rotation.get());
             if page_width <= 0.0 || page_height <= 0.0 || area_width <= 0.0 || area_height <= 0.0 {
                 return;
             }
@@ -2519,7 +2553,7 @@ impl Viewer {
             cairo.scale(scale, scale);
             cairo.set_source_rgb(1.0, 1.0, 1.0);
             let _ = cairo.paint();
-            apply_rotation(&cairo, page.size(), viewer.rotation.get());
+            apply_rotation(&cairo, page.size(), viewer.view.rotation.get());
             page.render(&cairo);
             let _ = cairo.restore();
 
@@ -2546,21 +2580,21 @@ impl Viewer {
         });
 
         if let Err(error) =
-            operation.run(gtk::PrintOperationAction::PrintDialog, Some(&self.window))
+            operation.run(gtk::PrintOperationAction::PrintDialog, Some(&self.ui.window))
         {
-            show_error(&self.window, "No se pudo imprimir.", &error.to_string());
+            show_error(&self.ui.window, "No se pudo imprimir.", &error.to_string());
         }
     }
 
     /// Prints two pages per sheet in booklet imposition.
     fn print_booklet(self: &Rc<Self>) {
         let (pages, job) = {
-            let document = self.document.borrow();
+            let document = self.doc.document.borrow();
             let Some(document) = document.as_ref() else {
-                show_error(&self.window, "No hay ningún documento abierto.", "");
+                show_error(&self.ui.window, "No hay ningún documento abierto.", "");
                 return;
             };
-            (document.n_pages().max(0), self.title.label().to_string())
+            (document.n_pages().max(0), self.ui.title.label().to_string())
         };
         if pages == 0 {
             return;
@@ -2578,7 +2612,7 @@ impl Viewer {
             let Some(viewer) = weak.upgrade() else {
                 return;
             };
-            let document = viewer.document.borrow();
+            let document = viewer.doc.document.borrow();
             let Some(document) = document.as_ref() else {
                 return;
             };
@@ -2627,42 +2661,42 @@ impl Viewer {
         });
 
         if let Err(error) =
-            operation.run(gtk::PrintOperationAction::PrintDialog, Some(&self.window))
+            operation.run(gtk::PrintOperationAction::PrintDialog, Some(&self.ui.window))
         {
-            show_error(&self.window, "No se pudo imprimir el folleto.", &error.to_string());
+            show_error(&self.ui.window, "No se pudo imprimir el folleto.", &error.to_string());
         }
     }
 
     fn rotate_view(&self) {
         let anchor = self.current_page();
-        self.rotation.set((self.rotation.get() + 90) % 360);
+        self.view.rotation.set((self.view.rotation.get() + 90) % 360);
         match self.render() {
             Ok(()) => self.jump_to_page(anchor),
-            Err(message) => show_error(&self.window, "No se pudo rotar la vista.", &message),
+            Err(message) => show_error(&self.ui.window, "No se pudo rotar la vista.", &message),
         }
     }
 
     fn close_document(&self) {
-        *self.document.borrow_mut() = None;
-        *self.current_path.borrow_mut() = None;
-        self.slots.borrow_mut().clear();
-        clear_pages(&self.pages);
-        *self.layout.borrow_mut() = PageLayout::default();
-        self.page_sizes.borrow_mut().clear();
-        self.history.borrow_mut().clear();
-        self.history_pos.set(0);
-        self.current.set(0);
-        *self.selection.borrow_mut() = None;
-        self.selection_rects.borrow_mut().clear();
-        self.title.set_label(WINDOW_TITLE);
+        *self.doc.document.borrow_mut() = None;
+        *self.doc.current_path.borrow_mut() = None;
+        self.doc.slots.borrow_mut().clear();
+        clear_pages(&self.ui.pages);
+        *self.doc.layout.borrow_mut() = PageLayout::default();
+        self.doc.page_sizes.borrow_mut().clear();
+        self.nav.history.borrow_mut().clear();
+        self.nav.history_pos.set(0);
+        self.nav.current.set(0);
+        *self.sel.selection.borrow_mut() = None;
+        self.sel.selection_rects.borrow_mut().clear();
+        self.ui.title.set_label(WINDOW_TITLE);
         self.sync_thumbnails();
         self.set_indicator(0);
     }
 
     /// Watches the open file and announces external modifications.
     fn install_file_monitor(self: &Rc<Self>) {
-        *self.file_monitor.borrow_mut() = None;
-        let Some(path) = self.current_path.borrow().clone() else {
+        *self.doc.file_monitor.borrow_mut() = None;
+        let Some(path) = self.doc.current_path.borrow().clone() else {
             return;
         };
 
@@ -2681,7 +2715,7 @@ impl Viewer {
                 return;
             }
             if let Some(viewer) = weak.upgrade() {
-                viewer.window.announce(
+                viewer.ui.window.announce(
                     "El archivo cambió en el disco. Ctrl+Shift+R para recargarlo.",
                     gtk::AccessibleAnnouncementPriority::High,
                 );
@@ -2689,25 +2723,25 @@ impl Viewer {
             }
         });
 
-        *self.file_monitor.borrow_mut() = Some(monitor);
+        *self.doc.file_monitor.borrow_mut() = Some(monitor);
     }
 
     fn reload(&self) {
-        let path = self.current_path.borrow().clone();
+        let path = self.doc.current_path.borrow().clone();
         let Some(path) = path else {
             return;
         };
         let anchor = self.current_page();
         match self.open(&path) {
             Ok(()) => self.jump_to_page(anchor),
-            Err(message) => show_error(&self.window, "No se pudo recargar el archivo.", &message),
+            Err(message) => show_error(&self.ui.window, "No se pudo recargar el archivo.", &message),
         }
     }
 
     fn show_properties(&self) {
-        let mut document = self.document.borrow_mut();
+        let mut document = self.doc.document.borrow_mut();
         let Some(document) = document.as_mut() else {
-            show_error(&self.window, "No hay ningún documento abierto.", "");
+            show_error(&self.ui.window, "No hay ningún documento abierto.", "");
             return;
         };
 
@@ -2726,7 +2760,7 @@ impl Viewer {
             }
         }
         lines.push(format!("Páginas: {}", self.page_count()));
-        if let Some(path) = self.current_path.borrow().as_ref() {
+        if let Some(path) = self.doc.current_path.borrow().as_ref() {
             lines.push(format!("Archivo: {}", path.display()));
         }
 
@@ -2735,21 +2769,21 @@ impl Viewer {
             .message("Propiedades del documento")
             .detail(lines.join("\n"))
             .build();
-        dialog.show(Some(&self.window));
+        dialog.show(Some(&self.ui.window));
     }
 
     fn toggle_presentation(&self) {
-        let active = !self.presentation.get();
-        self.presentation.set(active);
+        let active = !self.view.presentation.get();
+        self.view.presentation.set(active);
 
-        for widget in &self.chrome {
+        for widget in &self.ui.chrome {
             widget.set_visible(!active);
         }
 
         if active {
-            self.window.fullscreen();
+            self.ui.window.fullscreen();
         } else {
-            self.window.unfullscreen();
+            self.ui.window.unfullscreen();
         }
     }
 
@@ -2773,11 +2807,11 @@ impl Viewer {
             viewer.open_reporting(&path);
             true
         });
-        viewer.window.add_controller(target);
+        viewer.ui.window.add_controller(target);
     }
 
     fn toggle_invert(&self) {
-        self.dark_mode.set(!self.dark_mode.get());
+        self.view.dark_mode.set(!self.view.dark_mode.get());
         self.apply_page_background();
         self.invalidate_textures();
     }
@@ -2785,7 +2819,7 @@ impl Viewer {
     /// Scrolls so `index` starts at the top of the viewport, then updates the
     /// indicator. Returns the page actually reached after clamping.
     fn scroll_to_page(&self, index: usize) -> usize {
-        let layout = self.layout.borrow();
+        let layout = self.doc.layout.borrow();
         if layout.page_count() == 0 {
             drop(layout);
             self.set_indicator(0);
@@ -2796,14 +2830,14 @@ impl Viewer {
         let offset = layout.page_offset(index);
         drop(layout);
 
-        let adjustment = self.scroller.vadjustment();
+        let adjustment = self.ui.scroller.vadjustment();
         let maximum = (adjustment.upper() - adjustment.page_size()).max(0.0);
         adjustment.set_value(offset.min(maximum));
 
         // Setting the value fires `value_changed`, which may resolve to a
         // different page when the target cannot be scrolled to the top; the
         // requested page is what the reader asked for, so it wins.
-        self.current.set(index);
+        self.nav.current.set(index);
         self.set_indicator(index);
         index
     }
@@ -2811,7 +2845,7 @@ impl Viewer {
     fn set_indicator(&self, index: usize) {
         let total = self.page_count();
         if total == 0 {
-            for nav in &self.navs {
+            for nav in &self.ui.navs {
                 nav.entry.set_text("");
                 nav.entry.set_sensitive(false);
                 nav.suffix.set_label(PAGE_LABEL_EMPTY);
@@ -2822,12 +2856,12 @@ impl Viewer {
         }
 
         let index = index.min(total - 1);
-        self.current.set(index);
-        self.thumb_sync.set(true);
-        self.thumbs_selection.set_selected(index as u32);
-        self.thumb_sync.set(false);
+        self.nav.current.set(index);
+        self.input.thumb_sync.set(true);
+        self.ui.thumbs_selection.set_selected(index as u32);
+        self.input.thumb_sync.set(false);
 
-        for nav in &self.navs {
+        for nav in &self.ui.navs {
             // Never clobber what the reader is typing.
             if !nav.entry.has_focus() {
                 nav.entry.set_text(&(index + 1).to_string());
@@ -2840,7 +2874,7 @@ impl Viewer {
     }
 
     fn device_scale(&self) -> f64 {
-        f64::from(self.window.scale_factor().max(1))
+        f64::from(self.ui.window.scale_factor().max(1))
     }
 }
 
@@ -3241,7 +3275,7 @@ trailer\n<< /Root 1 0 R /Size 5 >>\n%%EOF\n";
             );
             let name = action.strip_prefix("win.").expect("window-scoped action");
             assert!(
-                viewer.window.lookup_action(name).is_some(),
+                viewer.ui.window.lookup_action(name).is_some(),
                 "{action} must be installed by Viewer::new"
             );
         }
@@ -3252,16 +3286,16 @@ trailer\n<< /Root 1 0 R /Size 5 >>\n%%EOF\n";
         std::fs::write(&path, RED_PAGE_PDF).expect("write scratch PDF");
 
         viewer.open(&path).expect("open a document from disk");
-        assert_eq!(viewer.zoom_label.label(), "100 %");
+        assert_eq!(viewer.ui.zoom_label.label(), "100 %");
 
         // One placeholder per page, sized in logical pixels.
-        assert_eq!(viewer.slots.borrow().len(), 1, "one slot per page");
-        assert_eq!(size_request_at(&viewer.pages, 0), (200, 100));
+        assert_eq!(viewer.doc.slots.borrow().len(), 1, "one slot per page");
+        assert_eq!(size_request_at(&viewer.ui.pages, 0), (200, 100));
 
         // Only the pages near the viewport own a texture; the rest stay empty.
         viewer.ensure_rendered(0);
         {
-            let slots = viewer.slots.borrow();
+            let slots = viewer.doc.slots.borrow();
             let slot = slots.first().expect("slot 0");
             assert!(slot.rendered.get().is_some(), "visible page must be rasterized");
             let paintable = slot
@@ -3275,20 +3309,20 @@ trailer\n<< /Root 1 0 R /Size 5 >>\n%%EOF\n";
         }
         viewer.release_rendered(0);
         assert!(
-            viewer.slots.borrow()[0].rendered.get().is_none(),
+            viewer.doc.slots.borrow()[0].rendered.get().is_none(),
             "released pages must drop their texture"
         );
         viewer.ensure_rendered(0);
 
-        gtk::prelude::WidgetExt::activate_action(&viewer.window, "win.zoom-in", None)
+        gtk::prelude::WidgetExt::activate_action(&viewer.ui.window, "win.zoom-in", None)
             .expect("zoom-in action must run");
-        assert_eq!(viewer.zoom_label.label(), "150 %");
-        assert_eq!(size_request_at(&viewer.pages, 0), (300, 150));
+        assert_eq!(viewer.ui.zoom_label.label(), "150 %");
+        assert_eq!(size_request_at(&viewer.ui.pages, 0), (300, 150));
 
         // Ctrl+scroll feeds the same steps through the accumulator.
         viewer.zoom_by_scroll(1.0);
-        assert_eq!(viewer.zoom_label.label(), "100 %");
-        assert_eq!(size_request_at(&viewer.pages, 0), (200, 100));
+        assert_eq!(viewer.ui.zoom_label.label(), "100 %");
+        assert_eq!(size_request_at(&viewer.ui.pages, 0), (200, 100));
 
         std::fs::remove_file(&path).ok();
     }
