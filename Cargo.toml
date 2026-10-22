@@ -1,0 +1,12 @@
+[package]
+name = "visor_pdf"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Published as `gtk4`; renamed to `gtk` (gtk-rs convention).
+gtk = { package = "gtk4", version = "0.11.5", features = ["v4_10", "v4_12", "v4_14"] }
+# High-level poppler-glib bindings. Must share one cairo-rs version with gtk4,
+# otherwise `cairo::Context` would be two different types.
+poppler = { package = "poppler-rs", version = "0.26.0" }
+cairo-rs = "0.22.9"
