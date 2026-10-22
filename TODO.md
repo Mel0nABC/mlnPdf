@@ -161,9 +161,11 @@ necesita una decisión o una dependencia nueva.
   con `child`/`next`, pero no `title()` ni `action()`, así que no hay forma de
   mostrar ni navegar el outline sin escribir FFI propio sobre `poppler-sys`.
 
-- Búsqueda: `ctrl+F` recorre el documento desde la página actual, une los hits en
-  un mapa por página y pinta rectángulos translúcidos al rasterizar. Los hits se
-  limitan a 300 para que una palabra común no dispare tiempo y memoria.
+- Búsqueda: `Ctrl+F` recorre el documento desde la página actual en tandas de 8
+  páginas por tick (con progreso en la barra), une los hits en un mapa por página
+  y pinta rectángulos translúcidos al rasterizar. Los hits se limitan a 300 para
+  que una palabra común no dispare tiempo y memoria. Antes bloqueaba el bucle
+  principal ~1,4 s en un PDF de 666 páginas.
 - Impresión: el diálogo lo pone GTK (incluye imprimir a PDF); el dibujado escala
   la página al área imprimible y respeta la rotación actual.
 

@@ -138,6 +138,8 @@ pub(crate) struct InteractionState {
     /// Set when a view change reshapes the viewport: the zoom is refitted once
     /// the new width is known.
     pub(crate)     refit_pending: Cell<bool>,
+    /// Page to scroll to once the viewport has a real size (session restore).
+    pub(crate)     pending_restore: Cell<Option<usize>>,
 }
 
 pub(crate) struct PageSlot {
@@ -345,6 +347,7 @@ impl Viewer {
                 drag_origin: Cell::new((0.0, 0.0)),
                 thumb_sync: Cell::new(false),
                 refit_pending: Cell::new(false),
+                pending_restore: Cell::new(None),
             },
             me: RefCell::new(std::rc::Weak::new()),
         });
@@ -459,6 +462,7 @@ impl Viewer {
         Self::install_shortcuts(&viewer);
         Self::install_ctrl_scroll(&viewer);
         Self::install_page_sync(&viewer);
+        Self::install_copy_shortcut(&viewer);
         Self::install_hand_pan(&viewer);
         Self::install_drop_target(&viewer);
 
@@ -484,6 +488,8 @@ impl Viewer {
         viewer.ui.scroller.vadjustment().connect_changed(move |_| {
             if let Some(viewer) = weak.upgrade() {
                 viewer.refresh_visible();
+                // A restored session waits here for the first real layout.
+                viewer.apply_pending_restore();
             }
         });
 
@@ -602,6 +608,34 @@ impl Viewer {
             }
         });
         viewer.ui.window.add_action(&simple);
+    }
+
+    /// Window-level key handling that must win over the focused widget.
+    ///
+    /// `Ctrl+C` with an active text selection copies the selection even when the
+    /// focus sits in the search or page field: otherwise that entry consumes the
+    /// key and copies its own (usually empty) content.
+    pub(crate) fn install_copy_shortcut(viewer: &Rc<Self>) {
+        let keys = gtk::EventControllerKey::new();
+        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+
+        let weak = Rc::downgrade(viewer);
+        keys.connect_key_pressed(move |_, keyval, _, state| {
+            let control = state.contains(gdk::ModifierType::CONTROL_MASK);
+            if !control || keyval != gdk::Key::c {
+                return glib::Propagation::Proceed;
+            }
+            let Some(viewer) = weak.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
+            if viewer.sel.selection.borrow().is_none() {
+                return glib::Propagation::Proceed;
+            }
+            viewer.copy_selection();
+            glib::Propagation::Stop
+        });
+
+        viewer.ui.window.add_controller(keys);
     }
 
     pub(crate) fn install_ctrl_scroll(viewer: &Rc<Self>) {
@@ -842,15 +876,21 @@ impl Viewer {
             return Err("El documento no tiene páginas.".to_string());
         }
 
-        // Page sizes in points: 666 of them cost ~0.2 ms, so they are always
-        // recomputed (rotation changes them).
+        // Raw page sizes in points, as poppler reports them. Rotation is applied
+        // where geometry is computed, never stored: the selection mapping needs
+        // the unrotated size to invert the view transform.
         let mut sizes = Vec::with_capacity(count);
         for index in 0..count {
             let page = document
                 .page(index as i32)
                 .ok_or_else(|| format!("No se pudo leer la página {}.", index + 1))?;
-            sizes.push(oriented_size(page.size(), self.view.rotation.get()));
+            sizes.push(page.size());
         }
+        let rotation = self.view.rotation.get();
+        let oriented: Vec<(f64, f64)> = sizes
+            .iter()
+            .map(|size| oriented_size(*size, rotation))
+            .collect();
 
         let structure = (count, self.view.spread.get(), self.view.cover_alone.get());
         let reuse = *self.doc.structure.borrow() == structure && self.doc.slots.borrow().len() == count;
@@ -858,7 +898,7 @@ impl Viewer {
         if reuse {
             // Same pages, same grouping: only sizes and textures change.
             let slots = self.doc.slots.borrow();
-            for (index, (width, height)) in sizes.iter().enumerate() {
+            for (index, (width, height)) in oriented.iter().enumerate() {
                 let logical = ((width * zoom).ceil() as i32, (height * zoom).ceil() as i32);
                 let slot = &slots[index];
                 slot.picture.set_size_request(logical.0, logical.1);
@@ -870,7 +910,7 @@ impl Viewer {
 
             *self.doc.page_sizes.borrow_mut() = sizes;
             *self.doc.layout.borrow_mut() = PageLayout::build(
-                &self.doc.page_sizes.borrow(),
+                &oriented,
                 zoom,
                 self.view.spread.get(),
                 self.view.cover_alone.get(),
@@ -885,7 +925,7 @@ impl Viewer {
         let mut pictures = Vec::with_capacity(count);
 
         for index in 0..count {
-            let (width, height) = sizes[index];
+            let (width, height) = oriented[index];
             let logical = ((width * zoom).ceil(), (height * zoom).ceil());
 
             let picture = gtk::Picture::new();
@@ -921,7 +961,7 @@ impl Viewer {
         }
 
         let layout = PageLayout::build(
-            &sizes,
+            &oriented,
             zoom,
             self.view.spread.get(),
             self.view.cover_alone.get(),
@@ -1080,6 +1120,12 @@ impl Viewer {
     }
 
     pub(crate) fn toggle_hand_mode(&self) {
+        // Typing a space in the search or page field must not grab the hand tool.
+        if let Some(focus) = gtk::prelude::GtkWindowExt::focus(&self.ui.window)
+            && focus.is::<gtk::Entry>()
+        {
+            return;
+        }
         let active = !self.input.hand_mode.get();
         self.input.hand_mode.set(active);
         self.ui.scroller
@@ -1320,20 +1366,29 @@ impl Viewer {
     }
 
     /// Width, in points, that has to fit in the viewport for the current view.
+    /// Page sizes as they are displayed, i.e. after the view rotation.
+    pub(crate) fn oriented_sizes(&self) -> Vec<(f64, f64)> {
+        let rotation = self.view.rotation.get();
+        self.doc
+            .page_sizes
+            .borrow()
+            .iter()
+            .map(|size| oriented_size(*size, rotation))
+            .collect()
+    }
+
     pub(crate) fn fit_zoom_row(&self) -> Option<f64> {
-        let sizes = self.doc.page_sizes.borrow();
+        let sizes = self.oriented_sizes();
         let width = widest_row_width(&sizes, self.view.spread.get(), self.view.cover_alone.get());
-        drop(sizes);
         self.fit_zoom(width, None)
     }
 
     /// Same, but also fitting the current page height (whole page visible).
     pub(crate) fn fit_zoom_page(&self) -> Option<f64> {
         let page = self.current_page();
-        let sizes = self.doc.page_sizes.borrow();
+        let sizes = self.oriented_sizes();
         let height = sizes.get(page).map(|(_, height)| *height)?;
         let width = widest_row_width(&sizes, self.view.spread.get(), self.view.cover_alone.get());
-        drop(sizes);
         self.fit_zoom(width, Some(height))
     }
 
@@ -1385,9 +1440,10 @@ impl Viewer {
 
     /// Searches the whole document from the current page, wrapping around, and
     /// jumps to the first match. Hits are highlighted when the page is drawn.
-    pub(crate) fn search(&self, query: &str) {
+    pub(crate) fn search(self: &Rc<Self>, query: &str) {
         let query = query.trim().to_string();
-        self.search.search_epoch.set(self.search.search_epoch.get().wrapping_add(1));
+        let run = self.search.search_epoch.get().wrapping_add(1);
+        self.search.search_epoch.set(run);
 
         if query.is_empty() {
             self.search.search_hits.borrow_mut().clear();
@@ -1398,12 +1454,7 @@ impl Viewer {
             return;
         }
 
-        let mut hits: HashMap<i32, Vec<(f64, f64, f64, f64)>> = HashMap::new();
-        let mut pages_hit: Vec<usize> = Vec::new();
-        let mut first_page: Option<usize> = None;
-        let mut found = 0usize;
-
-        {
+        let (total, start) = {
             let document = self.doc.document.borrow();
             let Some(document) = document.as_ref() else {
                 return;
@@ -1412,10 +1463,39 @@ impl Viewer {
             if total == 0 {
                 return;
             }
-            let start = self.current_page().min(total as usize - 1) as i32;
+            (total, self.current_page().min(total as usize - 1) as i32)
+        };
 
-            for offset in 0..total {
-                let index = (start + offset) % total;
+        // Searching every page of a 666-page document takes ~1.4 s. Scanning a
+        // few pages per tick keeps the window responsive and lets the status
+        // label report progress instead of looking frozen.
+        self.ui.search_status.set_label("…");
+        let viewer = Rc::clone(self);
+        let hits = Rc::new(RefCell::new(HashMap::new()));
+        let pages_hit: Rc<RefCell<Vec<usize>>> = Rc::new(RefCell::new(Vec::new()));
+        let found = Cell::new(0usize);
+        let first_page = Cell::new(None::<usize>);
+        let scanned = Cell::new(0i32);
+
+        glib::timeout_add_local(std::time::Duration::from_millis(1), move || {
+            const PAGES_PER_TICK: i32 = 8;
+
+            if viewer.search.search_epoch.get() != run {
+                // A newer search replaced this one.
+                return glib::ControlFlow::Break;
+            }
+            let document = viewer.doc.document.borrow();
+            let Some(document) = document.as_ref() else {
+                return glib::ControlFlow::Break;
+            };
+
+            for _ in 0..PAGES_PER_TICK {
+                if scanned.get() >= total || found.get() >= SEARCH_HIT_LIMIT {
+                    break;
+                }
+                let index = (start + scanned.get()) % total;
+                scanned.set(scanned.get() + 1);
+
                 let Some(page) = document.page(index) else {
                     continue;
                 };
@@ -1423,41 +1503,51 @@ impl Viewer {
                 if rects.is_empty() {
                     continue;
                 }
-                if first_page.is_none() {
-                    first_page = Some(index as usize);
+                if first_page.get().is_none() {
+                    first_page.set(Some(index as usize));
                 }
-                found += rects.len();
-                let rects = rects
-                    .iter()
-                    .map(|rect| (rect.x1(), rect.y1(), rect.x2(), rect.y2()))
-                    .collect();
-                pages_hit.push(index as usize);
-                hits.insert(index, rects);
-                if found >= SEARCH_HIT_LIMIT {
-                    break;
-                }
+                found.set(found.get() + rects.len());
+                pages_hit.borrow_mut().push(index as usize);
+                hits.borrow_mut().insert(
+                    index,
+                    rects
+                        .iter()
+                        .map(|rect| (rect.x1(), rect.y1(), rect.x2(), rect.y2()))
+                        .collect(),
+                );
             }
-        }
 
-        *self.search.search_hits.borrow_mut() = hits;
-        *self.search.search_hit_pages.borrow_mut() = pages_hit;
-        self.search.search_cursor.set(0);
-        self.update_search_status();
-        self.invalidate_textures();
+            let done = scanned.get() >= total || found.get() >= SEARCH_HIT_LIMIT;
+            if !done {
+                viewer
+                    .ui
+                    .search_status
+                    .set_label(&format!("{}/{}", scanned.get(), total));
+                return glib::ControlFlow::Continue;
+            }
 
-        self.ui.window.announce(
-            &format!("{found} coincidencias"),
-            gtk::AccessibleAnnouncementPriority::Medium,
-        );
+            drop(document);
+            *viewer.search.search_hits.borrow_mut() = hits.borrow().clone();
+            *viewer.search.search_hit_pages.borrow_mut() = pages_hit.borrow().clone();
+            viewer.search.search_cursor.set(0);
+            viewer.update_search_status();
+            viewer.invalidate_textures();
 
-        match first_page {
-            Some(index) => self.goto_page(index),
-            None => show_error(
-                &self.ui.window,
-                "Sin resultados.",
-                &format!("No se encontró «{query}» en el documento."),
-            ),
-        }
+            viewer.ui.window.announce(
+                &format!("{} coincidencias", found.get()),
+                gtk::AccessibleAnnouncementPriority::Medium,
+            );
+
+            match first_page.get() {
+                Some(index) => viewer.goto_page(index),
+                None => show_error(
+                    &viewer.ui.window,
+                    "Sin resultados.",
+                    &format!("No se encontró «{query}» en el documento."),
+                ),
+            }
+            glib::ControlFlow::Break
+        });
     }
 
     pub(crate) fn update_search_status(&self) {
@@ -2061,7 +2151,11 @@ impl Viewer {
         if let Err(message) = self.set_zoom_checked(session.zoom) {
             eprintln!("[sesión] zoom no restaurado: {message}");
         }
-        self.jump_to_page(session.page);
+
+        // The viewport has no size yet, so scrolling would clamp to page 1.
+        // The jump is deferred until the adjustment reports a real extent.
+        self.input.pending_restore.set(Some(session.page));
+        self.apply_pending_restore();
     }
 
     /// Applies a zoom coming from the session file, ignoring nonsense values.
@@ -2071,6 +2165,21 @@ impl Viewer {
         }
         self.set_zoom(zoom);
         Ok(())
+    }
+
+    /// Jumps to the page remembered by the session once the layout allows it.
+    pub(crate) fn apply_pending_restore(&self) -> bool {
+        let Some(page) = self.input.pending_restore.get() else {
+            return false;
+        };
+        // Before the first layout the adjustment has no extent and setting a
+        // value would clamp to the top, leaving the reader on page 1.
+        if self.ui.scroller.vadjustment().upper() <= 1.0 {
+            return false;
+        }
+        self.input.pending_restore.set(None);
+        self.jump_to_page(page);
+        true
     }
 
     pub(crate) fn show_recent(self: &Rc<Self>) {
