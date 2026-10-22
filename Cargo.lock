@@ -669,6 +669,7 @@ name = "visor_pdf"
 version = "0.1.0"
 dependencies = [
  "cairo-rs",
+ "glib",
  "gtk4",
  "poppler-rs",
 ]

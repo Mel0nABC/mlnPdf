@@ -3,5 +3,6 @@
 
 pub mod geometry;
 pub mod render;
+pub mod selection;
 pub mod session;
 pub mod zoom;

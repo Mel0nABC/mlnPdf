@@ -10,3 +10,5 @@ gtk = { package = "gtk4", version = "0.11.5", features = ["v4_10", "v4_12", "v4_
 # otherwise `cairo::Context` would be two different types.
 poppler = { package = "poppler-rs", version = "0.26.0" }
 cairo-rs = "0.22.9"
+# GLib bindings, used by poppler-rs; the engine must not depend on GTK.
+glib = "0.22"

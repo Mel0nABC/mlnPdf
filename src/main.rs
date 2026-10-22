@@ -12,6 +12,7 @@ mod engine;
 
 use engine::geometry::*;
 use engine::render::*;
+use engine::selection::*;
 use engine::session::*;
 use engine::zoom::*;
 use std::rc::Rc;
@@ -2850,13 +2851,6 @@ impl Viewer {
 
 /// A page in the document: a fixed-size placeholder that holds a rasterized
 /// texture only while it is near the viewport.
-/// One drag selection, in PDF points, on a single page.
-#[derive(Clone, Copy)]
-struct Selection {
-    page: usize,
-    anchor: (f64, f64),
-    head: (f64, f64),
-}
 
 struct PageSlot {
     picture: gtk::Picture,
@@ -3111,78 +3105,8 @@ fn render_page(
     Ok((texture.upcast(), width_pt, height_pt))
 }
 
-/// Poppler rectangle for a selection: `(x1, y1)` is the anchor and `(x2, y2)`
-/// the current end of the drag.
-fn selection_rectangle(selection: Selection) -> poppler::ffi::PopplerRectangle {
-    poppler::ffi::PopplerRectangle {
-        x1: selection.anchor.0,
-        y1: selection.anchor.1,
-        x2: selection.head.0,
-        y2: selection.head.1,
-    }
-}
 
-/// Per-line rectangles of a selection, in PDF points.
-///
-/// # Safety
-/// `page` must be a live poppler page. The returned list is freed here with the
-/// matching `g_free`, so the callers never see poppler memory.
-unsafe fn selection_region(
-    page: &poppler::Page,
-    selection: &mut poppler::ffi::PopplerRectangle,
-) -> Vec<(f64, f64, f64, f64)> {
-    use glib::translate::{IntoGlib, ToGlibPtr};
 
-    let list = unsafe {
-        poppler::ffi::poppler_page_get_selection_region(
-            page.to_glib_none().0,
-            1.0,
-            poppler::SelectionStyle::Glyph.into_glib(),
-            selection,
-        )
-    };
-    if list.is_null() {
-        return Vec::new();
-    }
-
-    let mut rects = Vec::new();
-    unsafe {
-        let mut node = list;
-        while !node.is_null() {
-            let data = (*node).data as *const poppler::ffi::PopplerRectangle;
-            if !data.is_null() {
-                let rect = &*data;
-                rects.push((rect.x1, rect.y1, rect.x2, rect.y2));
-            }
-            node = (*node).next;
-        }
-        glib::ffi::g_list_free_full(list, Some(glib::ffi::g_free));
-    }
-    rects
-}
-
-/// Text covered by a selection.
-///
-/// # Safety
-/// Same contract as `selection_region`.
-unsafe fn selected_text(
-    page: &poppler::Page,
-    selection: &mut poppler::ffi::PopplerRectangle,
-) -> Option<String> {
-    use glib::translate::{FromGlibPtrFull, IntoGlib, ToGlibPtr};
-
-    let text = unsafe {
-        poppler::ffi::poppler_page_get_selected_text(
-            page.to_glib_none().0,
-            poppler::SelectionStyle::Glyph.into_glib(),
-            selection,
-        )
-    };
-    if text.is_null() {
-        return None;
-    }
-    Some(unsafe { glib::GString::from_glib_full(text) }.to_string())
-}
 
 fn show_error(parent: &impl IsA<gtk::Window>, message: &str, detail: &str) {
     let builder = gtk::AlertDialog::builder().modal(true).message(message);
