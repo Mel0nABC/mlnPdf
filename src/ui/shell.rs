@@ -1526,7 +1526,6 @@ impl Viewer {
                 return glib::ControlFlow::Continue;
             }
 
-            drop(document);
             *viewer.search.search_hits.borrow_mut() = hits.borrow().clone();
             *viewer.search.search_hit_pages.borrow_mut() = pages_hit.borrow().clone();
             viewer.search.search_cursor.set(0);
