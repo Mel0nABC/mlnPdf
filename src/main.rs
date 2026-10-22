@@ -9,10 +9,16 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 mod engine;
+mod services;
+mod ui;
 
 use engine::geometry::*;
 use engine::render::*;
 use engine::selection::*;
+use services::export::*;
+use ui::actions::*;
+use ui::nav::*;
+use ui::style::*;
 use engine::session::*;
 use engine::zoom::*;
 use std::rc::Rc;
@@ -23,7 +29,6 @@ use gtk::{gio, glib};
 
 const APP_ID: &str = "com.example.VisorPdf";
 const WINDOW_TITLE: &str = "Visor PDF";
-const PAGE_LABEL_EMPTY: &str = "—";
 /// Navigation history is bounded so a long session cannot grow it forever.
 const HISTORY_LIMIT: usize = 100;
 /// Upper bound on highlighted search hits, so one common word cannot make the
@@ -34,97 +39,6 @@ const THUMB_WIDTH: i32 = 120;
 /// Interface scale steps, independent of the document zoom.
 const UI_SCALE_STEPS: [f64; 5] = [0.85, 1.0, 1.15, 1.3, 1.5];
 const UI_SCALE_DEFAULT: usize = 1;
-/// Human-readable shortcut list shown by Help > Atajos de teclado.
-const SHORTCUT_HELP: [(&str, &str); 19] = [
-    ("Ctrl+O", "Abrir un PDF"),
-    ("Ctrl+P", "Imprimir"),
-    ("Ctrl+F", "Buscar en el documento"),
-    ("Ctrl+L", "Ir a una página"),
-    ("Ctrl+W", "Cerrar el documento"),
-    ("Ctrl+R", "Rotar la vista 90°"),
-    ("Ctrl+D", "Propiedades del documento"),
-    ("Ctrl+I", "Invertir colores"),
-    ("Ctrl+1 / 2 / 3", "Ajustar al ancho / a la página / tamaño real"),
-    ("Ctrl+0", "Zoom 100 %"),
-    ("Ctrl+B", "Mostrar u ocultar miniaturas"),
-    ("Ctrl+C", "Copiar el texto seleccionado"),
-    ("Ctrl+Shift+C", "Copiar el texto de la página actual"),
-    ("Ctrl+G / Ctrl+Shift+G", "Siguiente / anterior coincidencia"),
-    ("Ctrl+rueda", "Zoom con la rueda"),
-    ("↑ / ↓", "Página anterior / siguiente"),
-    ("Ctrl+Inicio / Fin", "Primera / última página"),
-    ("Alt+← / →", "Historial atrás / adelante"),
-    ("Espacio + arrastrar", "Herramienta mano"),
-];
-
-/// App-wide CSS. The page field is compact so it fits inside the sentence, but
-/// keeps a visible box at all times so it reads as an input, not as a label.
-const STYLE: &str = "
-entry.page-number {
-  min-height: 22px;
-  min-width: 0;
-  padding: 0 4px;
-  margin: 0;
-  border: 1px solid alpha(currentColor, 0.3);
-  border-radius: 4px;
-  background: alpha(currentColor, 0.06);
-}
-entry.page-number:focus-within {
-  border-color: alpha(currentColor, 0.7);
-  background: alpha(currentColor, 0.1);
-}
-entry.page-number > text {
-  min-height: 0;
-  padding: 0;
-}
-.paper { background: #ffffff; }
-.paper-dark { background: #000000; }
-";
-
-/// Cairo's `ARGB32` is native-endian premultiplied BGRA on little-endian hosts.
-/// Declaring it explicitly keeps GDK's channel interpretation aligned.
-#[cfg(target_endian = "little")]
-const CAIRO_PIXEL_FORMAT: gdk::MemoryFormat = gdk::MemoryFormat::B8g8r8a8Premultiplied;
-#[cfg(target_endian = "big")]
-const CAIRO_PIXEL_FORMAT: gdk::MemoryFormat = gdk::MemoryFormat::A8r8g8b8Premultiplied;
-
-/// Keyboard shortcuts bound to the window actions. Declared as data so the
-/// display test can prove every trigger string actually parses.
-const SHORTCUTS: [(&str, &str); 31] = [
-    ("<Control>plus", "win.zoom-in"),
-    ("<Control>equal", "win.zoom-in"),
-    ("<Control>minus", "win.zoom-out"),
-    ("<Control>0", "win.zoom-reset"),
-    ("Up", "win.page-prev"),
-    ("Down", "win.page-next"),
-    ("space", "win.hand-mode"),
-    ("Page_Up", "win.page-prev"),
-    ("Page_Down", "win.page-next"),
-    ("<Alt>Left", "win.history-back"),
-    ("<Alt>Right", "win.history-forward"),
-    ("<Control>1", "win.fit-width"),
-    ("<Control>2", "win.fit-page"),
-    ("<Control>3", "win.zoom-reset"),
-    ("F11", "win.fullscreen"),
-    ("<Control>i", "win.invert"),
-    ("<Control>l", "win.focus-goto"),
-    // Ctrl+Inicio / Ctrl+Fin: first and last page. Plain Home/End are left free
-    // so they keep moving the caret inside the page field.
-    ("<Control>Home", "win.page-first"),
-    ("<Control>End", "win.page-last"),
-    ("<Control>r", "win.rotate"),
-    ("<Control>w", "win.close-doc"),
-    ("<Control><Shift>r", "win.reload"),
-    ("<Control>d", "win.properties"),
-    ("F5", "win.presentation"),
-    ("<Control>f", "win.search"),
-    ("<Control>p", "win.print"),
-    ("<Control>b", "win.thumbnails"),
-    ("<Control><Shift>c", "win.copy-page-text"),
-    ("<Control>g", "win.search-next"),
-    ("<Control><Shift>g", "win.search-prev"),
-    ("<Control>c", "win.copy-selection"),
-];
 
 fn main() -> glib::ExitCode {
     let app = gtk::Application::builder().application_id(APP_ID).build();
@@ -2892,145 +2806,6 @@ struct PageSlot {
     rendered: Cell<Option<(u64, bool, i32, u32)>>,
 }
 
-/// One page navigation bar: previous, `Página [1] de 3` where the page number
-/// itself is a small editable field, and next. Built twice so both bars behave
-/// identically.
-struct NavBar {
-    root: gtk::Box,
-    prev: gtk::Button,
-    next: gtk::Button,
-    /// Trailing "de M" label; the number itself lives in `entry`.
-    suffix: gtk::Label,
-    entry: gtk::Entry,
-}
-
-/// Gives an icon-only control a name that screen readers can announce.
-fn accessible_label<W: IsA<gtk::Widget> + IsA<gtk::Accessible>>(widget: &W, label: &str) {
-    widget.update_property(&[gtk::accessible::Property::Label(label)]);
-}
-
-/// Loads the app CSS into the default display.
-fn install_styles() {
-    let Some(display) = gdk::Display::default() else {
-        return;
-    };
-    let provider = gtk::CssProvider::new();
-    provider.load_from_string(STYLE);
-    gtk::style_context_add_provider_for_display(
-        &display,
-        &provider,
-        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-    );
-}
-
-/// Builds one page navigation bar.
-fn build_nav() -> NavBar {
-    let prev = gtk::Button::from_icon_name("go-up-symbolic");
-    prev.set_tooltip_text(Some("Página anterior (↑)"));
-    accessible_label(&prev, "Página anterior");
-    let next = gtk::Button::from_icon_name("go-down-symbolic");
-    next.set_tooltip_text(Some("Página siguiente (↓)"));
-    accessible_label(&next, "Página siguiente");
-
-    let prefix = gtk::Label::new(Some("Página"));
-    let suffix = gtk::Label::new(Some(PAGE_LABEL_EMPTY));
-    suffix.set_tooltip_text(Some("Total de páginas del documento"));
-
-    // Small inline field: just the page number, flat so it reads as part of the
-    // sentence instead of as a form control.
-    let entry = gtk::Entry::builder()
-        .width_chars(2)
-        .max_width_chars(5)
-        .max_length(5)
-        .xalign(0.5)
-        .tooltip_text("Escribí el número de página y pulsá Enter")
-        .build();
-    entry.add_css_class("page-number");
-    accessible_label(&entry, "Número de página");
-
-    // The sentence keeps its own tight spacing; the buttons sit apart from it.
-    let text_box = gtk::Box::new(gtk::Orientation::Horizontal, 2);
-    text_box.append(&prefix);
-    text_box.append(&entry);
-    text_box.append(&suffix);
-
-    let root = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    root.set_halign(gtk::Align::Center);
-    root.append(&prev);
-    root.append(&text_box);
-    root.append(&next);
-
-    NavBar {
-        root,
-        prev,
-        next,
-        suffix,
-        entry,
-    }
-}
-
-/// Classic menu bar. Only File > Abrir is wired for now; the rest are empty
-/// placeholders so the shape of the application is visible from the start.
-fn build_menu_bar() -> gtk::PopoverMenuBar {
-    let model = gio::Menu::new();
-
-    let file_menu = gio::Menu::new();
-    file_menu.append(Some("Abrir…"), Some("win.open"));
-    file_menu.append(Some("Imprimir…"), Some("win.print"));
-    file_menu.append(Some("Imprimir con opciones…"), Some("win.print-options"));
-    file_menu.append(Some("Imprimir folleto…"), Some("win.print-booklet"));
-    file_menu.append(Some("Recargar"), Some("win.reload"));
-    file_menu.append(Some("Cerrar documento"), Some("win.close-doc"));
-    file_menu.append(Some("Recientes…"), Some("win.recent"));
-    model.append_submenu(Some("File"), &file_menu);
-
-    let edit_menu = gio::Menu::new();
-    edit_menu.append(Some("Buscar…"), Some("win.search"));
-    edit_menu.append(Some("Copiar texto de la página"), Some("win.copy-page-text"));
-    model.append_submenu(Some("Edit"), &edit_menu);
-
-    let view_menu = gio::Menu::new();
-    view_menu.append(Some("Ajustar al ancho"), Some("win.fit-width"));
-    view_menu.append(Some("Ajustar a la página"), Some("win.fit-page"));
-    view_menu.append(Some("Tamaño real"), Some("win.zoom-reset"));
-    view_menu.append(Some("Rotar 90°"), Some("win.rotate"));
-    view_menu.append(Some("Miniaturas"), Some("win.thumbnails"));
-    view_menu.append(Some("Dos páginas"), Some("win.spread"));
-    view_menu.append(Some("Portada separada"), Some("win.cover-alone"));
-    view_menu.append(Some("Aumentar interfaz"), Some("win.ui-scale-up"));
-    view_menu.append(Some("Reducir interfaz"), Some("win.ui-scale-down"));
-    view_menu.append(Some("Restablecer interfaz"), Some("win.ui-scale-reset"));
-    view_menu.append(Some("Invertir colores"), Some("win.invert"));
-    view_menu.append(Some("Pantalla completa"), Some("win.fullscreen"));
-    view_menu.append(Some("Presentación"), Some("win.presentation"));
-    model.append_submenu(Some("View"), &view_menu);
-
-    let go_menu = gio::Menu::new();
-    go_menu.append(Some("Primera página"), Some("win.page-first"));
-    go_menu.append(Some("Última página"), Some("win.page-last"));
-    go_menu.append(Some("Ir a página…"), Some("win.focus-goto"));
-    model.append_submenu(Some("Go"), &go_menu);
-
-    let tools_menu = gio::Menu::new();
-    tools_menu.append(Some("Propiedades"), Some("win.properties"));
-    tools_menu.append(Some("Exportar texto…"), Some("win.export-text"));
-    tools_menu.append(Some("Exportar página…"), Some("win.export-page"));
-    tools_menu.append(Some("Exportar página como JPEG…"), Some("win.export-page-jpeg"));
-    tools_menu.append(Some("Exportar todas las páginas…"), Some("win.export-pages"));
-    model.append_submenu(Some("Tools"), &tools_menu);
-
-    let settings_menu = gio::Menu::new();
-    // An insensitive placeholder keeps the empty menu visible and openable.
-    settings_menu.append(Some("—"), None::<&str>);
-    model.append_submenu(Some("Settings"), &settings_menu);
-
-    let help_menu = gio::Menu::new();
-    help_menu.append(Some("Atajos de teclado…"), Some("win.shortcuts"));
-    model.append_submenu(Some("Help"), &help_menu);
-
-    gtk::PopoverMenuBar::from_model(Some(&model))
-}
-
 /// Convenience wrapper used by the tests to exercise the path -> URI step.
 #[cfg(test)]
 fn open_document(path: &Path) -> Result<poppler::Document, String> {
@@ -3051,48 +2826,6 @@ fn open_document_with_password(
 fn looks_encrypted(message: &str) -> bool {
     let message = message.to_lowercase();
     message.contains("encrypt") || message.contains("password") || message.contains("contraseña")
-}
-
-/// Renders every page of `document` into `pages`, replacing whatever was there.
-///
-/// Pages are rasterized at `zoom * device_scale` device pixels but request
-/// `zoom * point_size` logical pixels, so a HiDPI screen gets a crisp texture
-/// instead of an upscaled one. Returns each page's logical height so the caller
-/// can compute page offsets without waiting for a layout pass.
-/// Writes a texture as JPEG. GDK hands out premultiplied BGRA, while a pixbuf
-/// expects packed RGB, so the channels are converted instead of copied.
-fn save_texture_as_jpeg(texture: &gdk::Texture, path: &Path) -> Result<(), String> {
-    let (width, height) = (texture.width() as usize, texture.height() as usize);
-    if width == 0 || height == 0 {
-        return Err("La imagen está vacía.".to_string());
-    }
-
-    let stride = width * 4;
-    let mut pixels = vec![0u8; stride * height];
-    texture.download(&mut pixels, stride);
-
-    let rgb_stride = width * 3;
-    let mut rgb = vec![0u8; rgb_stride * height];
-    for (source, target) in pixels.chunks_exact(4).zip(rgb.chunks_exact_mut(3)) {
-        target[0] = source[2];
-        target[1] = source[1];
-        target[2] = source[0];
-    }
-
-    let bytes = glib::Bytes::from(&rgb[..]);
-    let pixbuf = gdk::gdk_pixbuf::Pixbuf::from_bytes(
-        &bytes,
-        gdk::gdk_pixbuf::Colorspace::Rgb,
-        false,
-        8,
-        width as i32,
-        height as i32,
-        rgb_stride as i32,
-    );
-    let encoded = pixbuf
-        .save_to_bufferv("jpeg", &[("quality", "90")])
-        .map_err(|error| error.to_string())?;
-    std::fs::write(path, encoded).map_err(|error| error.to_string())
 }
 
 fn clear_pages(pages: &gtk::Box) {
