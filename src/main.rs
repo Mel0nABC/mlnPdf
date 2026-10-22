@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 mod engine;
 
 use engine::geometry::*;
+use engine::render::*;
 use engine::session::*;
 use engine::zoom::*;
 use std::rc::Rc;
@@ -32,10 +33,6 @@ const THUMB_WIDTH: i32 = 120;
 /// Interface scale steps, independent of the document zoom.
 const UI_SCALE_STEPS: [f64; 5] = [0.85, 1.0, 1.15, 1.3, 1.5];
 const UI_SCALE_DEFAULT: usize = 1;
-/// Channel spread under which a pixel is considered neutral (paper, text,
-/// grayscale) and therefore safe to invert in the dark mode.
-const NEUTRAL_SPREAD: u8 = 28;
-
 /// Human-readable shortcut list shown by Help > Atajos de teclado.
 const SHORTCUT_HELP: [(&str, &str); 19] = [
     ("Ctrl+O", "Abrir un PDF"),
@@ -3085,6 +3082,7 @@ fn clear_pages(pages: &gtk::Box) {
 ///
 /// Returns the texture and the page size in points, which the caller scales by
 /// the user zoom to obtain the logical size.
+/// Wraps the engine rasterizer and hands the result to GTK as a texture.
 fn render_page(
     page: &poppler::Page,
     pixel_scale: f64,
@@ -3092,68 +3090,16 @@ fn render_page(
     rotation: i32,
     hits: &[(f64, f64, f64, f64)],
 ) -> Result<(gdk::Texture, f64, f64), String> {
-    let (width, height) = page.size();
-    if !(width > 0.0 && height > 0.0) {
-        return Err("la página tiene un tamaño inválido.".to_string());
-    }
-
-    let (out_width, out_height) = oriented_size((width, height), rotation);
-    let pixel_width = ((out_width * pixel_scale).ceil() as i32).max(1);
-    let pixel_height = ((out_height * pixel_scale).ceil() as i32).max(1);
-
-    let mut surface =
-        cairo::ImageSurface::create(cairo::Format::ARgb32, pixel_width, pixel_height)
-            .map_err(|error| format!("no se pudo crear la superficie: {error}"))?;
-
-    {
-        let context = cairo::Context::new(&surface)
-            .map_err(|error| format!("no se pudo crear el contexto cairo: {error}"))?;
-        // PDF pages are transparent; paint white so the page reads as paper.
-        context.set_source_rgb(1.0, 1.0, 1.0);
-        context
-            .paint()
-            .map_err(|error| format!("no se pudo pintar el fondo: {error}"))?;
-        context.scale(pixel_scale, pixel_scale);
-        apply_rotation(&context, (width, height), rotation);
-        page.render(&context);
-
-        // Search hits are in PDF points, so they use the same transform.
-        if !hits.is_empty() {
-            context.set_source_rgba(1.0, 0.84, 0.0, 0.45);
-            for (x1, y1, x2, y2) in hits {
-                context.rectangle(*x1, *y1, x2 - x1, y2 - y1);
-            }
-            let _ = context.fill();
-        }
-    }
+    let (mut surface, width_pt, height_pt) =
+        render_page_surface(page, pixel_scale, invert, rotation, hits)?;
     surface.flush();
 
     let stride = surface.stride() as usize;
+    let (pixel_width, pixel_height) = (surface.width(), surface.height());
     let data = surface
         .data()
         .map_err(|error| format!("no se pudo leer el mapa de píxeles: {error:?}"))?;
-    let bytes = if invert {
-        // Pages are painted opaque white, so alpha stays 255. Only neutral
-        // pixels are inverted: paper and text flip, while coloured images keep
-        // their original look instead of becoming negatives. Grayscale photos
-        // still invert; telling them apart would need image-region detection.
-        let mut pixels = data.to_vec();
-        for pixel in pixels.chunks_exact_mut(4) {
-            let (blue, green, red) = (pixel[0], pixel[1], pixel[2]);
-            let max = blue.max(green).max(red);
-            let min = blue.min(green).min(red);
-            if max - min > NEUTRAL_SPREAD {
-                continue;
-            }
-            pixel[0] = 255 - blue;
-            pixel[1] = 255 - green;
-            pixel[2] = 255 - red;
-        }
-        glib::Bytes::from(&pixels[..])
-    } else {
-        glib::Bytes::from(&data[..])
-    };
-
+    let bytes = glib::Bytes::from(&data[..]);
     let texture = gdk::MemoryTexture::new(
         pixel_width,
         pixel_height,
@@ -3162,7 +3108,7 @@ fn render_page(
         stride,
     );
 
-    Ok((texture.upcast(), out_width, out_height))
+    Ok((texture.upcast(), width_pt, height_pt))
 }
 
 /// Poppler rectangle for a selection: `(x1, y1)` is the anchor and `(x2, y2)`
