@@ -1709,10 +1709,7 @@ impl Viewer {
             return;
         };
 
-        let mut rect = selection_rectangle(selection);
-        // SAFETY: `page` is alive for the duration of the call and poppler
-        // returns a freshly allocated list that we free below.
-        let rects = unsafe { selection_region(&page, &mut rect) };
+        let rects = page_selection_region(&page, selection);
         *self.selection_rects.borrow_mut() = rects;
     }
 
@@ -1776,9 +1773,7 @@ impl Viewer {
             let Some(page) = document.page(selection.page as i32) else {
                 return;
             };
-            let mut rect = selection_rectangle(selection);
-            // SAFETY: poppler returns an owned string that GString takes over.
-            unsafe { selected_text(&page, &mut rect) }
+            page_selected_text(&page, selection)
         };
 
         match text {

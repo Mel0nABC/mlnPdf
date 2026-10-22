@@ -25,7 +25,7 @@ pub fn selection_rectangle(selection: Selection) -> poppler::ffi::PopplerRectang
 /// # Safety
 /// `page` must be a live poppler page. The returned list is freed here with the
 /// matching `g_free`, so the callers never see poppler memory.
-pub unsafe fn selection_region(
+pub fn selection_region_raw(
     page: &poppler::Page,
     selection: &mut poppler::ffi::PopplerRectangle,
 ) -> Vec<(f64, f64, f64, f64)> {
@@ -63,7 +63,7 @@ pub unsafe fn selection_region(
 ///
 /// # Safety
 /// Same contract as `selection_region`.
-pub unsafe fn selected_text(
+pub fn selected_text_raw(
     page: &poppler::Page,
     selection: &mut poppler::ffi::PopplerRectangle,
 ) -> Option<String> {
@@ -80,6 +80,19 @@ pub unsafe fn selected_text(
         return None;
     }
     Some(unsafe { glib::GString::from_glib_full(text) }.to_string())
+}
+
+/// Per-line rectangles of a selection, safe for callers outside the engine.
+pub fn page_selection_region(page: &poppler::Page, selection: Selection) -> Vec<(f64, f64, f64, f64)> {
+    let mut rect = selection_rectangle(selection);
+    // The pointer work (and freeing poppler's list) stays inside the raw helper.
+    selection_region_raw(page, &mut rect)
+}
+
+/// Text covered by a selection, safe for callers outside the engine.
+pub fn page_selected_text(page: &poppler::Page, selection: Selection) -> Option<String> {
+    let mut rect = selection_rectangle(selection);
+    selected_text_raw(page, &mut rect)
 }
 
 #[cfg(test)]
@@ -120,7 +133,7 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
             head: (200.0, 45.0),
         };
         let mut rect = selection_rectangle(selection);
-        let text = unsafe { selected_text(&page, &mut rect) };
+        let text = selected_text_raw(&page, &mut rect);
         assert_eq!(text.as_deref().map(str::trim), Some("Arriba"));
     }
 
@@ -133,7 +146,7 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
             head: (200.0, 195.0),
         };
         let mut rect = selection_rectangle(selection);
-        let text = unsafe { selected_text(&page, &mut rect) };
+        let text = selected_text_raw(&page, &mut rect);
         assert_eq!(text.as_deref().map(str::trim), Some("Abajo"));
     }
 
@@ -141,7 +154,7 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
     fn a_click_without_drag_selects_nothing() {
         let page = page();
         let mut rect = poppler::ffi::PopplerRectangle { x1: 20.0, y1: 10.0, x2: 20.0, y2: 10.0 };
-        let text = unsafe { selected_text(&page, &mut rect) };
+        let text = selected_text_raw(&page, &mut rect);
         assert!(text.map_or(true, |text| text.trim().is_empty()));
     }
 
@@ -149,7 +162,7 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
     fn selection_region_returns_line_rectangles_inside_the_page() {
         let page = page();
         let mut rect = poppler::ffi::PopplerRectangle { x1: 20.0, y1: 10.0, x2: 200.0, y2: 45.0 };
-        let region = unsafe { selection_region(&page, &mut rect) };
+        let region = selection_region_raw(&page, &mut rect);
         assert!(!region.is_empty(), "debe haber al menos un rectangulo");
         for (x1, y1, x2, y2) in region {
             assert!(x1 >= 0.0 && y1 >= 0.0 && x2 <= 200.0 && y2 <= 200.0, "dentro de la pagina");
