@@ -89,6 +89,24 @@ pub fn same_document(left: &Path, right: &Path) -> bool {
     }
 }
 
+/// Folder the file chooser should start in: the one holding the last document,
+/// or the most recent one that still exists.
+///
+/// The remembered paths are used in order, so a deleted document does not drag
+/// the reader to a folder that is gone.
+pub fn last_directory(session: &Session) -> Option<PathBuf> {
+    let candidates = session.last.iter().chain(session.recent.iter());
+    for path in candidates {
+        let Some(parent) = path.parent() else {
+            continue;
+        };
+        if parent.is_dir() {
+            return Some(parent.to_path_buf());
+        }
+    }
+    None
+}
+
 /// Page and zoom saved for `path`, when the session remembers that document.
 ///
 /// The single stored position belongs to the last file only, so any other
@@ -145,6 +163,40 @@ mod tests {
         assert_eq!(loaded.zoom, 3.0);
         assert_eq!(loaded.last, Some(PathBuf::from("/x.pdf")));
         std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn last_directory_follows_the_last_document_then_the_recent_ones() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/test-work");
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let opened = dir.join("session-last-dir.pdf");
+        std::fs::write(&opened, b"%PDF-1.4\n").expect("write scratch pdf");
+        let gone = dir.join("session-gone.pdf");
+
+        let remembered = Session {
+            last: Some(opened.clone()),
+            recent: vec![opened.clone()],
+            ..Session::default()
+        };
+        assert_eq!(last_directory(&remembered), Some(dir.clone()));
+
+        // A document that no longer exists falls through to the recent list.
+        let deleted_last = Session {
+            last: Some(gone.clone()),
+            recent: vec![gone, opened.clone()],
+            ..Session::default()
+        };
+        assert_eq!(last_directory(&deleted_last), Some(dir.clone()));
+
+        // Nothing remembered, or nothing whose folder still exists.
+        assert_eq!(last_directory(&Session::default()), None);
+        let nowhere = Session {
+            last: Some(PathBuf::from("sin-directorio.pdf")),
+            recent: vec![PathBuf::from("otro.pdf")],
+            ..Session::default()
+        };
+        assert_eq!(last_directory(&nowhere), None, "una ruta relativa no da carpeta");
+        std::fs::remove_file(opened).ok();
     }
 
     fn existing(name: &str) -> PathBuf {

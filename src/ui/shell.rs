@@ -779,12 +779,26 @@ impl Viewer {
         let filters = gio::ListStore::new::<gtk::FileFilter>();
         filters.append(&pdf_filter);
 
-        let dialog = gtk::FileDialog::builder()
+        // Start where the reader left off: the folder of the open document, or
+        // the one of the last document this session remembers.
+        let remembered = self
+            .doc
+            .current_path
+            .borrow()
+            .as_ref()
+            .and_then(|path| path.parent().map(Path::to_path_buf))
+            .or_else(|| last_directory(&load_session()))
+            .map(gio::File::for_path);
+
+        let builder = gtk::FileDialog::builder()
             .title("Abrir PDF")
             .modal(true)
             .filters(&filters)
-            .default_filter(&pdf_filter)
-            .build();
+            .default_filter(&pdf_filter);
+        let dialog = match remembered {
+            Some(folder) => builder.initial_folder(&folder).build(),
+            None => builder.build(),
+        };
 
         let weak = Rc::downgrade(self);
         dialog.open(Some(&self.ui.window), None::<&gio::Cancellable>, move |result| {
