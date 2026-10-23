@@ -101,7 +101,7 @@ ventana.
 | `Ctrl+1` / `2` / `3` | Ancho / página / tamaño real | `Ctrl+0` | Zoom 100 % |
 | `↑` / `↓` | Página anterior / siguiente | `Ctrl+Inicio` / `Fin` | Primera / última página |
 | `Alt+←` / `→` | Historial atrás / adelante | `F11` / `F5` | Pantalla completa / presentación |
-| `Ctrl` + rueda | Zoom con la rueda | `Espacio` + arrastrar | Herramienta mano |
+| `Ctrl` + rueda | Zoom con la rueda | `Espacio` + arrastrar | Herramienta mano, con inercia al soltar |
 | `Ctrl+C` / `Ctrl+Shift+C` | Copiar la selección / la página | `Esc` | Sale de presentación o del modo mano; limpia la búsqueda |
 
 La lista completa está en `Help > Atajos de teclado…` dentro de la aplicación.

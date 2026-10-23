@@ -2,6 +2,7 @@
 //! Nothing here knows that GTK exists.
 
 pub mod geometry;
+pub mod inertia;
 pub mod page_range;
 pub mod render;
 pub mod search;

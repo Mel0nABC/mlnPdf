@@ -13,7 +13,7 @@ Una línea por capacidad, sin agrupar cosas distintas en una sola casilla.
 - [x] Mantener la página actual al cambiar el zoom (anclaje)
 - [x] Navegación de páginas anterior/siguiente con contador, en dos barras
 - [x] Teclas `↑` retrocede y `↓` avanza de página
-- [x] Herramienta mano (`Space`) para desplazar arrastrando: el cursor se mantiene durante el arrastre y `Esc` sale del modo
+- [x] Herramienta mano (`Space`) para desplazar arrastrando, con inercia al soltar: el arrastre sigue al puntero 1:1 y, al soltar, el scroll continúa con la velocidad que traía y frena solo. El cursor se mantiene durante el arrastre y `Esc` sale del modo
 - [x] Barra de menús con `File`, `View`, `Edit`, `Go`, `Tools`, `Settings`, `Help`
 - [x] Ir a una página concreta escribiendo el número (campo `Ir a` + `Ctrl+L`)
 - [x] `PageUp` / `PageDown`
@@ -217,6 +217,14 @@ necesita una decisión o una dependencia nueva.
   heredado del scroller no alcanza cuando el arrastre desliza otras páginas;
   durante el arrastre el cursor se fija también en la ventana.
   `Esc` apaga el modo (y sale de presentación, en ese orden).
+- Inercia del modo mano (`src/engine/inertia.rs`, sin GTK): el arrastre sigue
+  al puntero uno a uno, sin suavizado, y cada movimiento deja una muestra
+  `(instante, scroll x, scroll y)`. Al soltar se mide la velocidad media de la
+  última ventana de 100 ms: si el puntero se quedó quieto más que eso, no hay
+  inercia; si venía rápido, el scroll sigue solo con una fricción exponencial de
+  4 1/s, así que el recorrido total es ≈ v/fricción y termina al bajar de 20 px/s
+  o al llegar a un extremo del documento. Los frames son de 16 ms, igual que el
+  zoom animado, y `render()`, cerrar el documento o apagar el modo los corta.
 
 - Incidente resuelto: con un PDF de 666 páginas el render síncrono de todas las
   páginas consumía 1,5 GB al abrir y 4,5 GB al pasar a 150 %, bloqueando el bucle

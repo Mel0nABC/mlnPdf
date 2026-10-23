@@ -10,6 +10,7 @@ use gtk::prelude::*;
 use gtk::{gio, glib};
 
 use crate::engine::geometry::*;
+use crate::engine::inertia::*;
 use crate::engine::render::*;
 use crate::engine::selection::*;
 use crate::engine::session::*;
@@ -31,6 +32,18 @@ const SEARCH_HIT_LIMIT: usize = 300;
 
 /// Width of the thumbnails in the side panel, in logical pixels.
 const THUMB_WIDTH: i32 = 120;
+
+/// Time between two fling frames: a 60 Hz redraw, the same cadence as the
+/// smooth zoom.
+const PAN_FRAME_MS: u64 = 16;
+
+/// How long a drag sample is kept, in ms. Twice the release window, so the
+/// velocity can always be measured over the whole window.
+const PAN_HISTORY_MS: f64 = 2.0 * crate::engine::inertia::FLING_WINDOW_MS;
+
+/// Longest `dt` a fling frame accepts, in ms: after a stalled loop the coast
+/// steps ahead once instead of jumping the whole distance at once.
+const PAN_MAX_FRAME_MS: f64 = 32.0;
 
 /// Interface scale steps, independent of the document zoom.
 const UI_SCALE_STEPS: [f64; 5] = [0.85, 1.0, 1.15, 1.3, 1.5];
@@ -137,6 +150,18 @@ pub(crate) struct SelectionState {
 pub(crate) struct InteractionState {
     pub(crate)     hand_mode: Cell<bool>,
     pub(crate)     drag_origin: Cell<(f64, f64)>,
+    /// Inertia velocity per axis, in px/s, while the coast after a release runs.
+    pub(crate)     pan_velocity: Cell<(f64, f64)>,
+    pub(crate)     pan_flinging: Cell<bool>,
+    /// Set while the fling frame loop is scheduled.
+    pub(crate)     pan_running: Cell<bool>,
+    /// Instant of the previous fling frame, to measure its `dt`.
+    pub(crate)     pan_frame_at: Cell<Option<std::time::Instant>>,
+    /// Drag history as `(ms since the drag began, scroll x, scroll y)`: the
+    /// released speed is measured over its final window.
+    pub(crate)     pan_samples: RefCell<Vec<(f64, f64, f64)>>,
+    /// Instant the current drag began, the origin of `pan_samples` times.
+    pub(crate)     pan_started_at: Cell<Option<std::time::Instant>>,
     /// Guards selection <-> page synchronisation against feedback loops.
     pub(crate)     thumb_sync: Cell<bool>,
     /// Set when a view change reshapes the viewport: the zoom is refitted once
@@ -370,6 +395,12 @@ impl Viewer {
             input: InteractionState {
                 hand_mode: Cell::new(false),
                 drag_origin: Cell::new((0.0, 0.0)),
+                pan_velocity: Cell::new((0.0, 0.0)),
+                pan_flinging: Cell::new(false),
+                pan_running: Cell::new(false),
+                pan_frame_at: Cell::new(None),
+                pan_samples: RefCell::new(Vec::new()),
+                pan_started_at: Cell::new(None),
                 thumb_sync: Cell::new(false),
                 refit_pending: Cell::new(false),
                 pending_restore: Cell::new(None),
@@ -1046,6 +1077,9 @@ impl Viewer {
         self.input.zoom_animation.set(None);
         self.input.zoom_generation
             .set(self.input.zoom_generation.get().wrapping_add(1));
+        // A fling frame would set scroll values that the new geometry no longer
+        // matches, so a relayout also ends any coast in progress.
+        self.stop_fling();
 
         let document = self.doc.document.borrow();
         let Some(document) = document.as_ref() else {
@@ -1323,6 +1357,7 @@ impl Viewer {
         self.input.hand_mode.set(active);
         if !active {
             // A drag interrupted by Escape can leave the window cursor behind.
+            self.stop_fling();
             self.ui.window.set_cursor(None::<&gdk::Cursor>);
         }
         self.apply_hand_cursor(active.then_some("grab"));
@@ -1388,9 +1423,124 @@ impl Viewer {
         glib::Propagation::Proceed
     }
 
+    /// Scroll limits of an axis: `(lower, upper - page_size)` so the content
+    /// edge, not the adjustment maximum, is the stop.
+    fn pan_limits(adjustment: &gtk::Adjustment) -> (f64, f64) {
+        let lower = adjustment.lower();
+        (lower, (adjustment.upper() - adjustment.page_size()).max(lower))
+    }
+
+    /// Appends the current scroll position to the drag history, with its time
+    /// since the drag began, and drops what fell out of `PAN_HISTORY_MS`.
+    fn record_pan_sample(&self) {
+        let Some(started) = self.input.pan_started_at.get() else {
+            return;
+        };
+        let at = started.elapsed().as_secs_f64() * 1000.0;
+        let horizontal = self.ui.scroller.hadjustment().value();
+        let vertical = self.ui.scroller.vadjustment().value();
+
+        let mut samples = self.input.pan_samples.borrow_mut();
+        samples.push((at, horizontal, vertical));
+        samples.retain(|(sample_at, _, _)| at - sample_at <= PAN_HISTORY_MS);
+    }
+
+    /// Speed the drag hands over, per axis, in px/s. A pointer that stopped
+    /// before releasing hands over nothing, so the coast only happens on a
+    /// drag that was still moving.
+    fn release_velocity(&self, now_ms: f64) -> (f64, f64) {
+        let samples = self.input.pan_samples.borrow();
+        let horizontal: Vec<(f64, f64)> = samples.iter().map(|(at, x, _)| (*at, *x)).collect();
+        let vertical: Vec<(f64, f64)> = samples.iter().map(|(at, _, y)| (*at, *y)).collect();
+        (
+            sampled_velocity(&horizontal, now_ms, FLING_WINDOW_MS),
+            sampled_velocity(&vertical, now_ms, FLING_WINDOW_MS),
+        )
+    }
+
+    /// Starts the fling frame loop if it is not running yet.
+    fn start_fling_frames(&self) {
+        if self.input.pan_running.get() {
+            return;
+        }
+        self.input.pan_running.set(true);
+        self.input.pan_frame_at.set(Some(std::time::Instant::now()));
+
+        let weak = self.me.borrow().clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(PAN_FRAME_MS), move || {
+            let Some(viewer) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            if viewer.fling_frame() {
+                glib::ControlFlow::Continue
+            } else {
+                glib::ControlFlow::Break
+            }
+        });
+    }
+
+    /// One coast frame: advances each axis with the speed it still has and
+    /// brakes it for the next frame. Returns `true` while anything moves.
+    fn fling_frame(&self) -> bool {
+        let now = std::time::Instant::now();
+        // A frame without a previous instant, or a stalled loop, still advances
+        // a minimum, so the coast cannot freeze on a zero `dt`.
+        let dt_ms = self
+            .input
+            .pan_frame_at
+            .get()
+            .map_or(1.0, |last| now.duration_since(last).as_secs_f64() * 1000.0)
+            .clamp(1.0, PAN_MAX_FRAME_MS);
+        self.input.pan_frame_at.set(Some(now));
+        let dt_s = dt_ms / 1000.0;
+
+        let adjustments = [
+            self.ui.scroller.hadjustment(),
+            self.ui.scroller.vadjustment(),
+        ];
+        let (horizontal, vertical) = self.input.pan_velocity.get();
+        let mut velocities = [horizontal, vertical];
+        let mut values = [0.0_f64; 2];
+
+        for axis in 0..adjustments.len() {
+            let adjustment = &adjustments[axis];
+            let next = adjustment.value() + velocities[axis] * dt_s;
+            // The braking is applied to the speed the frame used, so the coast
+            // decays smoothly instead of stopping on the last step.
+            velocities[axis] = decayed_velocity(velocities[axis], dt_ms);
+            let (lower, upper) = Self::pan_limits(adjustment);
+            let clamped = clamp_scroll(next, lower, upper);
+            if (clamped - next).abs() > f64::EPSILON {
+                // Hitting an end of the document spends that axis' inertia.
+                velocities[axis] = 0.0;
+            }
+            values[axis] = clamped;
+        }
+
+        // Both values are set together so the layout never sees one axis moved
+        // and the other still on the previous frame.
+        adjustments[0].set_value(values[0]);
+        adjustments[1].set_value(values[1]);
+        self.input.pan_velocity.set((velocities[0], velocities[1]));
+
+        if fling_finished(velocities[0]) && fling_finished(velocities[1]) {
+            self.stop_fling();
+            return false;
+        }
+        true
+    }
+
+    /// Cancels the coast and forgets the speed it had.
+    fn stop_fling(&self) {
+        self.input.pan_flinging.set(false);
+        self.input.pan_running.set(false);
+        self.input.pan_velocity.set((0.0, 0.0));
+    }
+
     /// While the hand tool is on, dragging pans the view. Offsets are captured
     /// at drag start and applied as a delta, so long drags do not accumulate
-    /// rounding drift.
+    /// rounding drift; the movement follows the pointer one to one, and only a
+    /// release leaves a coast behind.
     pub(crate) fn install_hand_pan(viewer: &Rc<Self>) {
         let gesture = gtk::GestureDrag::new();
 
@@ -1402,9 +1552,14 @@ impl Viewer {
             if !viewer.input.hand_mode.get() {
                 return;
             }
+            // A new drag owns the scroll: any coast still running is over.
+            viewer.stop_fling();
             let horizontal = viewer.ui.scroller.hadjustment().value();
             let vertical = viewer.ui.scroller.vadjustment().value();
             viewer.input.drag_origin.set((horizontal, vertical));
+            viewer.input.pan_started_at.set(Some(std::time::Instant::now()));
+            viewer.input.pan_samples.borrow_mut().clear();
+            viewer.record_pan_sample();
             // While a page is being dragged the hand owns the whole window, so no
             // widget picked on the way can fall back to the arrow.
             viewer.apply_hand_cursor(Some("grabbing"));
@@ -1433,6 +1588,9 @@ impl Viewer {
                 .scroller
                 .vadjustment()
                 .set_value(vertical - offset_y);
+            // The sample is taken after the scroll moved, so it records what the
+            // view actually did, ends of the document included.
+            viewer.record_pan_sample();
         });
 
         let weak = Rc::downgrade(viewer);
@@ -1440,6 +1598,25 @@ impl Viewer {
             let Some(viewer) = weak.upgrade() else {
                 return;
             };
+            let released_after = viewer
+                .input
+                .pan_started_at
+                .get()
+                .map(|started| started.elapsed().as_secs_f64() * 1000.0)
+                .unwrap_or(f64::INFINITY);
+            let velocity = viewer.release_velocity(released_after);
+            viewer.input.pan_started_at.set(None);
+
+            if viewer.input.hand_mode.get()
+                && !(fling_finished(velocity.0) && fling_finished(velocity.1))
+            {
+                viewer.input.pan_velocity.set(velocity);
+                viewer.input.pan_flinging.set(true);
+                viewer.start_fling_frames();
+            } else {
+                viewer.stop_fling();
+            }
+
             viewer.ui.window.set_cursor(None::<&gdk::Cursor>);
             if viewer.input.hand_mode.get() {
                 viewer.apply_hand_cursor(Some("grab"));
