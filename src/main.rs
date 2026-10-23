@@ -564,6 +564,24 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
         assert!(!viewer.has_pending_marks());
         std::fs::remove_file(&copy).ok();
 
+        // Pulsar la herramienta abre el selector de color del sistema. Es la
+        // única parte del flujo que no se puede probar sin un clic real, así que
+        // se comprueba que la ventana del selector aparezca.
+        viewer.start_mark_tool(MarkKind::Highlight);
+        let mut selector: Option<gtk::Widget> = None;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while selector.is_none() && std::time::Instant::now() < deadline {
+            gtk::glib::MainContext::default().iteration(false);
+            selector = gtk::Window::list_toplevels()
+                .into_iter()
+                .find(|widget| *widget != viewer.ui.window);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            selector.is_some(),
+            "pulsar subrayar o resaltar tiene que abrir el selector de color"
+        );
+
         std::fs::remove_file(&text_path).ok();
         std::fs::remove_file(&path).ok();
     }
