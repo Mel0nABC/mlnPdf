@@ -16,6 +16,7 @@ use crate::engine::render::*;
 use crate::engine::selection::*;
 use crate::engine::session::*;
 use crate::engine::zoom::*;
+use crate::services::annotations::*;
 use crate::services::export::*;
 use crate::ui::actions::*;
 use crate::ui::nav::*;
@@ -102,6 +103,8 @@ pub(crate) struct UiHandles {
     pub(crate)     underline_button: gtk::ToggleButton,
     pub(crate)     underline_popover: gtk::Popover,
     pub(crate)     underline_apply: gtk::Button,
+    /// Sólo lo leen las pruebas: la elección se guarda en `AnnotationState`.
+    #[allow(dead_code)]
     pub(crate)     underline_color: gtk::ColorDialogButton,
 }
 
@@ -826,6 +829,10 @@ impl Viewer {
         Self::install_action(viewer, "open", |viewer| viewer.choose_file());
         Self::install_action(viewer, "hand-mode", |viewer| viewer.toggle_hand_mode());
         Self::install_action(viewer, "underline", |viewer| viewer.toggle_underline_mode());
+        Self::install_action(viewer, "save-annotations", |viewer| viewer.save_annotations());
+        Self::install_action(viewer, "save-annotations-as", |viewer| {
+            viewer.save_annotations_as(None);
+        });
 
         let controller = gtk::ShortcutController::new();
         for (trigger, action) in SHORTCUTS {
@@ -984,6 +991,8 @@ impl Viewer {
 
         *self.doc.document.borrow_mut() = Some(document);
         *self.doc.current_path.borrow_mut() = Some(path.to_path_buf());
+        // Los subrayados pertenecen al documento anterior.
+        self.clear_underlines();
         *self.sel.selection.borrow_mut() = None;
         self.sel.selection_rects.borrow_mut().clear();
         self.view.zoom.set(ZOOM_DEFAULT);
@@ -1007,6 +1016,16 @@ impl Viewer {
     /// the session remembers (from the command line, the recent list, the file
     /// dialog or a drop) resumes where the reader left it.
     pub(crate) fn open_reporting(self: &Rc<Self>, path: &Path) {
+        let path = path.to_path_buf();
+        self.resolve_pending_underlines(move |viewer| viewer.open_reporting_now(&path));
+    }
+
+    /// Opens the document, asking for a password when it is encrypted.
+    ///
+    /// The saved reading position is applied here, so reopening the document
+    /// the session remembers (from the command line, the recent list, the file
+    /// dialog or a drop) resumes where the reader left it.
+    fn open_reporting_now(self: &Rc<Self>, path: &Path) {
         // The position of the remembered document is offered to this open, but
         // only when the session already points at the same file.
         let saved = load_session();
@@ -1607,6 +1626,176 @@ impl Viewer {
     /// True when there are underlines that are not in the file yet.
     pub(crate) fn has_pending_underlines(&self) -> bool {
         self.annot.saved.get() < self.annot.marks.borrow().len()
+    }
+
+    /// Escribe los subrayados pendientes en `target` y devuelve si quedaron
+    /// guardados; si el guardado falla, deja el estado como estaba para que el
+    /// lector pueda reintentarlo.
+    pub(crate) fn save_pending_underlines(&self, target: &Path) -> bool {
+        let source = self.doc.current_path.borrow().clone();
+        let Some(source) = source else {
+            show_error(&self.ui.window, "No hay ningún documento abierto.", "");
+            return false;
+        };
+
+        let pending: Vec<Underline> = {
+            let marks = self.annot.marks.borrow();
+            marks[self.annot.saved.get().min(marks.len())..].to_vec()
+        };
+        if pending.is_empty() {
+            return true;
+        }
+
+        match write_underlines(&source, target, &pending) {
+            Ok(written) => {
+                self.annot.saved.set(self.annot.marks.borrow().len());
+                let plural = if written == 1 { "subrayado" } else { "subrayados" };
+                self.ui.window.announce(
+                    &format!("Guardados {written} {plural} en el PDF"),
+                    gtk::AccessibleAnnouncementPriority::Medium,
+                );
+                self.notify(
+                    "Subrayados guardados",
+                    &format!("{written} {plural} en {}", display_name(target)),
+                );
+                true
+            }
+            Err(message) => {
+                show_error(
+                    &self.ui.window,
+                    "No se pudieron guardar los subrayados.",
+                    &message,
+                );
+                false
+            }
+        }
+    }
+
+    /// Guarda los subrayados en el mismo archivo que se está leyendo.
+    pub(crate) fn save_annotations(self: &Rc<Self>) {
+        let Some(path) = self.doc.current_path.borrow().clone() else {
+            show_error(&self.ui.window, "No hay ningún documento abierto.", "");
+            return;
+        };
+        if !self.has_pending_underlines() {
+            self.ui.window.announce(
+                "No hay subrayados sin guardar",
+                gtk::AccessibleAnnouncementPriority::Low,
+            );
+            return;
+        }
+        self.save_pending_underlines(&path);
+    }
+
+    /// Guarda los subrayados en otro archivo, dejando el original como estaba.
+    pub(crate) fn save_annotations_as(self: &Rc<Self>, then: Option<Box<dyn Fn(&Rc<Self>)>>) {
+        let name = self.suggested_name("pdf");
+        Self::ask_save_path(
+            self,
+            "Guardar una copia con los subrayados",
+            Some(name),
+            move |viewer, target| {
+                if viewer.save_pending_underlines(target) {
+                    if let Some(then) = then.as_ref() {
+                        then(viewer);
+                    }
+                }
+            },
+        );
+    }
+
+    /// Subrayados que todavía no están en el archivo.
+    pub(crate) fn pending_underlines(&self) -> Vec<Underline> {
+        let marks = self.annot.marks.borrow();
+        marks[self.annot.saved.get().min(marks.len())..].to_vec()
+    }
+
+    /// Pregunta qué hacer con los subrayados sin guardar y sólo después ejecuta
+    /// `then`, con la decisión ya tomada. Sin cambios pendientes `then` corre en
+    /// el acto: el camino normal no paga ningún diálogo.
+    pub(crate) fn resolve_pending_underlines(
+        self: &Rc<Self>,
+        then: impl Fn(&Rc<Self>) + 'static,
+    ) {
+        if !self.has_pending_underlines() {
+            then(self);
+            return;
+        }
+
+        let count = self.pending_underlines().len();
+        let name = self
+            .doc
+            .current_path
+            .borrow()
+            .as_ref()
+            .map(|path| display_name(path))
+            .unwrap_or_default();
+        let plural = if count == 1 { "subrayado" } else { "subrayados" };
+
+        let dialog = gtk::AlertDialog::builder()
+            .modal(true)
+            .message(format!("Hay {count} {plural} sin guardar"))
+            .detail(format!(
+                "«{name}» todavía no tiene {count} {plural}. Si seguís sin guardar, se pierden."
+            ))
+            .buttons(["Descartar", "Guardar", "Guardar una copia…"])
+            .cancel_button(0)
+            .default_button(1)
+            .build();
+
+        let weak = Rc::downgrade(self);
+        dialog.choose(
+            Some(&self.ui.window),
+            None::<&gio::Cancellable>,
+            move |result| {
+                let Some(viewer) = weak.upgrade() else {
+                    return;
+                };
+                match result {
+                    // Guardar: si falla, no se sigue con la acción original.
+                    Ok(choice) if choice == 1 => {
+                        if viewer.save_pending_underlines_file() {
+                            then(&viewer);
+                        }
+                    }
+                    // Guardar una copia: el diálogo de archivo decide si se
+                    // sigue; cancelarlo deja todo como estaba.
+                    Ok(choice) if choice == 2 => viewer.save_annotations_as(Some(Box::new(then))),
+                    _ => {
+                        viewer.discard_underlines();
+                        then(&viewer);
+                    }
+                }
+            },
+        );
+    }
+
+    fn save_pending_underlines_file(self: &Rc<Self>) -> bool {
+        let Some(path) = self.doc.current_path.borrow().clone() else {
+            return false;
+        };
+        self.save_pending_underlines(&path)
+    }
+
+    /// Tira los cambios pendientes y redibuja para que desaparezcan de la página.
+    /// Lo que ya está escrito en el archivo se queda.
+    pub(crate) fn discard_underlines(&self) {
+        let saved = self.annot.saved.get().min(self.annot.marks.borrow().len());
+        let pages: Vec<usize> = self.annot.marks.borrow()[saved..]
+            .iter()
+            .map(|mark| mark.page)
+            .collect();
+        self.annot.marks.borrow_mut().truncate(saved);
+        for page in pages {
+            self.queue_page_draw(page);
+        }
+    }
+
+    /// Deja el documento sin subrayados en memoria: se usan al abrir otro.
+    pub(crate) fn clear_underlines(&self) {
+        self.annot.marks.borrow_mut().clear();
+        self.annot.saved.set(0);
+        self.set_underline_mode(false);
     }
 
     /// Dibuja la capa de la página: primero los subrayados, que son parte del
@@ -3833,7 +4022,11 @@ impl Viewer {
         }
     }
 
-    pub(crate) fn close_document(&self) {
+    pub(crate) fn close_document(self: &Rc<Self>) {
+        self.resolve_pending_underlines(|viewer| viewer.close_document_now());
+    }
+
+    fn close_document_now(&self) {
         *self.doc.document.borrow_mut() = None;
         *self.doc.current_path.borrow_mut() = None;
         self.doc.slots.borrow_mut().clear();
@@ -3845,6 +4038,7 @@ impl Viewer {
         self.nav.current.set(0);
         *self.sel.selection.borrow_mut() = None;
         self.sel.selection_rects.borrow_mut().clear();
+        self.clear_underlines();
         self.ui.title.set_label(WINDOW_TITLE);
         self.sync_thumbnails();
         self.set_indicator(0);
@@ -3883,7 +4077,11 @@ impl Viewer {
         *self.doc.file_monitor.borrow_mut() = Some(monitor);
     }
 
-    pub(crate) fn reload(&self) {
+    pub(crate) fn reload(self: &Rc<Self>) {
+        self.resolve_pending_underlines(|viewer| viewer.reload_now());
+    }
+
+    fn reload_now(&self) {
         let path = self.doc.current_path.borrow().clone();
         let Some(path) = path else {
             return;

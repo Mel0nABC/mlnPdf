@@ -20,18 +20,6 @@ pub struct PageBox {
     pub rotation: i32,
 }
 
-impl PageBox {
-    /// Tamaño de la página tal como se muestra, con `/Rotate` aplicado: es el
-    /// que poppler devuelve y con el que se mide la selección en pantalla.
-    pub fn displayed_size(&self) -> (f64, f64) {
-        if self.rotation.rem_euclid(180) == 90 {
-            (self.height, self.width)
-        } else {
-            (self.width, self.height)
-        }
-    }
-}
-
 /// Un subrayado pendiente de guardar, todavía en memoria.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Underline {
@@ -192,21 +180,6 @@ mod tests {
             rotated_270[0],
             [170.0, 90.0, 180.0, 90.0, 170.0, 40.0, 180.0, 40.0]
         );
-    }
-
-    #[test]
-    fn the_displayed_size_swaps_the_axes_when_the_page_is_sideways() {
-        assert_eq!(PLAIN.displayed_size(), (200.0, 100.0));
-        let sideways = PageBox {
-            rotation: 90,
-            ..PLAIN
-        };
-        assert_eq!(sideways.displayed_size(), (100.0, 200.0));
-        let upside_down = PageBox {
-            rotation: 270,
-            ..PLAIN
-        };
-        assert_eq!(upside_down.displayed_size(), (100.0, 200.0));
     }
 
     #[test]

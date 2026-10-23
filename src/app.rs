@@ -57,13 +57,24 @@ pub(crate) fn install_viewer(
             viewer.open_reporting(path);
         }
 
-        // Persist the reading position when the window goes away.
+        // Persist the reading position when the window goes away, but only
+        // after the reader decided what to do with the underlines that are not
+        // in the file yet: closing is the one moment where they can be lost.
         let weak = Rc::downgrade(&viewer);
-        viewer.ui.window.connect_close_request(move |_| {
-            if let Some(viewer) = weak.upgrade() {
+        viewer.ui.window.connect_close_request(move |window| {
+            let Some(viewer) = weak.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
+            if !viewer.has_pending_underlines() {
                 viewer.save_state();
+                return glib::Propagation::Proceed;
             }
-            glib::Propagation::Proceed
+            let window = window.clone();
+            viewer.resolve_pending_underlines(move |viewer| {
+                viewer.save_state();
+                window.close();
+            });
+            glib::Propagation::Stop
         });
         *slot.borrow_mut() = Some(viewer);
     });

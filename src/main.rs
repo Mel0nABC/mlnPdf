@@ -373,11 +373,156 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
                 && !viewer.annot.active.get(),
             "Esc sale del modo subrayar"
         );
-        viewer.annot.marks.borrow_mut().clear();
-        viewer.annot.saved.set(0);
+
+        // Guardar: los subrayados entran en el archivo abierto y dejan de estar
+        // pendientes. Descartar tira sólo lo que todavía no se escribió.
+        assert!(
+            viewer.save_pending_underlines(&text_path),
+            "guardar escribe los subrayados en el archivo abierto"
+        );
+        assert!(!viewer.has_pending_underlines(), "ya no queda nada pendiente");
+        assert_eq!(
+            written_annotations(&text_path),
+            2,
+            "el archivo tiene una anotación por subrayado"
+        );
+        assert!(
+            poppler::Document::from_data(&std::fs::read(&text_path).expect("leer"), None).is_ok(),
+            "el PDF sigue abriéndose después de guardar"
+        );
+
+        viewer.begin_selection(0, 20.0, 10.0);
+        viewer.update_selection(0, 180.0, 35.0);
+        viewer.finish_selection();
+        viewer.refresh_underline_actions();
+        assert!(viewer.apply_underline_to_selection(), "otro subrayado");
+        assert!(viewer.has_pending_underlines());
+        viewer.discard_underlines();
+        assert!(
+            !viewer.has_pending_underlines(),
+            "descartar limpia lo que estaba pendiente"
+        );
+        assert_eq!(
+            viewer.annot.marks.borrow().len(),
+            2,
+            "lo que ya estaba guardado se queda"
+        );
+        assert_eq!(
+            written_annotations(&text_path),
+            2,
+            "descartar no toca el archivo"
+        );
+
+        // Sin cambios pendientes, cerrar no pregunta nada: la acción sigue sola.
+        let ran = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counter = ran.clone();
+        viewer.resolve_pending_underlines(move |_| counter.set(counter.get() + 1));
+        assert_eq!(ran.get(), 1, "sin subrayados pendientes no hay diálogo");
+
+        // Con cambios pendientes, la acción original espera la decisión: aparece
+        // el diálogo y, al cerrarlo sin elegir, se descarta lo pendiente.
+        viewer.begin_selection(0, 20.0, 10.0);
+        viewer.update_selection(0, 180.0, 35.0);
+        viewer.finish_selection();
+        viewer.refresh_underline_actions();
+        assert!(viewer.apply_underline_to_selection(), "un subrayado pendiente");
+
+        let ran = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counter = ran.clone();
+        viewer.resolve_pending_underlines(move |_| counter.set(counter.get() + 1));
+        assert_eq!(ran.get(), 0, "con cambios pendientes nada sigue solo");
+
+        // El diálogo ofrece guardar o descartar; acá se elige descartar.
+        assert!(
+            click_dialog_button(&viewer, "Descartar"),
+            "el diálogo ofrece descartar los cambios pendientes"
+        );
+        pump_until(|| ran.get() == 1);
+        assert!(
+            !viewer.has_pending_underlines(),
+            "descartar deja el documento sin cambios pendientes"
+        );
+        assert_eq!(
+            written_annotations(&text_path),
+            2,
+            "descartar no escribe nada en el archivo"
+        );
+
+        // Y elegir guardar escribe los pendientes antes de seguir.
+        viewer.begin_selection(0, 20.0, 155.0);
+        viewer.update_selection(0, 160.0, 40.0);
+        viewer.finish_selection();
+        viewer.refresh_underline_actions();
+        assert!(viewer.apply_underline_to_selection(), "un pendiente más");
+
+        let ran = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counter = ran.clone();
+        viewer.resolve_pending_underlines(move |_| counter.set(counter.get() + 1));
+        assert_eq!(ran.get(), 0, "el cierre espera la decisión");
+        assert!(
+            click_dialog_button(&viewer, "Guardar"),
+            "el diálogo ofrece guardar los cambios pendientes"
+        );
+        pump_until(|| ran.get() == 1);
+        assert!(
+            !viewer.has_pending_underlines(),
+            "guardar deja el documento sin cambios pendientes"
+        );
+        assert_eq!(
+            written_annotations(&text_path),
+            3,
+            "el tercer subrayado llegó al archivo"
+        );
 
         std::fs::remove_file(&text_path).ok();
         std::fs::remove_file(&path).ok();
+    }
+
+    /// Pulsa el botón del diálogo modal que se esté mostrando encima de la
+    /// ventana del visor; devuelve si lo encontró.
+    fn click_dialog_button(viewer: &Viewer, label: &str) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            gtk::glib::MainContext::default().iteration(false);
+            for toplevel in gtk::Window::list_toplevels() {
+                if toplevel == viewer.ui.window {
+                    continue;
+                }
+                if let Some(button) = labeled_button(toplevel.upcast_ref(), label) {
+                    button.emit_by_name::<()>("clicked", &[]);
+                    return true;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        false
+    }
+
+    /// Busca un botón por su etiqueta dentro del árbol del diálogo.
+    fn labeled_button(widget: &gtk::Widget, label: &str) -> Option<gtk::Button> {
+        if let Some(button) = widget.downcast_ref::<gtk::Button>()
+            && button.label().as_deref() == Some(label)
+        {
+            return Some(button.clone());
+        }
+        let mut child = widget.first_child();
+        while let Some(current) = child {
+            if let Some(found) = labeled_button(&current, label) {
+                return Some(found);
+            }
+            child = current.next_sibling();
+        }
+        None
+    }
+
+    /// Cuántas anotaciones lleva el archivo, leídas con lopdf.
+    fn written_annotations(path: &Path) -> usize {
+        let document = lopdf::Document::load(path).expect("lopdf abre el archivo");
+        let page_id = *document.get_pages().get(&1).expect("página 1");
+        document
+            .get_page_annotations(page_id)
+            .expect("anotaciones")
+            .len()
     }
 
     /// Runs the main loop until `done` holds, so an animated change can settle.
