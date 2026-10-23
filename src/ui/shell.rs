@@ -2788,6 +2788,59 @@ impl Viewer {
         .map(|(texture, _, _)| texture)
     }
 
+    /// Opens the page preview in a window next to GTK's print dialog.
+    ///
+    /// The dialog stays GTK's, untouched. The window is transient for it (so it
+    /// stays above and goes away with it) and is refreshed from the dialog's own
+    /// settings, so adding pages to the range changes what the preview walks.
+    fn install_print_preview(self: &Rc<Self>, pages: i32) {
+        let viewer = Rc::clone(self);
+        let window: Rc<std::cell::RefCell<Option<gtk::Window>>> =
+            Rc::new(std::cell::RefCell::new(None));
+        let preview: Rc<std::cell::RefCell<Option<crate::ui::print::Preview>>> =
+            Rc::new(std::cell::RefCell::new(None));
+
+        glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
+            let dialog = gtk::Window::list_toplevels()
+                .into_iter()
+                .filter_map(|widget| widget.downcast::<gtk::PrintUnixDialog>().ok())
+                .find(|dialog| dialog.is_visible());
+
+            let Some(dialog) = dialog else {
+                // The print dialog is gone: the preview leaves with it.
+                if let Some(window) = window.borrow_mut().take() {
+                    window.close();
+                }
+                return glib::ControlFlow::Break;
+            };
+
+            let pages = selected_pages(&dialog, pages);
+            if window.borrow().is_some() {
+                if let Some(preview) = preview.borrow().as_ref() {
+                    (preview.set_pages)(pages);
+                }
+                return glib::ControlFlow::Continue;
+            }
+
+            // GTK's own Preview button takes the dialog away, so it is not
+            // offered: the preview is already here.
+            hide_preview_button(&dialog);
+
+            let built = crate::ui::print::preview(&viewer, pages);
+            let preview_window = gtk::Window::builder()
+                .title("Vista previa")
+                .default_width(crate::ui::print::PREVIEW_WIDTH + 60)
+                .default_height(520)
+                .build();
+            preview_window.set_transient_for(Some(&dialog));
+            preview_window.set_child(Some(&built.root));
+            preview_window.present();
+            *window.borrow_mut() = Some(preview_window);
+            *preview.borrow_mut() = Some(built);
+            glib::ControlFlow::Continue
+        });
+    }
+
     pub(crate) fn print_document(self: &Rc<Self>) {
         let (pages, job) = {
             let document = self.doc.document.borrow();
@@ -2806,36 +2859,6 @@ impl Viewer {
         ) {
             show_error(&self.ui.window, "No se pudo imprimir.", &error.to_string());
         }
-    }
-
-    /// Puts the page preview inside GTK's print dialog, on its right.
-    ///
-    /// The dialog stays GTK's, with every option it has: its content is wrapped
-    /// in a wider box and the preview goes next to it. The dialog only exists
-    /// while its own loop runs, so a timer looks for it on screen and does the
-    /// work once.
-    fn install_print_preview(self: &Rc<Self>, pages: i32) {
-        let preview = crate::ui::print::preview_widget(self, pages.max(0) as usize);
-        let weak = Rc::downgrade(self);
-        let preview = std::rc::Rc::new(std::cell::RefCell::new(Some(preview)));
-
-        glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
-            if weak.upgrade().is_none() {
-                return glib::ControlFlow::Break;
-            }
-            let dialogs: Vec<gtk::PrintUnixDialog> = gtk::Window::list_toplevels()
-                .into_iter()
-                .filter_map(|widget| widget.downcast::<gtk::PrintUnixDialog>().ok())
-                .collect();
-            let Some(dialog) = dialogs.into_iter().find(|dialog| dialog.is_visible()) else {
-                return glib::ControlFlow::Continue;
-            };
-            let Some(preview) = preview.borrow_mut().take() else {
-                return glib::ControlFlow::Break;
-            };
-            install_preview_into_dialog(&dialog, &preview);
-            glib::ControlFlow::Break
-        });
     }
 
     /// Builds the operation behind [`Self::print_document`]: one page per sheet,
@@ -3797,32 +3820,35 @@ fn toolbar_gap(width: i32) -> gtk::Box {
     gap
 }
 
-/// Widens GTK's print dialog and puts the preview on its right.
+/// Pages the dialog is about to print, as zero-based document indices.
 ///
-/// Nothing of the dialog itself is changed: its content is moved into a box with
-/// the preview next to it, and the Preview button is hidden because the preview
-/// is already there and GTK's own button closes the dialog.
+/// A range in the dialog changes the preview: the arrows walk exactly the pages
+/// that would come out, and "all pages" is just the whole document.
+pub(crate) fn selected_pages(dialog: &gtk::PrintUnixDialog, total: i32) -> Vec<usize> {
+    let all: Vec<usize> = (0..total.max(0) as usize).collect();
+    let settings = dialog.settings();
+    if settings.print_pages() != gtk::PrintPages::Ranges {
+        return all;
+    }
+
+    let mut pages = Vec::new();
+    for range in settings.page_ranges() {
+        for page in range.start()..=range.end() {
+            if page >= 0 && (page as usize) < all.len() {
+                pages.push(page as usize);
+            }
+        }
+    }
+    if pages.is_empty() { all } else { pages }
+}
+
+/// Hides the dialog's Preview button: GTK turns it into the end of the dialog and
+/// hands the pages to another application, and the preview is already next to it.
 #[allow(deprecated)] // GTK has no replacement for reaching a dialog's response widget.
-pub(crate) fn install_preview_into_dialog(dialog: &gtk::PrintUnixDialog, preview: &gtk::Widget) {
+fn hide_preview_button(dialog: &gtk::PrintUnixDialog) {
     if let Some(button) = dialog.widget_for_response(gtk::ResponseType::Apply) {
         button.set_visible(false);
     }
-
-    let Some(content) = dialog.child() else {
-        return;
-    };
-    let body = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    dialog.set_child(None::<&gtk::Widget>);
-    body.append(&content);
-    body.append(&gtk::Separator::new(gtk::Orientation::Vertical));
-    body.append(preview);
-    dialog.set_child(Some(&body));
-
-    let width = dialog.width().max(dialog.default_width());
-    dialog.set_default_size(
-        width + crate::ui::print::PREVIEW_WIDTH + 40,
-        dialog.height().max(dialog.default_height()),
-    );
 }
 
 /// Renders one page at `pixel_scale` device pixels per point.

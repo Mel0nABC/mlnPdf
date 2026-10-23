@@ -196,14 +196,17 @@ necesita una decisión o una dependencia nueva.
   que una palabra común no dispare tiempo y memoria. Antes bloqueaba el bucle
   principal ~1,4 s en un PDF de 666 páginas.
 - Impresión: el diálogo sigue siendo el de GTK, con todas sus opciones intactas
-  (impresora, rango, copias, papel, orientación e imprimir a PDF). Lo único que se
-  agrega es la vista previa: un timer busca el diálogo mientras su propio bucle
-  corre, oculta su botón Preview (GTK lo destruye al pulsarlo) y envuelve el
-  contenido en una caja más ancha con la vista previa a la derecha, así la
-  ventana crece a lo ancho sin tocar nada de adentro. La vista previa trae una
-  miniatura de la página (260 px, más grande que las del panel lateral) dibujada
-  por el render de la app y, abajo, las flechas ‹ › con el contador para recorrer
-  el documento; en el folleto cuenta hojas, que es lo que imprime el trabajo.
+  (impresora, rango, copias, papel, orientación e imprimir a PDF). La vista previa
+  se abre en una ventana propia al lado (`src/ui/print.rs`), transitoria del
+  diálogo para quedar encima y cerrarse con él: una miniatura de 260 px (más
+  grande que las del panel lateral) y abajo las flechas ‹ › con el contador. Un
+  timer de 250 ms busca el diálogo mientras su bucle corre, lee su
+  `print_settings` y le pasa al preview las páginas elegidas, así que al cambiar
+  el rango el contador y las flechas siguen a las páginas que saldrían; con
+  “todas”, el documento entero. También oculta el botón Preview del diálogo: GTK
+  lo usa para cerrarlo y mandar las páginas a otra aplicación. En Wayland la
+  posición de la ventana la decide el compositor (no hay forma de pedir “al lado”
+  por API); en X11 queda pegada al diálogo.
 - Exportación: la página suelta se puede guardar en PDF (cairo `PdfSurface` con
   el contenido vectorial de poppler, sin la rotación ni la inversión de la vista),
   PNG o JPEG. La exportación por lotes pide una expresión de páginas
