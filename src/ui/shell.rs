@@ -2837,16 +2837,20 @@ impl Viewer {
         for round in 1..=MAX_ROUNDS {
             print_debug(&format!("ronda {round} de {MAX_ROUNDS}"));
             let operation = build(settings.as_ref(), setup.as_ref());
-            let previewed = Self::install_print_preview(self, &operation);
+            let (previewed, preview_setup) = Self::install_print_preview(self, &operation);
             let result = operation.run(
                 gtk::PrintOperationAction::PrintDialog,
                 Some(&self.ui.window),
             );
 
             // What the reader chose is worth keeping for the dialog that comes
-            // back after a preview.
+            // back after a preview. The page setup comes from the preview's print
+            // context: asking the operation returns null once it finished, and
+            // the binding panics on that.
             settings = operation.print_settings();
-            setup = Some(operation.default_page_setup());
+            if let Some(captured) = preview_setup.borrow().clone() {
+                setup = Some(captured);
+            }
 
             print_debug(&format!(
                 "run devolvió {result:?}, preview atendida: {}",
@@ -2868,15 +2872,23 @@ impl Viewer {
     /// Returns the flag that says the dialog ended because of a preview: GTK
     /// destroys it at that point, and [`Self::run_print_dialog`] rebuilds it
     /// when the preview window closes.
-    fn install_print_preview(self: &Rc<Self>, operation: &gtk::PrintOperation) -> Rc<Cell<bool>> {
+    fn install_print_preview(
+        self: &Rc<Self>,
+        operation: &gtk::PrintOperation,
+    ) -> (Rc<Cell<bool>>, Rc<std::cell::RefCell<Option<gtk::PageSetup>>>) {
         let previewed = Rc::new(Cell::new(false));
         let flag = Rc::clone(&previewed);
+        let page_setup: Rc<std::cell::RefCell<Option<gtk::PageSetup>>> =
+            Rc::new(std::cell::RefCell::new(None));
+        let captured_setup = Rc::clone(&page_setup);
         let pages = operation.n_pages();
         let parent = self.ui.window.clone();
 
         operation.connect_preview(move |_, preview, context, _dialog| {
             print_debug("señal preview: se abre la vista previa de la app");
             flag.set(true);
+            // The paper the reader chose lives here once the dialog is gone.
+            *captured_setup.borrow_mut() = Some(context.page_setup());
             let (window, area) =
                 Viewer::print_preview_window(preview, context, parent.upcast_ref(), pages);
 
@@ -2893,9 +2905,13 @@ impl Viewer {
                 let preview = preview.clone();
                 window.connect_close_request(move |_| {
                     // Ending the preview is what lets run() return, and with it
-                    // the print dialog come back.
+                    // the print dialog come back. It goes on an idle because GTK
+                    // creates the loop that waits for the end of the preview
+                    // after this handler returns: ending it before would leave
+                    // that loop with nobody to stop it.
                     print_debug("cierre de la vista previa: end_preview");
-                    preview.end_preview();
+                    let preview = preview.clone();
+                    glib::idle_add_local_once(move || preview.end_preview());
                     glib::Propagation::Proceed
                 });
             }
@@ -2904,7 +2920,7 @@ impl Viewer {
             true
         });
 
-        previewed
+        (previewed, page_setup)
     }
 
     /// One page of paper, shown as the print preview sees it.

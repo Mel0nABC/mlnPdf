@@ -316,6 +316,56 @@ trailer\n<< /Root 1 0 R /Size 5 >>\n%%EOF\n";
             );
         }
 
+        // After a preview, the operation has to end on its own: that is what
+        // makes run_print_dialog open the print dialog again.
+        {
+            let operation = gtk::PrintOperation::new();
+            operation.set_unit(gtk::Unit::Points);
+            operation.set_n_pages(1);
+
+            let drawn = Rc::new(std::cell::Cell::new(0_u32));
+            let painted = Rc::clone(&drawn);
+            operation.connect_draw_page(move |_, context, _page| {
+                painted.set(painted.get() + 1);
+                let cr = context.cairo_context();
+                let _ = cr.set_source_rgb(1.0, 0.0, 0.0);
+                let _ = cr.paint();
+            });
+
+            let previewed = Rc::new(std::cell::Cell::new(false));
+            let flag = Rc::clone(&previewed);
+            let parent: gtk::Window = viewer.ui.window.clone().upcast();
+            operation.connect_preview(move |_, preview, context, _| {
+                flag.set(true);
+                let (window, _area) = Viewer::print_preview_window(preview, context, &parent, 1);
+                window.present();
+                let ended = preview.clone();
+                window.connect_close_request(move |_| {
+                    let ended = ended.clone();
+                    gtk::glib::idle_add_local_once(move || ended.end_preview());
+                    gtk::glib::Propagation::Proceed
+                });
+                let closing = window.clone();
+                gtk::glib::timeout_add_local_once(
+                    std::time::Duration::from_millis(300),
+                    move || closing.close(),
+                );
+                true
+            });
+
+            let result =
+                operation.run(gtk::PrintOperationAction::Preview, Some(&viewer.ui.window));
+            assert!(previewed.get(), "la vista previa tiene que atenderse en la app");
+            assert!(
+                drawn.get() > 0,
+                "la página se dibuja a través del contexto de impresión"
+            );
+            assert!(
+                matches!(result, Ok(gtk::PrintOperationResult::Apply)),
+                "cerrar la vista previa termina la operación, que es lo que hace volver al diálogo: {result:?}"
+            );
+        }
+
         std::fs::remove_file(&path).ok();
     }
 
