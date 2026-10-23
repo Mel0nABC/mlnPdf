@@ -12,3 +12,7 @@ poppler = { package = "poppler-rs", version = "0.26.0" }
 cairo-rs = { version = "0.22.9", features = ["pdf"] }
 # GLib bindings, used by poppler-rs; the engine must not depend on GTK.
 glib = "0.22"
+# Writing is the one thing poppler-glib cannot do, so the annotations are added
+# with a pure-Rust PDF writer. No default features: neither rayon nor chrono is
+# needed to append an object and save, and both drag extra dependencies in.
+lopdf = { version = "0.46", default-features = false }
