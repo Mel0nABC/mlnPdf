@@ -486,6 +486,60 @@ mod tests {
     }
 
     #[test]
+    fn poppler_paints_the_underline_from_the_written_file() {
+        // La prueba que importa: el archivo escrito, leído por poppler, se ve con
+        // el subrayado. Un rectángulo (20, 20, 120, 40) deja la línea en el borde
+        // inferior, que en pantalla es y = 200 - 160 = 40.
+        let source = scratch("painted.pdf");
+        let target = scratch("painted-out.pdf");
+        std::fs::write(&source, fixture([0.0, 0.0, 200.0, 200.0], 0)).expect("escribir el PDF");
+
+        write_underlines(&source, &target, &[mark(vec![(20.0, 20.0, 120.0, 40.0)])])
+            .expect("escribir el subrayado");
+
+        assert_eq!(
+            reddish_pixels(&std::fs::read(&source).expect("original")),
+            0,
+            "sin anotación no hay nada rojo en la página"
+        );
+        assert!(
+            reddish_pixels(&std::fs::read(&target).expect("resultado")) > 0,
+            "poppler dibuja el subrayado que se escribió"
+        );
+    }
+
+    /// Cuenta los píxeles rojos de la franja donde cae la línea, al rasterizar
+    /// la página con poppler a escala 1.
+    fn reddish_pixels(bytes: &[u8]) -> usize {
+        let document = poppler::Document::from_data(bytes, None).expect("poppler abre el PDF");
+        let page = document.page(0).expect("página 0");
+
+        let mut surface = cairo::ImageSurface::create(cairo::Format::ARgb32, 200, 200)
+            .expect("crear la superficie");
+        {
+            let context = cairo::Context::new(&surface).expect("contexto");
+            context.set_source_rgb(1.0, 1.0, 1.0);
+            context.paint().expect("fondo blanco");
+            page.render(&context);
+        }
+        surface.flush();
+
+        let stride = usize::try_from(surface.stride()).expect("stride");
+        let data = surface.data().expect("píxeles");
+        let mut found = 0;
+        for y in 30..50usize {
+            for x in 40..100usize {
+                let offset = y * stride + x * 4;
+                let (blue, green, red) = (data[offset], data[offset + 1], data[offset + 2]);
+                if red > 150 && green < 120 && blue < 120 {
+                    found += 1;
+                }
+            }
+        }
+        found
+    }
+
+    #[test]
     fn a_second_underline_is_appended_next_to_the_first() {
         let source = scratch("twice.pdf");
         let path = scratch("twice-same.pdf");
