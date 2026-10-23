@@ -4,7 +4,7 @@ use gtk::gio;
 
 /// Keyboard shortcuts bound to the window actions. Declared as data so the
 /// display test can prove every trigger string actually parses.
-pub const SHORTCUTS: [(&str, &str); 34] = [
+pub const SHORTCUTS: [(&str, &str); 35] = [
     ("<Control>plus", "win.zoom-in"),
     ("<Control>equal", "win.zoom-in"),
     ("<Control>minus", "win.zoom-out"),
@@ -39,12 +39,13 @@ pub const SHORTCUTS: [(&str, &str); 34] = [
     ("<Control><Shift>g", "win.search-prev"),
     ("<Control>c", "win.copy-selection"),
     ("<Control>u", "win.underline"),
+    ("<Control><Shift>u", "win.highlight"),
     ("<Control>s", "win.save-annotations"),
     ("<Control><Shift>s", "win.save-annotations-as"),
 ];
 
 /// Human-readable shortcut list shown by Help > Atajos de teclado.
-pub const SHORTCUT_HELP: [(&str, &str); 22] = [
+pub const SHORTCUT_HELP: [(&str, &str); 23] = [
     ("Ctrl+O", "Abrir un PDF"),
     ("Ctrl+P", "Imprimir"),
     ("Ctrl+F", "Buscar en el documento"),
@@ -58,6 +59,7 @@ pub const SHORTCUT_HELP: [(&str, &str); 22] = [
     ("Ctrl+B", "Mostrar u ocultar miniaturas"),
     ("Ctrl+C", "Copiar el texto seleccionado"),
     ("Ctrl+U", "Subrayar el texto seleccionado"),
+    ("Ctrl+Shift+U", "Resaltar el texto seleccionado"),
     ("Ctrl+S / Ctrl+Shift+S", "Guardar los subrayados / guardar una copia"),
     ("Ctrl+Shift+C", "Copiar el texto de la página actual"),
     ("Ctrl+G / Ctrl+Shift+G", "Siguiente / anterior coincidencia"),
@@ -89,6 +91,7 @@ pub fn build_menu_bar() -> gtk::PopoverMenuBar {
     let edit_menu = gio::Menu::new();
     edit_menu.append(Some("Buscar…"), Some("win.search"));
     edit_menu.append(Some("Subrayar"), Some("win.underline"));
+    edit_menu.append(Some("Resaltar"), Some("win.highlight"));
     edit_menu.append(Some("Copiar texto de la página"), Some("win.copy-page-text"));
     model.append_submenu(Some("Edit"), &edit_menu);
 

@@ -20,24 +20,71 @@ pub struct PageBox {
     pub rotation: i32,
 }
 
-/// Un subrayado pendiente de guardar, todavía en memoria.
+/// Qué se dibuja sobre el texto.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarkKind {
+    /// Línea por debajo del texto, opaca.
+    Underline,
+    /// Fondo translúcido sobre el texto, como un rotulador.
+    Highlight,
+}
+
+impl MarkKind {
+    /// Nombre del `/Subtype` de la anotación del PDF.
+    pub fn subtype(self) -> &'static str {
+        match self {
+            Self::Underline => "Underline",
+            Self::Highlight => "Highlight",
+        }
+    }
+
+    /// Posición en la tabla de herramientas del visor.
+    pub fn index(self) -> usize {
+        match self {
+            Self::Underline => 0,
+            Self::Highlight => 1,
+        }
+    }
+
+    /// Transparencia con la que el lector tiene que pintar el marcado: la línea
+    /// va opaca, el resaltado deja leer el texto.
+    pub fn opacity(self) -> f64 {
+        match self {
+            Self::Underline => 1.0,
+            Self::Highlight => 0.4,
+        }
+    }
+}
+
+/// Un marcado pendiente de guardar, todavía en memoria.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Underline {
+pub struct TextMark {
     /// Página, empezando en cero.
     pub page: usize,
     /// Rectángulos por línea de texto, en el espacio de poppler (origen arriba).
     pub rects: Vec<Rect>,
     /// Color RGB con componentes en `0..=1`, como los toma `/C`.
     pub color: [f64; 3],
+    pub kind: MarkKind,
 }
 
-impl Underline {
-    /// Crea el subrayado y acota el color al rango que acepta el PDF.
-    pub fn new(page: usize, rects: Vec<Rect>, color: (f64, f64, f64)) -> Self {
+impl TextMark {
+    /// Subrayado: la línea va por debajo del texto.
+    pub fn underline(page: usize, rects: Vec<Rect>, color: (f64, f64, f64)) -> Self {
+        Self::new(page, rects, color, MarkKind::Underline)
+    }
+
+    /// Resaltado: el fondo del texto, con transparencia.
+    pub fn highlight(page: usize, rects: Vec<Rect>, color: (f64, f64, f64)) -> Self {
+        Self::new(page, rects, color, MarkKind::Highlight)
+    }
+
+    fn new(page: usize, rects: Vec<Rect>, color: (f64, f64, f64), kind: MarkKind) -> Self {
         Self {
             page,
             rects,
             color: [color.0, color.1, color.2].map(|component| component.clamp(0.0, 1.0)),
+            kind,
         }
     }
 
@@ -55,7 +102,7 @@ impl Underline {
 /// del texto en la página tal como se muestra. En una página con `/Rotate` esa
 /// arista no es la de menor `y` en el archivo, y los lectores dibujan el
 /// subrayado sobre ella, así que cada esquina se convierte por separado.
-pub fn underline_quads(rects: &[Rect], page: PageBox) -> Vec<[f64; 8]> {
+pub fn mark_quads(rects: &[Rect], page: PageBox) -> Vec<[f64; 8]> {
     rects
         .iter()
         .map(|rect| {
@@ -128,7 +175,7 @@ mod tests {
     fn an_unrotated_line_lands_on_the_bottom_edge() {
         // El rectángulo de poppler lleva el origen arriba; el PDF lo lleva abajo,
         // así que el borde inferior de la selección es el borde superior de y.
-        let quads = underline_quads(&[line(20.0, 30.0)], PLAIN);
+        let quads = mark_quads(&[line(20.0, 30.0)], PLAIN);
 
         assert_eq!(quads.len(), 1, "una línea, un quad");
         assert_eq!(
@@ -144,7 +191,7 @@ mod tests {
         // ejes y el subrayado tiene que volver al espacio sin girar del archivo.
         let rect = line(20.0, 30.0);
 
-        let rotated_90 = underline_quads(
+        let rotated_90 = mark_quads(
             &[rect],
             PageBox {
                 rotation: 90,
@@ -158,7 +205,7 @@ mod tests {
             [20.0, 10.0, 20.0, 60.0, 30.0, 10.0, 30.0, 60.0]
         );
 
-        let rotated_180 = underline_quads(
+        let rotated_180 = mark_quads(
             &[rect],
             PageBox {
                 rotation: 180,
@@ -170,7 +217,7 @@ mod tests {
             [190.0, 20.0, 140.0, 20.0, 190.0, 30.0, 140.0, 30.0]
         );
 
-        let rotated_270 = underline_quads(
+        let rotated_270 = mark_quads(
             &[rect],
             PageBox {
                 rotation: 270,
@@ -192,20 +239,20 @@ mod tests {
             y0: 20.0,
             ..PLAIN
         };
-        let quads = underline_quads(&[line(20.0, 30.0)], offset);
+        let quads = mark_quads(&[line(20.0, 30.0)], offset);
         assert_eq!(quads[0], [20.0, 100.0, 70.0, 100.0, 20.0, 90.0, 70.0, 90.0]);
 
         let sideways = PageBox {
             rotation: 90,
             ..offset
         };
-        let quads = underline_quads(&[line(20.0, 30.0)], sideways);
+        let quads = mark_quads(&[line(20.0, 30.0)], sideways);
         assert_eq!(quads[0], [30.0, 30.0, 30.0, 80.0, 40.0, 30.0, 40.0, 80.0]);
     }
 
     #[test]
     fn the_annotation_rect_contains_every_quad() {
-        let quads = underline_quads(&[line(20.0, 30.0), line(50.0, 60.0)], PLAIN);
+        let quads = mark_quads(&[line(20.0, 30.0), line(50.0, 60.0)], PLAIN);
         let bounds = bounds_rect(&quads);
 
         assert_eq!(bounds, (10.0, 40.0, 60.0, 80.0), "(x1, y1, x2, y2)");
@@ -213,7 +260,7 @@ mod tests {
 
     #[test]
     fn a_mark_can_be_created_with_its_color_clamped_to_the_valid_range() {
-        let mark = Underline::new(3, vec![line(20.0, 30.0)], (-0.5, 0.5, 2.0));
+        let mark = TextMark::underline(3, vec![line(20.0, 30.0)], (-0.5, 0.5, 2.0));
 
         assert_eq!(mark.page, 3);
         assert_eq!(mark.color, [0.0, 0.5, 1.0], "0..=1, como pide /C");
@@ -223,7 +270,30 @@ mod tests {
 
     #[test]
     fn a_mark_without_rects_is_empty() {
-        let mark = Underline::new(0, Vec::new(), (1.0, 0.0, 0.0));
+        let mark = TextMark::highlight(0, Vec::new(), (1.0, 0.0, 0.0));
         assert!(mark.is_empty(), "un arrastre sin texto no subraya nada");
+    }
+
+    #[test]
+    fn each_kind_declares_how_the_reader_has_to_paint_it() {
+        assert_eq!(MarkKind::Underline.subtype(), "Underline");
+        assert_eq!(MarkKind::Underline.opacity(), 1.0);
+
+        assert_eq!(MarkKind::Highlight.subtype(), "Highlight");
+        assert!(
+            MarkKind::Highlight.opacity() < 1.0,
+            "el resaltado deja leer el texto"
+        );
+    }
+
+    #[test]
+    fn both_kinds_keep_the_color_and_the_rects() {
+        let underline = TextMark::underline(1, vec![line(20.0, 30.0)], (1.0, 0.0, 0.0));
+        let highlight = TextMark::highlight(1, vec![line(20.0, 30.0)], (1.0, 0.0, 0.0));
+
+        assert_eq!(underline.kind, MarkKind::Underline);
+        assert_eq!(highlight.kind, MarkKind::Highlight);
+        assert_eq!(underline.color, highlight.color);
+        assert_eq!(underline.rects, highlight.rects);
     }
 }

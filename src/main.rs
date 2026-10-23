@@ -25,6 +25,7 @@ mod tests {
     use crate::ui::actions::*;
     use std::rc::Rc;
     use crate::engine::geometry::*;
+    use crate::engine::annotation::MarkKind;
     use crate::ui::shell::*;
 
     /// One page, 200x100 pt, fully filled with pure red, no xref table
@@ -196,7 +197,11 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
             }
             children
         };
-        assert_eq!(children.len(), 6, "búsqueda, hueco, páginas, hueco, zoom, subrayar");
+        assert_eq!(
+            children.len(),
+            7,
+            "búsqueda, hueco, páginas, hueco, zoom, subrayar, resaltar"
+        );
         for gap in [&children[1], &children[3]] {
             assert_eq!(
                 gap.size_request().0,
@@ -209,10 +214,12 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
             TOOLBAR_GAP,
             "el bloque de páginas no es una separación"
         );
-        assert!(
-            children[5].is::<gtk::ToggleButton>(),
-            "el subrayado va justo al lado del zoom"
-        );
+        for (index, name) in [(5, "el subrayado"), (6, "el resaltado")] {
+            assert!(
+                children[index].is::<gtk::ToggleButton>(),
+                "{name} va justo al lado del zoom"
+            );
+        }
 
         // Every declared shortcut must be a valid trigger, and every action it
         // names must exist on the window, or the key silently does nothing.
@@ -315,14 +322,14 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
         std::fs::write(&text_path, TEXT_PAGE_PDF).expect("write scratch text PDF");
         viewer.open(&text_path).expect("open the text page");
         assert!(
-            viewer.ui.underline_button.is_sensitive(),
+            viewer.ui.tools[0].button.is_sensitive(),
             "con un documento abierto la herramienta está disponible"
         );
         assert!(
-            viewer.ui.underline_popover.child().is_some(),
+            viewer.ui.tools[0].popover.child().is_some(),
             "el botón abre un diálogo con sus opciones"
         );
-        let chosen = viewer.ui.underline_color.rgba();
+        let chosen = viewer.ui.tools[0].color_button.rgba();
         assert!(
             (f64::from(chosen.red()) - UNDERLINE_COLOR.0).abs() < 0.01
                 && (f64::from(chosen.green()) - UNDERLINE_COLOR.1).abs() < 0.01,
@@ -332,18 +339,18 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
         viewer.begin_selection(0, 20.0, 10.0);
         viewer.update_selection(0, 180.0, 35.0);
         viewer.finish_selection();
-        viewer.refresh_underline_actions();
+        viewer.refresh_mark_actions(MarkKind::Underline);
         assert!(
-            viewer.ui.underline_apply.is_sensitive(),
+            viewer.ui.tools[0].apply.is_sensitive(),
             "con texto seleccionado el botón del diálogo se habilita"
         );
         assert!(
-            viewer.apply_underline_to_selection(),
+            viewer.apply_mark(MarkKind::Underline),
             "la selección se subraya al instante"
         );
         assert_eq!(viewer.annot.marks.borrow().len(), 1, "un subrayado");
         assert!(
-            viewer.has_pending_underlines(),
+            viewer.has_pending_marks(),
             "el subrayado queda pendiente de guardar"
         );
         assert_eq!(
@@ -358,24 +365,23 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
 
         gtk::prelude::WidgetExt::activate_action(&viewer.ui.window, "win.underline", None)
             .expect("la acción de subrayar tiene que existir");
-        assert!(viewer.annot.active.get(), "la herramienta queda armada");
-        pump_until(|| viewer.ui.underline_popover.is_visible());
+        assert!(viewer.mark_tool(MarkKind::Underline).active, "la herramienta queda armada");
+        pump_until(|| viewer.ui.tools[0].popover.is_visible());
 
         // El diálogo de color de GTK es otra ventana: al abrirlo, el popover se
-        // cierra por el foco. Eso no puede apagar la herramienta, y al elegir el
-        // color el diálogo tiene que volver a estar a la vista.
-        viewer.ui.underline_popover.popdown();
-        viewer.ui.underline_color.set_rgba(&gtk::gdk::RGBA::new(0.15, 0.45, 0.85, 1.0));
+        // cierra por el foco. Eso no puede apagar la herramienta, y el diálogo no
+        // tiene por qué reabrirse: se elige el color y se sigue con el arrastre.
+        viewer.ui.tools[0].popover.popdown();
+        viewer.ui.tools[0].color_button.set_rgba(&gtk::gdk::RGBA::new(0.15, 0.45, 0.85, 1.0));
         assert!(
-            viewer.annot.active.get(),
-            "elegir el color no cierra el diálogo de subrayar"
+            viewer.mark_tool(MarkKind::Underline).active,
+            "elegir el color no apaga la herramienta"
         );
-        let chosen_color = viewer.annot.color.get();
+        let chosen_color = viewer.mark_tool(MarkKind::Underline).color;
         assert!(
             chosen_color.0 < 0.5 && chosen_color.2 > 0.5,
             "el color elegido queda guardado para el próximo subrayado"
         );
-        pump_until(|| viewer.ui.underline_popover.is_visible());
 
         viewer.begin_selection(0, 20.0, 155.0);
         viewer.update_selection(0, 160.0, 40.0);
@@ -391,21 +397,75 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
         );
         assert!(
             viewer.escape_pressed() == gtk::glib::Propagation::Stop
-                && !viewer.annot.active.get(),
+                && !viewer.mark_tool(MarkKind::Underline).active,
             "Esc sale del modo subrayar"
         );
 
-        // Guardar: los subrayados entran en el archivo abierto y dejan de estar
+        // Resaltar: mismo gesto que subrayar, con fondo translúcido. Armar una
+        // herramienta apaga la otra y el color es independiente.
+        gtk::prelude::WidgetExt::activate_action(&viewer.ui.window, "win.highlight", None)
+            .expect("la acción de resaltar tiene que existir");
+        assert!(
+            viewer.mark_tool(MarkKind::Highlight).active,
+            "la herramienta de resaltar queda armada"
+        );
+        assert!(
+            !viewer.mark_tool(MarkKind::Underline).active,
+            "subrayar y resaltar no pueden estar armadas a la vez"
+        );
+        pump_until(|| viewer.ui.tools[1].popover.is_visible());
+        assert!(
+            viewer.ui.tools[1].popover.child().is_some(),
+            "el resaltado también abre su diálogo con el selector de color"
+        );
+
+        viewer.begin_selection(0, 20.0, 60.0);
+        viewer.update_selection(0, 120.0, 20.0);
+        viewer.finish_selection();
+        assert_eq!(
+            viewer.annot.marks.borrow().len(),
+            3,
+            "con la herramienta de resaltar el arrastre marca solo"
+        );
+        let highlight = viewer.annot.marks.borrow()[2].clone();
+        assert_eq!(highlight.kind, MarkKind::Highlight, "el marcado es un resaltado");
+        assert_eq!(
+            highlight.color,
+            [HIGHLIGHT_COLOR.0, HIGHLIGHT_COLOR.1, HIGHLIGHT_COLOR.2],
+            "el resaltado arranca con su propio color"
+        );
+        assert!(
+            viewer.mark_tool(MarkKind::Underline).color != viewer.mark_tool(MarkKind::Highlight).color,
+            "cada herramienta recuerda su color"
+        );
+
+        // Resaltar también se aplica a una selección ya hecha, como subrayar.
+        viewer.set_mark_mode(MarkKind::Highlight, false);
+        viewer.begin_selection(0, 20.0, 155.0);
+        viewer.update_selection(0, 160.0, 40.0);
+        viewer.refresh_mark_actions(MarkKind::Highlight);
+        assert!(
+            viewer.ui.tools[1].apply.is_sensitive(),
+            "con texto seleccionado el botón de resaltar se habilita"
+        );
+        assert!(
+            viewer.apply_mark(MarkKind::Highlight),
+            "el resaltado se aplica al instante sobre la selección"
+        );
+        assert_eq!(viewer.annot.marks.borrow().len(), 4);
+        assert_eq!(viewer.annot.marks.borrow()[3].kind, MarkKind::Highlight);
+
+        // Guardar: los marcados entran en el archivo abierto y dejan de estar
         // pendientes. Descartar tira sólo lo que todavía no se escribió.
         assert!(
-            viewer.save_pending_underlines(&text_path),
-            "guardar escribe los subrayados en el archivo abierto"
+            viewer.save_pending_marks(&text_path),
+            "guardar escribe los marcados en el archivo abierto"
         );
-        assert!(!viewer.has_pending_underlines(), "ya no queda nada pendiente");
+        assert!(!viewer.has_pending_marks(), "ya no queda nada pendiente");
         assert_eq!(
             written_annotations(&text_path),
-            2,
-            "el archivo tiene una anotación por subrayado"
+            4,
+            "el archivo tiene una anotación por marcado, subrayados y resaltados"
         );
         assert!(
             poppler::Document::from_data(&std::fs::read(&text_path).expect("leer"), None).is_ok(),
@@ -415,42 +475,42 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
         viewer.begin_selection(0, 20.0, 10.0);
         viewer.update_selection(0, 180.0, 35.0);
         viewer.finish_selection();
-        viewer.refresh_underline_actions();
-        assert!(viewer.apply_underline_to_selection(), "otro subrayado");
-        assert!(viewer.has_pending_underlines());
-        viewer.discard_underlines();
+        viewer.refresh_mark_actions(MarkKind::Underline);
+        assert!(viewer.apply_mark(MarkKind::Underline), "otro subrayado");
+        assert!(viewer.has_pending_marks());
+        viewer.discard_marks();
         assert!(
-            !viewer.has_pending_underlines(),
+            !viewer.has_pending_marks(),
             "descartar limpia lo que estaba pendiente"
         );
         assert_eq!(
             viewer.annot.marks.borrow().len(),
-            2,
+            4,
             "lo que ya estaba guardado se queda"
         );
         assert_eq!(
             written_annotations(&text_path),
-            2,
+            4,
             "descartar no toca el archivo"
         );
 
         // Sin cambios pendientes, cerrar no pregunta nada: la acción sigue sola.
         let ran = std::rc::Rc::new(std::cell::Cell::new(0));
         let counter = ran.clone();
-        viewer.resolve_pending_underlines(move |_| counter.set(counter.get() + 1));
-        assert_eq!(ran.get(), 1, "sin subrayados pendientes no hay diálogo");
+        viewer.resolve_pending_marks(move |_| counter.set(counter.get() + 1));
+        assert_eq!(ran.get(), 1, "sin marcados pendientes no hay diálogo");
 
         // Con cambios pendientes, la acción original espera la decisión: aparece
-        // el diálogo y, al cerrarlo sin elegir, se descarta lo pendiente.
+        // el diálogo y no se sigue hasta que el lector elige.
         viewer.begin_selection(0, 20.0, 10.0);
         viewer.update_selection(0, 180.0, 35.0);
         viewer.finish_selection();
-        viewer.refresh_underline_actions();
-        assert!(viewer.apply_underline_to_selection(), "un subrayado pendiente");
+        viewer.refresh_mark_actions(MarkKind::Underline);
+        assert!(viewer.apply_mark(MarkKind::Underline), "un marcado pendiente");
 
         let ran = std::rc::Rc::new(std::cell::Cell::new(0));
         let counter = ran.clone();
-        viewer.resolve_pending_underlines(move |_| counter.set(counter.get() + 1));
+        viewer.resolve_pending_marks(move |_| counter.set(counter.get() + 1));
         assert_eq!(ran.get(), 0, "con cambios pendientes nada sigue solo");
 
         // El diálogo ofrece guardar o descartar; acá se elige descartar.
@@ -460,12 +520,12 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
         );
         pump_until(|| ran.get() == 1);
         assert!(
-            !viewer.has_pending_underlines(),
+            !viewer.has_pending_marks(),
             "descartar deja el documento sin cambios pendientes"
         );
         assert_eq!(
             written_annotations(&text_path),
-            2,
+            4,
             "descartar no escribe nada en el archivo"
         );
 
@@ -473,12 +533,12 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
         viewer.begin_selection(0, 20.0, 155.0);
         viewer.update_selection(0, 160.0, 40.0);
         viewer.finish_selection();
-        viewer.refresh_underline_actions();
-        assert!(viewer.apply_underline_to_selection(), "un pendiente más");
+        viewer.refresh_mark_actions(MarkKind::Underline);
+        assert!(viewer.apply_mark(MarkKind::Underline), "un pendiente más");
 
         let ran = std::rc::Rc::new(std::cell::Cell::new(0));
         let counter = ran.clone();
-        viewer.resolve_pending_underlines(move |_| counter.set(counter.get() + 1));
+        viewer.resolve_pending_marks(move |_| counter.set(counter.get() + 1));
         assert_eq!(ran.get(), 0, "el cierre espera la decisión");
         assert!(
             click_dialog_button(&viewer, "Guardar"),
@@ -486,13 +546,13 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
         );
         pump_until(|| ran.get() == 1);
         assert!(
-            !viewer.has_pending_underlines(),
+            !viewer.has_pending_marks(),
             "guardar deja el documento sin cambios pendientes"
         );
         assert_eq!(
             written_annotations(&text_path),
-            3,
-            "el tercer subrayado llegó al archivo"
+            5,
+            "el marcado pendiente llegó al archivo"
         );
 
         // Guardar una copia no puede dejar como "guardado en el archivo abierto"
@@ -500,28 +560,28 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
         viewer.begin_selection(0, 20.0, 10.0);
         viewer.update_selection(0, 180.0, 35.0);
         viewer.finish_selection();
-        viewer.refresh_underline_actions();
-        assert!(viewer.apply_underline_to_selection(), "un cuarto subrayado");
+        viewer.refresh_mark_actions(MarkKind::Underline);
+        assert!(viewer.apply_mark(MarkKind::Underline), "un marcado más");
         let copy = dir.join("copy-ui.pdf");
         std::fs::remove_file(&copy).ok();
-        assert!(viewer.save_pending_underlines(&copy), "guardar la copia");
-        assert_eq!(written_annotations(&copy), 4, "la copia lleva los cuatro");
+        assert!(viewer.save_pending_marks(&copy), "guardar la copia");
+        assert_eq!(written_annotations(&copy), 6, "la copia lleva los seis");
         assert_eq!(
             written_annotations(&text_path),
-            3,
-            "el original sigue con tres"
+            5,
+            "el original sigue con cinco"
         );
         assert!(
-            viewer.has_pending_underlines(),
+            viewer.has_pending_marks(),
             "guardar una copia deja el original pendiente de guardar"
         );
         viewer.save_annotations();
         assert_eq!(
             written_annotations(&text_path),
-            4,
-            "el original recibe el cuarto"
+            6,
+            "el original recibe el sexto"
         );
-        assert!(!viewer.has_pending_underlines());
+        assert!(!viewer.has_pending_marks());
         std::fs::remove_file(&copy).ok();
 
         std::fs::remove_file(&text_path).ok();

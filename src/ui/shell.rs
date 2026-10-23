@@ -40,6 +40,13 @@ const UNDERLINE_WIDTH: f64 = 2.0;
 /// highlight over white paper and as a line over dark paper.
 pub(crate) const UNDERLINE_COLOR: (f64, f64, f64) = (0.93, 0.67, 0.0);
 
+/// Color with which a new highlight starts: the marker yellow.
+pub(crate) const HIGHLIGHT_COLOR: (f64, f64, f64) = (1.0, 0.88, 0.2);
+
+/// Transparency of a highlight on screen. It is the same value the annotation
+/// carries in `/CA`, so the page and the saved file read the same.
+pub(crate) const HIGHLIGHT_ALPHA: f64 = 0.4;
+
 /// Width of the thumbnails in the side panel, in logical pixels.
 const THUMB_WIDTH: i32 = 120;
 
@@ -100,12 +107,19 @@ pub(crate) struct UiHandles {
     pub(crate)     thumbs_store: gio::ListStore,
     pub(crate)     thumbs_selection: gtk::SingleSelection,
     pub(crate)     scale_provider: gtk::CssProvider,
-    pub(crate)     underline_button: gtk::ToggleButton,
-    pub(crate)     underline_popover: gtk::Popover,
-    pub(crate)     underline_apply: gtk::Button,
+    /// Un juego de botón, diálogo y selector de color por cada herramienta de
+    /// marcado, en el orden de `MarkKind::index`.
+    pub(crate)     tools: [MarkToolUi; 2],
+}
+
+/// Widgets de una herramienta de marcado.
+pub(crate) struct MarkToolUi {
+    pub(crate) button: gtk::ToggleButton,
+    pub(crate) popover: gtk::Popover,
+    pub(crate) apply: gtk::Button,
     /// Sólo lo leen las pruebas: la elección se guarda en `AnnotationState`.
     #[allow(dead_code)]
-    pub(crate)     underline_color: gtk::ColorDialogButton,
+    pub(crate) color_button: gtk::ColorDialogButton,
 }
 
 /// The open document and everything derived from it.
@@ -167,16 +181,23 @@ pub(crate) struct SelectionState {
     pub(crate)     selection_start: Cell<Option<(f64, f64)>>,
 }
 
-/// Subrayados y el estado de la herramienta que los crea.
-pub(crate) struct AnnotationState {
-    /// Subrayados en memoria, en orden de creación. Los primeros `saved` ya
-    /// están escritos en el archivo; el resto son los cambios pendientes.
-    pub(crate)     marks: RefCell<Vec<Underline>>,
-    pub(crate)     saved: Cell<usize>,
+/// Una herramienta de marcado: el color elegido y si está armada. Las dos son
+/// excluyentes, así que a lo sumo una está activa.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct MarkTool {
     /// Color elegido en el selector de GTK, con componentes en `0..=1`.
-    pub(crate)     color: Cell<(f64, f64, f64)>,
-    /// Modo subrayar: el próximo arrastre sobre el texto crea un subrayado.
-    pub(crate)     active: Cell<bool>,
+    pub(crate) color: (f64, f64, f64),
+    pub(crate) active: bool,
+}
+
+/// Marcados y el estado de las dos herramientas que los crean.
+pub(crate) struct AnnotationState {
+    /// Marcados en memoria, en orden de creación. Los primeros `saved` ya
+    /// están escritos en el archivo; el resto son los cambios pendientes.
+    pub(crate)     marks: RefCell<Vec<TextMark>>,
+    pub(crate)     saved: Cell<usize>,
+    pub(crate)     underline: Cell<MarkTool>,
+    pub(crate)     highlight: Cell<MarkTool>,
 }
 
 /// Transient interaction state.
@@ -254,67 +275,13 @@ impl Viewer {
         zoom_box.append(&zoom_label);
         zoom_box.append(&zoom_in_button);
 
-        // Underline tool, right next to the zoom. A button with an underlined
-        // "U" instead of an icon: Adwaita ships no underline glyph and a label
-        // keeps the meaning visible in every theme.
-        let underline_glyph = gtk::Label::new(None);
-        underline_glyph.set_markup("<u>U</u>");
-        let underline_button = gtk::ToggleButton::builder()
-            .child(&underline_glyph)
-            .tooltip_text("Subrayar (Ctrl+U)")
-            .margin_start(6)
-            .build();
-        accessible_label(&underline_button, "Subrayar el texto seleccionado");
-
-        let underline_color = gtk::ColorDialogButton::new(Some(
-            gtk::ColorDialog::builder()
-                .title("Color del subrayado")
-                .with_alpha(false)
-                .build(),
-        ));
-        underline_color.set_rgba(&gdk::RGBA::new(
-            UNDERLINE_COLOR.0 as f32,
-            UNDERLINE_COLOR.1 as f32,
-            UNDERLINE_COLOR.2 as f32,
-            1.0,
-        ));
-        underline_color.set_tooltip_text(Some("Color del subrayado"));
-        accessible_label(&underline_color, "Color del subrayado");
-
-        let underline_apply = gtk::Button::with_label("Subrayar la selección");
-        underline_apply.add_css_class("suggested-action");
-        underline_apply.set_sensitive(false);
-        accessible_label(&underline_apply, "Subrayar el texto seleccionado");
-
-        let underline_title = gtk::Label::new(None);
-        underline_title.set_markup("<b>Subrayar</b>");
-        underline_title.set_xalign(0.0);
-        let underline_hint = gtk::Label::new(Some(
-            "Elegí el color y arrastrá sobre el texto. Esc sale del modo.",
-        ));
-        underline_hint.add_css_class("dim-label");
-        underline_hint.set_wrap(true);
-        underline_hint.set_max_width_chars(28);
-        underline_hint.set_xalign(0.0);
-
-        let color_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        color_row.append(&gtk::Label::new(Some("Color")));
-        color_row.append(&underline_color);
-
-        let underline_content = gtk::Box::new(gtk::Orientation::Vertical, 8);
-        underline_content.set_margin_top(10);
-        underline_content.set_margin_bottom(10);
-        underline_content.set_margin_start(10);
-        underline_content.set_margin_end(10);
-        underline_content.append(&underline_title);
-        underline_content.append(&color_row);
-        underline_content.append(&underline_hint);
-        underline_content.append(&underline_apply);
-
-        let underline_popover = gtk::Popover::new();
-        underline_popover.set_child(Some(&underline_content));
-        underline_popover.set_has_arrow(true);
-        underline_popover.set_parent(&underline_button);
+        // Las dos herramientas de marcado, justo al lado del zoom. Usan una
+        // letra como glifo: Adwaita no trae iconos de subrayado ni de rotulador y
+        // una etiqueta se lee igual en cualquier tema.
+        let tools = [
+            build_mark_tool(&mark_spec(MarkKind::Underline)),
+            build_mark_tool(&mark_spec(MarkKind::Highlight)),
+        ];
 
         let title = gtk::Label::new(Some(WINDOW_TITLE));
 
@@ -375,7 +342,8 @@ impl Viewer {
         controls.append(&toolbar_nav.root);
         controls.append(&toolbar_gap(TOOLBAR_GAP));
         controls.append(&zoom_box);
-        controls.append(&underline_button);
+        controls.append(&tools[0].button);
+        controls.append(&tools[1].button);
 
         // Secondary toolbar: the group stays centred, whatever the window width.
         let toolbar = gtk::Box::builder()
@@ -461,10 +429,7 @@ impl Viewer {
                 thumbs_store: thumbs_store.clone(),
                 thumbs_selection: thumbs_selection.clone(),
                 scale_provider: scale_provider.clone(),
-                underline_button: underline_button.clone(),
-                underline_popover: underline_popover.clone(),
-                underline_apply: underline_apply.clone(),
-                underline_color: underline_color.clone(),
+                tools,
             },
             doc: DocumentState {
                 document: RefCell::new(None),
@@ -506,8 +471,14 @@ impl Viewer {
             annot: AnnotationState {
                 marks: RefCell::new(Vec::new()),
                 saved: Cell::new(0),
-                color: Cell::new(UNDERLINE_COLOR),
-                active: Cell::new(false),
+                underline: Cell::new(MarkTool {
+                    color: UNDERLINE_COLOR,
+                    active: false,
+                }),
+                highlight: Cell::new(MarkTool {
+                    color: HIGHLIGHT_COLOR,
+                    active: false,
+                }),
             },
             input: InteractionState {
                 hand_mode: Cell::new(false),
@@ -532,54 +503,43 @@ impl Viewer {
         Self::connect_click(&viewer, &zoom_in_button, |viewer| viewer.zoom_in());
         Self::connect_click(&viewer, &zoom_out_button, |viewer| viewer.zoom_out());
 
-        let weak = Rc::downgrade(&viewer);
-        underline_button.connect_toggled(move |button| {
-            if let Some(viewer) = weak.upgrade() {
-                viewer.set_underline_mode(button.is_active());
-            }
-        });
+        for kind in [MarkKind::Underline, MarkKind::Highlight] {
+            let ui = &viewer.ui.tools[kind.index()];
 
-        // The apply button only works with a live selection, and the selection
-        // may have changed while the popover was closed.
-        let weak = Rc::downgrade(&viewer);
-        underline_popover.connect_map(move |_| {
-            if let Some(viewer) = weak.upgrade() {
-                viewer.refresh_underline_actions();
-            }
-        });
-
-        Self::connect_click(&viewer, &underline_apply, |viewer| {
-            viewer.apply_underline_to_selection();
-        });
-
-        // El diálogo de color es otra ventana de GTK: al abrirlo, el popover
-        // pierde el foco y se cierra solo. Eso no puede apagar la herramienta,
-        // porque el lector todavía está eligiendo cómo subrayar; el estado vive
-        // en el botón y en Esc, no en la visibilidad del popover.
-        let weak = Rc::downgrade(&viewer);
-        underline_color.connect_rgba_notify(move |button| {
-            if let Some(viewer) = weak.upgrade() {
-                let rgba = button.rgba();
-                viewer
-                    .annot
-                    .color
-                    .set((rgba.red().into(), rgba.green().into(), rgba.blue().into()));
-                if viewer.annot.active.get() {
-                    viewer.refresh_underline_actions();
-                    // Se vuelve a abrir cuando el diálogo de color ya se fue:
-                    // presentar una ventana desde el cierre de otra deja el
-                    // oscurecido colgado.
-                    let weak = Rc::downgrade(&viewer);
-                    Self::after_modal(move || {
-                        if let Some(viewer) = weak.upgrade()
-                            && viewer.annot.active.get()
-                        {
-                            viewer.ui.underline_popover.popup();
-                        }
-                    });
+            let weak = Rc::downgrade(&viewer);
+            ui.button.connect_toggled(move |button| {
+                if let Some(viewer) = weak.upgrade() {
+                    viewer.set_mark_mode(kind, button.is_active());
                 }
-            }
-        });
+            });
+
+            // The apply button only works with a live selection, and the
+            // selection may have changed while the popover was closed.
+            let weak = Rc::downgrade(&viewer);
+            ui.popover.connect_map(move |_| {
+                if let Some(viewer) = weak.upgrade() {
+                    viewer.refresh_mark_actions(kind);
+                }
+            });
+
+            Self::connect_click(&viewer, &ui.apply, move |viewer| {
+                viewer.apply_mark(kind);
+            });
+
+            // Elegir el color no reabre el diálogo ni apaga la herramienta: el
+            // diálogo de color es otra ventana de GTK y el popover se cierra al
+            // cambiar el foco, que es lo esperado.
+            let weak = Rc::downgrade(&viewer);
+            ui.color_button.connect_rgba_notify(move |button| {
+                if let Some(viewer) = weak.upgrade() {
+                    let rgba = button.rgba();
+                    viewer.set_mark_color(
+                        kind,
+                        (rgba.red().into(), rgba.green().into(), rgba.blue().into()),
+                    );
+                }
+            });
+        }
         for index in 0..viewer.ui.navs.len() {
             Self::install_nav(&viewer, index);
         }
@@ -839,7 +799,12 @@ impl Viewer {
         Self::install_action(viewer, "shortcuts", |viewer| viewer.show_shortcuts());
         Self::install_action(viewer, "open", |viewer| viewer.choose_file());
         Self::install_action(viewer, "hand-mode", |viewer| viewer.toggle_hand_mode());
-        Self::install_action(viewer, "underline", |viewer| viewer.toggle_underline_mode());
+        Self::install_action(viewer, "underline", |viewer| {
+            viewer.toggle_mark_mode(MarkKind::Underline);
+        });
+        Self::install_action(viewer, "highlight", |viewer| {
+            viewer.toggle_mark_mode(MarkKind::Highlight);
+        });
         Self::install_action(viewer, "save-annotations", |viewer| viewer.save_annotations());
         Self::install_action(viewer, "save-annotations-as", |viewer| {
             viewer.save_annotations_as(None);
@@ -1003,7 +968,7 @@ impl Viewer {
         *self.doc.document.borrow_mut() = Some(document);
         *self.doc.current_path.borrow_mut() = Some(path.to_path_buf());
         // Los subrayados pertenecen al documento anterior.
-        self.clear_underlines();
+        self.clear_marks();
         *self.sel.selection.borrow_mut() = None;
         self.sel.selection_rects.borrow_mut().clear();
         self.view.zoom.set(ZOOM_DEFAULT);
@@ -1028,7 +993,7 @@ impl Viewer {
     /// dialog or a drop) resumes where the reader left it.
     pub(crate) fn open_reporting(self: &Rc<Self>, path: &Path) {
         let path = path.to_path_buf();
-        self.resolve_pending_underlines(move |viewer| viewer.open_reporting_now(&path));
+        self.resolve_pending_marks(move |viewer| viewer.open_reporting_now(&path));
     }
 
     /// Opens the document, asking for a password when it is encrypted.
@@ -1552,8 +1517,9 @@ impl Viewer {
     /// Turns the hand tool on or off and keeps the cursor consistent.
     pub(crate) fn set_hand_mode(&self, active: bool) {
         if active {
-            // Las dos herramientas no pueden estar activas a la vez.
-            self.set_underline_mode(false);
+            // Las tres herramientas no pueden estar activas a la vez.
+            self.set_mark_mode(MarkKind::Underline, false);
+            self.set_mark_mode(MarkKind::Highlight, false);
         }
         self.input.hand_mode.set(active);
         if !active {
@@ -1568,7 +1534,7 @@ impl Viewer {
     pub(crate) fn refresh_page_cursor(&self) {
         if self.input.hand_mode.get() {
             self.apply_hand_cursor(Some("grab"));
-        } else if self.annot.active.get() {
+        } else if self.active_mark_tool().is_some() {
             self.apply_hand_cursor(Some("text"));
         } else {
             self.apply_hand_cursor(None);
@@ -1577,41 +1543,88 @@ impl Viewer {
         }
     }
 
-    /// Arms or disarms the underline tool and keeps the button, the dialog and
-    /// the cursor telling the same story.
-    pub(crate) fn set_underline_mode(&self, active: bool) {
+    /// Herramienta de marcado armada, si hay alguna: subrayar y resaltar son
+    /// excluyentes.
+    pub(crate) fn active_mark_tool(&self) -> Option<MarkKind> {
+        if self.annot.underline.get().active {
+            Some(MarkKind::Underline)
+        } else if self.annot.highlight.get().active {
+            Some(MarkKind::Highlight)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn mark_tool(&self, kind: MarkKind) -> MarkTool {
+        match kind {
+            MarkKind::Underline => self.annot.underline.get(),
+            MarkKind::Highlight => self.annot.highlight.get(),
+        }
+    }
+
+    fn set_mark_tool(&self, kind: MarkKind, tool: MarkTool) {
+        match kind {
+            MarkKind::Underline => self.annot.underline.set(tool),
+            MarkKind::Highlight => self.annot.highlight.set(tool),
+        }
+    }
+
+    fn keep_color(&self, kind: MarkKind, color: (f64, f64, f64)) {
+        let mut tool = self.mark_tool(kind);
+        tool.color = color;
+        self.set_mark_tool(kind, tool);
+    }
+
+    /// Guarda el color elegido en el selector de GTK para la próxima marca.
+    pub(crate) fn set_mark_color(&self, kind: MarkKind, color: (f64, f64, f64)) {
+        self.keep_color(kind, color);
+    }
+
+    /// Arms or disarms one marking tool and keeps the button, the dialog and the
+    /// cursor telling the same story.
+    pub(crate) fn set_mark_mode(&self, kind: MarkKind, active: bool) {
         let active = active && self.doc.document.borrow().is_some();
         if active {
             self.set_hand_mode(false);
+            // La otra herramienta de marcado se apaga.
+            for other in [MarkKind::Underline, MarkKind::Highlight] {
+                if other != kind {
+                    self.set_mark_mode(other, false);
+                }
+            }
         }
-        self.annot.active.set(active);
 
-        if self.ui.underline_button.is_active() != active {
-            self.ui.underline_button.set_active(active);
+        let mut tool = self.mark_tool(kind);
+        tool.active = active;
+        self.set_mark_tool(kind, tool);
+
+        let ui = &self.ui.tools[kind.index()];
+        if ui.button.is_active() != active {
+            ui.button.set_active(active);
         }
         if active {
-            self.refresh_underline_actions();
-            self.ui.underline_popover.popup();
+            self.refresh_mark_actions(kind);
+            ui.popover.popup();
         } else {
-            self.ui.underline_popover.popdown();
+            ui.popover.popdown();
         }
         self.refresh_page_cursor();
     }
 
-    pub(crate) fn toggle_underline_mode(&self) {
-        self.set_underline_mode(!self.annot.active.get());
+    pub(crate) fn toggle_mark_mode(&self, kind: MarkKind) {
+        self.set_mark_mode(kind, !self.mark_tool(kind).active);
     }
 
     /// The apply button only makes sense with text selected.
-    pub(crate) fn refresh_underline_actions(&self) {
+    pub(crate) fn refresh_mark_actions(&self, kind: MarkKind) {
         let ready = self.sel.selection.borrow().is_some()
             && !self.sel.selection_rects.borrow().is_empty();
-        self.ui.underline_apply.set_sensitive(ready);
+        self.ui.tools[kind.index()].apply.set_sensitive(ready);
     }
 
-    /// Subraya lo que esté seleccionado en este momento. Devuelve `false`
-    /// cuando no hay selección o no cubre texto.
-    pub(crate) fn apply_underline_to_selection(&self) -> bool {
+    /// Marca lo que esté seleccionado en este momento. Devuelve `false` cuando
+    /// no hay selección o no cubre texto.
+    pub(crate) fn apply_mark(&self, kind: MarkKind) -> bool {
         let Some(selection) = *self.sel.selection.borrow() else {
             return false;
         };
@@ -1620,36 +1633,39 @@ impl Viewer {
             return false;
         }
 
-        let color = self.annot.color.get();
-        self.annot
-            .marks
-            .borrow_mut()
-            .push(Underline::new(selection.page, rects, color));
+        let color = self.mark_tool(kind).color;
+        let mark = match kind {
+            MarkKind::Underline => TextMark::underline(selection.page, rects, color),
+            MarkKind::Highlight => TextMark::highlight(selection.page, rects, color),
+        };
+        self.annot.marks.borrow_mut().push(mark);
 
-        // La selección azul taparía el subrayado que se acaba de poner.
+        // La selección azul taparía el marcado que se acaba de poner.
         *self.sel.selection.borrow_mut() = None;
         self.sel.selection_rects.borrow_mut().clear();
         self.queue_page_draw(selection.page);
-        self.refresh_underline_actions();
+        for kind in [MarkKind::Underline, MarkKind::Highlight] {
+            self.refresh_mark_actions(kind);
+        }
         true
     }
 
-    /// True when there are underlines that are not in the file yet.
-    pub(crate) fn has_pending_underlines(&self) -> bool {
+    /// True when there are marks that are not in the file yet.
+    pub(crate) fn has_pending_marks(&self) -> bool {
         self.annot.saved.get() < self.annot.marks.borrow().len()
     }
 
     /// Escribe los subrayados pendientes en `target` y devuelve si quedaron
     /// guardados; si el guardado falla, deja el estado como estaba para que el
     /// lector pueda reintentarlo.
-    pub(crate) fn save_pending_underlines(&self, target: &Path) -> bool {
+    pub(crate) fn save_pending_marks(&self, target: &Path) -> bool {
         let source = self.doc.current_path.borrow().clone();
         let Some(source) = source else {
             show_error(&self.ui.window, "No hay ningún documento abierto.", "");
             return false;
         };
 
-        let pending: Vec<Underline> = {
+        let pending: Vec<TextMark> = {
             let marks = self.annot.marks.borrow();
             marks[self.annot.saved.get().min(marks.len())..].to_vec()
         };
@@ -1657,20 +1673,20 @@ impl Viewer {
             return true;
         }
 
-        match write_underlines(&source, target, &pending) {
+        match write_marks(&source, target, &pending) {
             Ok(written) => {
                 // Sólo es un guardado del documento abierto si el destino es ese
                 // archivo: la copia no deja el original al día.
                 if self.is_open_file(target) {
                     self.annot.saved.set(self.annot.marks.borrow().len());
                 }
-                let plural = if written == 1 { "subrayado" } else { "subrayados" };
+                let plural = if written == 1 { "marcado" } else { "marcados" };
                 self.ui.window.announce(
                     &format!("Guardados {written} {plural} en el PDF"),
                     gtk::AccessibleAnnouncementPriority::Medium,
                 );
                 self.notify(
-                    "Subrayados guardados",
+                    "Marcados guardados",
                     &format!("{written} {plural} en {}", display_name(target)),
                 );
                 true
@@ -1678,7 +1694,7 @@ impl Viewer {
             Err(message) => {
                 show_error(
                     &self.ui.window,
-                    "No se pudieron guardar los subrayados.",
+                    "No se pudieron guardar los marcados.",
                     &message,
                 );
                 false
@@ -1703,14 +1719,14 @@ impl Viewer {
             show_error(&self.ui.window, "No hay ningún documento abierto.", "");
             return;
         };
-        if !self.has_pending_underlines() {
+        if !self.has_pending_marks() {
             self.ui.window.announce(
-                "No hay subrayados sin guardar",
+                "No hay marcas sin guardar",
                 gtk::AccessibleAnnouncementPriority::Low,
             );
             return;
         }
-        self.save_pending_underlines(&path);
+        self.save_pending_marks(&path);
     }
 
     /// Guarda los subrayados en otro archivo, dejando el original como estaba.
@@ -1718,10 +1734,10 @@ impl Viewer {
         let name = self.suggested_name("pdf");
         Self::ask_save_path(
             self,
-            "Guardar una copia con los subrayados",
+            "Guardar una copia con los marcados",
             Some(name),
             move |viewer, target| {
-                if viewer.save_pending_underlines(target) {
+                if viewer.save_pending_marks(target) {
                     if let Some(then) = then.as_ref() {
                         then(viewer);
                     }
@@ -1731,7 +1747,7 @@ impl Viewer {
     }
 
     /// Subrayados que todavía no están en el archivo.
-    pub(crate) fn pending_underlines(&self) -> Vec<Underline> {
+    pub(crate) fn pending_marks(&self) -> Vec<TextMark> {
         let marks = self.annot.marks.borrow();
         marks[self.annot.saved.get().min(marks.len())..].to_vec()
     }
@@ -1739,16 +1755,16 @@ impl Viewer {
     /// Pregunta qué hacer con los subrayados sin guardar y sólo después ejecuta
     /// `then`, con la decisión ya tomada. Sin cambios pendientes `then` corre en
     /// el acto: el camino normal no paga ningún diálogo.
-    pub(crate) fn resolve_pending_underlines(
+    pub(crate) fn resolve_pending_marks(
         self: &Rc<Self>,
         then: impl Fn(&Rc<Self>) + 'static,
     ) {
-        if !self.has_pending_underlines() {
+        if !self.has_pending_marks() {
             then(self);
             return;
         }
 
-        let count = self.pending_underlines().len();
+        let count = self.pending_marks().len();
         let name = self
             .doc
             .current_path
@@ -1756,7 +1772,7 @@ impl Viewer {
             .as_ref()
             .map(|path| display_name(path))
             .unwrap_or_default();
-        let plural = if count == 1 { "subrayado" } else { "subrayados" };
+        let plural = if count == 1 { "marcado" } else { "marcados" };
 
         let dialog = gtk::AlertDialog::builder()
             .modal(true)
@@ -1778,12 +1794,12 @@ impl Viewer {
                 };
                 match result {
                     Ok(0) => {
-                        viewer.discard_underlines();
+                        viewer.discard_marks();
                         then(&viewer);
                     }
                     // Guardar: si falla, no se sigue con la acción original.
                     Ok(1) => {
-                        if viewer.save_pending_underlines_file() {
+                        if viewer.save_pending_marks_file() {
                             then(&viewer);
                         }
                     }
@@ -1791,7 +1807,7 @@ impl Viewer {
                     // que los pendientes quedan resueltos; cancelar el diálogo de
                     // archivo deja todo como estaba.
                     Ok(2) => viewer.save_annotations_as(Some(Box::new(move |viewer| {
-                        viewer.discard_underlines();
+                        viewer.discard_marks();
                         then(viewer);
                     }))),
                     // Cerrar el diálogo con Esc o con la X no elige nada: la
@@ -1802,16 +1818,16 @@ impl Viewer {
         );
     }
 
-    fn save_pending_underlines_file(self: &Rc<Self>) -> bool {
+    fn save_pending_marks_file(self: &Rc<Self>) -> bool {
         let Some(path) = self.doc.current_path.borrow().clone() else {
             return false;
         };
-        self.save_pending_underlines(&path)
+        self.save_pending_marks(&path)
     }
 
     /// Tira los cambios pendientes y redibuja para que desaparezcan de la página.
     /// Lo que ya está escrito en el archivo se queda.
-    pub(crate) fn discard_underlines(&self) {
+    pub(crate) fn discard_marks(&self) {
         let saved = self.annot.saved.get().min(self.annot.marks.borrow().len());
         let pages: Vec<usize> = self.annot.marks.borrow()[saved..]
             .iter()
@@ -1823,14 +1839,15 @@ impl Viewer {
         }
     }
 
-    /// Deja el documento sin subrayados en memoria: se usan al abrir otro.
-    pub(crate) fn clear_underlines(&self) {
+    /// Deja el documento sin marcados en memoria: se usan al abrir otro.
+    pub(crate) fn clear_marks(&self) {
         self.annot.marks.borrow_mut().clear();
         self.annot.saved.set(0);
-        self.set_underline_mode(false);
+        self.set_mark_mode(MarkKind::Underline, false);
+        self.set_mark_mode(MarkKind::Highlight, false);
     }
 
-    /// Dibuja la capa de la página: primero los subrayados, que son parte del
+    /// Dibuja la capa de la página: primero los marcados, que son parte del
     /// documento, y encima la selección que se está arrastrando.
     pub(crate) fn draw_page_overlay(
         &self,
@@ -1840,13 +1857,13 @@ impl Viewer {
         width: i32,
         height: i32,
     ) {
-        self.draw_underlines(page, context);
+        self.draw_marks(page, context);
         self.draw_selection(page, area, context, width, height);
     }
 
-    /// Pinta el borde inferior de cada rectángulo de línea: eso es, justo por
-    /// debajo del texto.
-    pub(crate) fn draw_underlines(&self, page: usize, context: &cairo::Context) {
+    /// Pinta los marcados de la página: el subrayado sobre el borde inferior de
+    /// cada línea de texto y el resaltado como fondo translúcido.
+    pub(crate) fn draw_marks(&self, page: usize, context: &cairo::Context) {
         let marks = self.annot.marks.borrow();
         if marks.iter().all(|mark| mark.page != page) {
             return;
@@ -1857,18 +1874,41 @@ impl Viewer {
 
         let zoom = self.view.zoom.get();
         let rotation = self.view.rotation.get();
-        context.set_line_cap(cairo::LineCap::Butt);
-        context.set_line_width((UNDERLINE_WIDTH * zoom).max(1.0));
 
         for mark in marks.iter().filter(|mark| mark.page == page) {
-            context.set_source_rgba(mark.color[0], mark.color[1], mark.color[2], 1.0);
-            for (x1, _, x2, y2) in mark.rects.iter() {
-                let (px1, py1) = forward_rotation((*x1, *y2), size, rotation);
-                let (px2, py2) = forward_rotation((*x2, *y2), size, rotation);
-                context.move_to(px1 * zoom, py1 * zoom);
-                context.line_to(px2 * zoom, py2 * zoom);
+            match mark.kind {
+                MarkKind::Underline => {
+                    context.set_line_cap(cairo::LineCap::Butt);
+                    context.set_line_width((UNDERLINE_WIDTH * zoom).max(1.0));
+                    context.set_source_rgba(mark.color[0], mark.color[1], mark.color[2], 1.0);
+                    for (x1, _, x2, y2) in mark.rects.iter() {
+                        let (px1, py1) = forward_rotation((*x1, *y2), size, rotation);
+                        let (px2, py2) = forward_rotation((*x2, *y2), size, rotation);
+                        context.move_to(px1 * zoom, py1 * zoom);
+                        context.line_to(px2 * zoom, py2 * zoom);
+                    }
+                    let _ = context.stroke();
+                }
+                MarkKind::Highlight => {
+                    context.set_source_rgba(
+                        mark.color[0],
+                        mark.color[1],
+                        mark.color[2],
+                        HIGHLIGHT_ALPHA,
+                    );
+                    for rect in mark.rects.iter() {
+                        let (px1, py1) = forward_rotation((rect.0, rect.1), size, rotation);
+                        let (px2, py2) = forward_rotation((rect.2, rect.3), size, rotation);
+                        context.rectangle(
+                            px1.min(px2) * zoom,
+                            py1.min(py2) * zoom,
+                            (px1 - px2).abs() * zoom,
+                            (py1 - py2).abs() * zoom,
+                        );
+                    }
+                    let _ = context.fill();
+                }
             }
-            let _ = context.stroke();
         }
     }
 
@@ -1925,8 +1965,8 @@ impl Viewer {
             self.toggle_presentation();
             return glib::Propagation::Stop;
         }
-        if self.annot.active.get() {
-            self.set_underline_mode(false);
+        if let Some(kind) = self.active_mark_tool() {
+            self.set_mark_mode(kind, false);
             return glib::Propagation::Stop;
         }
         if self.input.hand_mode.get() {
@@ -2638,11 +2678,16 @@ impl Viewer {
         }
         self.queue_page_draw(selection.page);
 
-        // Con la herramienta armada, el arrastre termina en un subrayado.
-        if self.annot.active.get() {
-            self.apply_underline_to_selection();
-        } else {
-            self.refresh_underline_actions();
+        // Con una herramienta armada, el arrastre termina en un marcado.
+        match self.active_mark_tool() {
+            Some(kind) => {
+                self.apply_mark(kind);
+            }
+            None => {
+                for kind in [MarkKind::Underline, MarkKind::Highlight] {
+                    self.refresh_mark_actions(kind);
+                }
+            }
         }
     }
 
@@ -4055,7 +4100,7 @@ impl Viewer {
     }
 
     pub(crate) fn close_document(self: &Rc<Self>) {
-        self.resolve_pending_underlines(|viewer| viewer.close_document_now());
+        self.resolve_pending_marks(|viewer| viewer.close_document_now());
     }
 
     fn close_document_now(&self) {
@@ -4070,7 +4115,7 @@ impl Viewer {
         self.nav.current.set(0);
         *self.sel.selection.borrow_mut() = None;
         self.sel.selection_rects.borrow_mut().clear();
-        self.clear_underlines();
+        self.clear_marks();
         self.ui.title.set_label(WINDOW_TITLE);
         self.sync_thumbnails();
         self.set_indicator(0);
@@ -4110,7 +4155,7 @@ impl Viewer {
     }
 
     pub(crate) fn reload(self: &Rc<Self>) {
-        self.resolve_pending_underlines(|viewer| viewer.reload_now());
+        self.resolve_pending_marks(|viewer| viewer.reload_now());
     }
 
     fn reload_now(&self) {
@@ -4232,8 +4277,10 @@ impl Viewer {
     pub(crate) fn set_indicator(&self, index: usize) {
         let total = self.page_count();
         if total == 0 {
-            self.ui.underline_button.set_active(false);
-            self.ui.underline_button.set_sensitive(false);
+            for tool in &self.ui.tools {
+                tool.button.set_active(false);
+                tool.button.set_sensitive(false);
+            }
             for nav in &self.ui.navs {
                 nav.entry.set_text("");
                 nav.entry.set_sensitive(false);
@@ -4245,7 +4292,9 @@ impl Viewer {
         }
 
         let index = index.min(total - 1);
-        self.ui.underline_button.set_sensitive(true);
+        for tool in &self.ui.tools {
+            tool.button.set_sensitive(true);
+        }
         self.nav.current.set(index);
         if self.ui.thumbs_selection.selected() != index as u32 {
             self.input.thumb_sync.set(true);
@@ -4294,6 +4343,111 @@ fn thumbnail_row_page(row: &gtk::Widget) -> Option<usize> {
 /// Fixed-width spacer for the toolbar: the two gaps that separate the search,
 /// the page controls and the zoom, so the distance between them is a number of
 /// the layout and not of the leftover space.
+/// Lo que distingue a una herramienta de marcado de la otra al construirla.
+struct MarkToolSpec {
+    glyph_markup: &'static str,
+    tooltip: &'static str,
+    title: &'static str,
+    apply_label: &'static str,
+    accessible: &'static str,
+    color_title: &'static str,
+    default_color: (f64, f64, f64),
+}
+
+fn mark_spec(kind: MarkKind) -> MarkToolSpec {
+    match kind {
+        MarkKind::Underline => MarkToolSpec {
+            // Una "U" subrayada: Adwaita no trae glifo de subrayado.
+            glyph_markup: "<u>U</u>",
+            tooltip: "Subrayar (Ctrl+U)",
+            title: "Subrayar",
+            apply_label: "Subrayar la selección",
+            accessible: "Subrayar el texto seleccionado",
+            color_title: "Color del subrayado",
+            default_color: UNDERLINE_COLOR,
+        },
+        MarkKind::Highlight => MarkToolSpec {
+            // Una "A" con fondo de rotulador.
+            glyph_markup: "<span background=\"#FFE082\">A</span>",
+            tooltip: "Resaltar (Ctrl+Shift+U)",
+            title: "Resaltar",
+            apply_label: "Resaltar la selección",
+            accessible: "Resaltar el texto seleccionado",
+            color_title: "Color del resaltado",
+            default_color: HIGHLIGHT_COLOR,
+        },
+    }
+}
+
+/// Botón, diálogo y selector de color de una herramienta de marcado.
+fn build_mark_tool(spec: &MarkToolSpec) -> MarkToolUi {
+    let glyph = gtk::Label::new(None);
+    glyph.set_markup(spec.glyph_markup);
+    let button = gtk::ToggleButton::builder()
+        .child(&glyph)
+        .tooltip_text(spec.tooltip)
+        .margin_start(6)
+        .build();
+    accessible_label(&button, spec.accessible);
+
+    let color_button = gtk::ColorDialogButton::new(Some(
+        gtk::ColorDialog::builder()
+            .title(spec.color_title)
+            .with_alpha(false)
+            .build(),
+    ));
+    color_button.set_rgba(&gdk::RGBA::new(
+        spec.default_color.0 as f32,
+        spec.default_color.1 as f32,
+        spec.default_color.2 as f32,
+        1.0,
+    ));
+    color_button.set_tooltip_text(Some(spec.color_title));
+    accessible_label(&color_button, spec.color_title);
+
+    let apply = gtk::Button::with_label(spec.apply_label);
+    apply.add_css_class("suggested-action");
+    apply.set_sensitive(false);
+    accessible_label(&apply, spec.accessible);
+
+    let title = gtk::Label::new(None);
+    title.set_markup(&format!("<b>{}</b>", spec.title));
+    title.set_xalign(0.0);
+    let hint = gtk::Label::new(Some(
+        "Elegí el color y arrastrá sobre el texto. Esc sale del modo.",
+    ));
+    hint.add_css_class("dim-label");
+    hint.set_wrap(true);
+    hint.set_max_width_chars(28);
+    hint.set_xalign(0.0);
+
+    let color_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    color_row.append(&gtk::Label::new(Some("Color")));
+    color_row.append(&color_button);
+
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    content.set_margin_top(10);
+    content.set_margin_bottom(10);
+    content.set_margin_start(10);
+    content.set_margin_end(10);
+    content.append(&title);
+    content.append(&color_row);
+    content.append(&hint);
+    content.append(&apply);
+
+    let popover = gtk::Popover::new();
+    popover.set_child(Some(&content));
+    popover.set_has_arrow(true);
+    popover.set_parent(&button);
+
+    MarkToolUi {
+        button,
+        popover,
+        apply,
+        color_button,
+    }
+}
+
 fn toolbar_gap(width: i32) -> gtk::Box {
     let gap = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     gap.set_size_request(width, -1);

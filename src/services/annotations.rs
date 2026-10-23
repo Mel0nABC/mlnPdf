@@ -6,15 +6,15 @@ use std::path::{Path, PathBuf};
 
 use lopdf::{Dictionary, Document, Object, ObjectId};
 
-use crate::engine::annotation::{bounds_rect, underline_quads, PageBox, Underline};
+use crate::engine::annotation::{bounds_rect, mark_quads, MarkKind, PageBox, TextMark};
 
-/// Agrega los subrayados al PDF y lo escribe en `target`; devuelve cuántas
+/// Agrega los marcados al PDF y lo escribe en `target`; devuelve cuántas
 /// anotaciones quedaron escritas.
 ///
 /// `source` es el archivo que hay que editar y no se toca hasta que el nuevo
 /// documento está completo en el disco. Cuando `target` es el mismo archivo que
 /// `source`, el guardado es atómico: primero el temporal, después el reemplazo.
-pub fn write_underlines(source: &Path, target: &Path, marks: &[Underline]) -> Result<u32, String> {
+pub fn write_marks(source: &Path, target: &Path, marks: &[TextMark]) -> Result<u32, String> {
     let mut document = Document::load(source)
         .map_err(|error| format!("no se pudo abrir el PDF para editarlo: {error}"))?;
     // `is_encrypted` mira el trailer actual y `was_encrypted` recuerda el archivo
@@ -35,11 +35,11 @@ pub fn write_underlines(source: &Path, target: &Path, marks: &[Underline]) -> Re
             continue;
         };
         let page_box = page_box(&document, page_id)?;
-        let quads = underline_quads(&mark.rects, page_box);
+        let quads = mark_quads(&mark.rects, page_box);
         if quads.is_empty() {
             continue;
         }
-        let annotation = annotation_dictionary(&quads, mark.color);
+        let annotation = annotation_dictionary(&quads, mark.color, mark.kind);
         push_annotation(&mut document, page_id, annotation)?;
         written += 1;
     }
@@ -48,13 +48,13 @@ pub fn write_underlines(source: &Path, target: &Path, marks: &[Underline]) -> Re
     Ok(written)
 }
 
-/// Diccionario de la anotación `/Underline`, lista para colgar de `/Annots`.
-fn annotation_dictionary(quads: &[[f64; 8]], color: [f64; 3]) -> Object {
+/// Diccionario de la anotación de marcado, listo para colgar de `/Annots`.
+fn annotation_dictionary(quads: &[[f64; 8]], color: [f64; 3], kind: MarkKind) -> Object {
     let rect = bounds_rect(quads);
 
     let mut dictionary = Dictionary::new();
     dictionary.set("Type", Object::Name(b"Annot".to_vec()));
-    dictionary.set("Subtype", Object::Name(b"Underline".to_vec()));
+    dictionary.set("Subtype", Object::Name(kind.subtype().as_bytes().to_vec()));
     dictionary.set(
         "Rect",
         Object::Array(vec![real(rect.0), real(rect.1), real(rect.2), real(rect.3)]),
@@ -73,6 +73,10 @@ fn annotation_dictionary(quads: &[[f64; 8]], color: [f64; 3]) -> Object {
         Object::Array(vec![real(color[0]), real(color[1]), real(color[2])]),
     );
     // Print flag without a border: el subrayado, no una caja de anotación.
+    if kind.opacity() < 1.0 {
+        // Sin `/CA` el lector pinta el resaltado opaco y tapa el texto.
+        dictionary.set("CA", real(kind.opacity()));
+    }
     dictionary.set("F", Object::Integer(4));
     dictionary.set(
         "Border",
@@ -315,8 +319,8 @@ mod tests {
         bytes
     }
 
-    fn mark(rects: Vec<(f64, f64, f64, f64)>) -> Underline {
-        Underline::new(0, rects, (1.0, 0.0, 0.0))
+    fn mark(rects: Vec<(f64, f64, f64, f64)>) -> TextMark {
+        TextMark::underline(0, rects, (1.0, 0.0, 0.0))
     }
 
     /// Números de `/QuadPoints` o de cualquier lista del diccionario.
@@ -337,7 +341,7 @@ mod tests {
         let target = scratch("plain-out.pdf");
         std::fs::write(&source, fixture([0.0, 0.0, 200.0, 200.0], 0)).expect("escribir el PDF");
 
-        let written = write_underlines(&source, &target, &[mark(vec![(20.0, 20.0, 120.0, 40.0)])])
+        let written = write_marks(&source, &target, &[mark(vec![(20.0, 20.0, 120.0, 40.0)])])
             .expect("el subrayado tiene que escribirse");
         assert_eq!(written, 1);
 
@@ -385,7 +389,7 @@ mod tests {
         let original = fixture([0.0, 0.0, 200.0, 100.0], 0);
         std::fs::write(&source, &original).expect("escribir el PDF");
 
-        write_underlines(&source, &target, &[mark(vec![(10.0, 10.0, 60.0, 20.0)])])
+        write_marks(&source, &target, &[mark(vec![(10.0, 10.0, 60.0, 20.0)])])
             .expect("guardar como");
 
         assert_eq!(
@@ -400,7 +404,7 @@ mod tests {
         let path = scratch("same.pdf");
         std::fs::write(&path, fixture([0.0, 0.0, 200.0, 100.0], 0)).expect("escribir el PDF");
 
-        write_underlines(&path, &path, &[mark(vec![(10.0, 10.0, 60.0, 20.0)])])
+        write_marks(&path, &path, &[mark(vec![(10.0, 10.0, 60.0, 20.0)])])
             .expect("guardar encima");
 
         let bytes = std::fs::read(&path).expect("leer el resultado");
@@ -453,7 +457,7 @@ mod tests {
                 "rotación {rotation}: sin anotación no hay nada rojo"
             );
 
-            write_underlines(&source, &target, &[Underline::new(0, rects.clone(), (1.0, 0.0, 0.0))])
+            write_marks(&source, &target, &[TextMark::underline(0, rects.clone(), (1.0, 0.0, 0.0))])
                 .expect("escribir el subrayado");
             let line = reddish_bbox(
                 &std::fs::read(&target).expect("leer resultado"),
@@ -564,6 +568,101 @@ mod tests {
     }
 
     #[test]
+    fn a_highlight_is_written_translucent_and_leaves_the_text_readable() {
+        let source = scratch("highlight.pdf");
+        let target = scratch("highlight-out.pdf");
+        std::fs::write(&source, upright_text_page(0)).expect("escribir fixture");
+
+        let bytes = std::fs::read(&source).expect("leer fixture");
+        let pdf = poppler::Document::from_data(&bytes, None).expect("poppler abre");
+        let page = pdf.page(0).expect("página");
+        let (width, height) = page.size();
+        let rects = crate::engine::selection::page_selection_region(
+            &page,
+            crate::engine::selection::Selection {
+                page: 0,
+                anchor: (0.0, 0.0),
+                head: (width, height),
+            },
+        );
+        assert!(!rects.is_empty(), "el texto tiene que estar");
+
+        write_marks(
+            &source,
+            &target,
+            &[TextMark::highlight(0, rects, (1.0, 0.9, 0.0))],
+        )
+        .expect("escribir el resaltado");
+
+        let document = Document::load(&target).expect("cargar el resultado");
+        let page_id = *document.get_pages().get(&1).expect("página 1");
+        let annotations = document.get_page_annotations(page_id).expect("anotaciones");
+        assert_eq!(
+            annotations[0]
+                .get(b"Subtype")
+                .and_then(Object::as_name)
+                .expect("Subtype"),
+            b"Highlight"
+        );
+        assert!(
+            (f64::from(
+                annotations[0]
+                    .get(b"CA")
+                    .and_then(Object::as_float)
+                    .expect("CA")
+            ) - 0.4)
+                .abs()
+                < 0.01,
+            "el resaltado tiene que ser translúcido"
+        );
+
+        // Rasterizado: el resaltado se ve y la tinta del texto sigue leyéndose.
+        // Sin `/CA`, el texto quedaría tapado y no habría píxeles oscurecidos.
+        let (yellow, ink) = highlight_pixels(
+            &std::fs::read(&target).expect("leer resultado"),
+            (width, height),
+        );
+        assert!(yellow > 0, "poppler pinta el resaltado");
+        assert!(ink > 0, "el texto se tiene que seguir leyendo bajo el color");
+    }
+
+    /// Cuenta píxeles amarillentos y píxeles de texto teñidos en la página.
+    fn highlight_pixels(bytes: &[u8], size: (f64, f64)) -> (usize, usize) {
+        let document = poppler::Document::from_data(bytes, None).expect("poppler abre el PDF");
+        let page = document.page(0).expect("página 0");
+        let mut surface = cairo::ImageSurface::create(
+            cairo::Format::ARgb32,
+            size.0.ceil() as i32,
+            size.1.ceil() as i32,
+        )
+        .expect("crear la superficie");
+        {
+            let context = cairo::Context::new(&surface).expect("contexto");
+            context.set_source_rgb(1.0, 1.0, 1.0);
+            context.paint().expect("fondo blanco");
+            page.render(&context);
+        }
+        surface.flush();
+
+        let stride = usize::try_from(surface.stride()).expect("stride");
+        let (pixel_width, pixel_height) = (surface.width() as usize, surface.height() as usize);
+        let data = surface.data().expect("píxeles");
+        let (mut yellow, mut ink) = (0, 0);
+        for row in 0..pixel_height {
+            for column in 0..pixel_width {
+                let offset = row * stride + column * 4;
+                let (blue, green, red) = (data[offset], data[offset + 1], data[offset + 2]);
+                if red > 200 && green > 180 && blue < 160 {
+                    yellow += 1;
+                } else if red < 200 && green < 200 {
+                    ink += 1;
+                }
+            }
+        }
+        (yellow, ink)
+    }
+
+    #[test]
     fn a_protected_pdf_is_never_rewritten_unencrypted() {
         // Contraseña de dueño con la de usuario vacía: se abre sin preguntar y
         // lopdf la descifra al cargar, así que el guardado tiene que negarse o
@@ -597,7 +696,7 @@ mod tests {
             "el fixture tiene que venir cifrado"
         );
 
-        let result = write_underlines(&source, &target, &[mark(vec![(10.0, 10.0, 60.0, 20.0)])]);
+        let result = write_marks(&source, &target, &[mark(vec![(10.0, 10.0, 60.0, 20.0)])]);
 
         assert!(result.is_err(), "un PDF protegido no se puede reescribir");
         assert_eq!(
@@ -616,7 +715,7 @@ mod tests {
         std::fs::write(&path, fixture([0.0, 0.0, 200.0, 200.0], 0)).expect("escribir el PDF");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
 
-        write_underlines(&path, &path, &[mark(vec![(10.0, 10.0, 60.0, 20.0)])])
+        write_marks(&path, &path, &[mark(vec![(10.0, 10.0, 60.0, 20.0)])])
             .expect("guardar encima");
 
         assert_eq!(
@@ -632,7 +731,7 @@ mod tests {
         let target = scratch("inherited-out.pdf");
         std::fs::write(&source, inherited_fixture()).expect("escribir el PDF");
 
-        write_underlines(&source, &target, &[mark(vec![(0.0, 0.0, 50.0, 10.0)])])
+        write_marks(&source, &target, &[mark(vec![(0.0, 0.0, 50.0, 10.0)])])
             .expect("escribir el subrayado");
 
         let document = Document::load(&target).expect("cargar el resultado");
@@ -654,7 +753,7 @@ mod tests {
         let mut out_of_range = mark(vec![(10.0, 10.0, 60.0, 20.0)]);
         out_of_range.page = 7;
         let written =
-            write_underlines(&source, &target, &[out_of_range]).expect("guardar sin subrayados");
+            write_marks(&source, &target, &[out_of_range]).expect("guardar sin subrayados");
         assert_eq!(written, 0);
 
         let document = Document::load(&target).expect("el archivo sigue siendo un PDF");
@@ -674,9 +773,9 @@ mod tests {
         let path = scratch("twice-same.pdf");
         std::fs::write(&source, fixture([0.0, 0.0, 200.0, 200.0], 0)).expect("escribir el PDF");
 
-        write_underlines(&source, &path, &[mark(vec![(10.0, 10.0, 60.0, 20.0)])])
+        write_marks(&source, &path, &[mark(vec![(10.0, 10.0, 60.0, 20.0)])])
             .expect("primer subrayado");
-        write_underlines(&path, &path, &[mark(vec![(10.0, 50.0, 60.0, 60.0)])])
+        write_marks(&path, &path, &[mark(vec![(10.0, 50.0, 60.0, 60.0)])])
             .expect("segundo subrayado");
 
         let document = Document::load(&path).expect("cargar el resultado");

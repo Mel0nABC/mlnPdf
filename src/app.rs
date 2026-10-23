@@ -65,12 +65,12 @@ pub(crate) fn install_viewer(
             let Some(viewer) = weak.upgrade() else {
                 return glib::Propagation::Proceed;
             };
-            if !viewer.has_pending_underlines() {
+            if !viewer.has_pending_marks() {
                 viewer.save_state();
                 return glib::Propagation::Proceed;
             }
             let window = window.clone();
-            viewer.resolve_pending_underlines(move |viewer| {
+            viewer.resolve_pending_marks(move |viewer| {
                 viewer.save_state();
                 window.close();
             });
