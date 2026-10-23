@@ -13,7 +13,7 @@ use crate::ui::shell::Viewer;
 
 /// Width of the preview thumbnail, in logical pixels: bigger than the sidebar
 /// thumbnails, so a page reads at a glance.
-const PREVIEW_WIDTH: i32 = 260;
+pub(crate) const PREVIEW_WIDTH: i32 = 260;
 
 /// Widget with one page of the document and the arrows that walk through them.
 ///

@@ -256,28 +256,44 @@ trailer\n<< /Root 1 0 R /Size 5 >>\n%%EOF\n";
         assert_eq!(viewer.ui.zoom_label.label(), "100 %");
         pump_until(|| size_request_at(&viewer.ui.pages, 0) == (200, 100));
 
-        // The preview lives inside GTK's print dialog, so it is a widget of the
-        // app: it shows a page and walks the document with its arrows.
+        // The preview is injected into GTK's own print dialog: the dialog keeps
+        // every option it has and gains the pages on the right.
         {
-            let preview = crate::ui::print::preview_widget(&viewer, 1);
-            let window = gtk::Window::builder()
-                .title("prueba de vista previa")
-                .child(&preview)
-                .build();
-            window.present();
-
+            let dialog = gtk::PrintUnixDialog::new(Some("prueba"), Some(&viewer.ui.window));
+            dialog.present();
             let mut waited = 0;
-            while !preview.is_mapped() && waited < 100 {
+            while !dialog.is_visible() && waited < 100 {
                 gtk::glib::MainContext::default().iteration(false);
                 std::thread::sleep(std::time::Duration::from_millis(5));
                 waited += 1;
             }
-            assert!(preview.is_mapped(), "la vista previa tiene que mostrarse");
-            assert!(
-                labels(&preview).iter().any(|text| text == "1 / 1"),
-                "la vista previa arranca en la primera página"
+            assert!(dialog.is_visible(), "el diálogo de imprimir se tiene que mostrar");
+
+            let preview = crate::ui::print::preview_widget(&viewer, 1);
+            crate::ui::shell::install_preview_into_dialog(&dialog, &preview);
+
+            let body = dialog.child().expect("el diálogo conserva su contenido");
+            let mut children = Vec::new();
+            let mut child = body.first_child();
+            while let Some(widget) = child {
+                child = widget.next_sibling();
+                children.push(widget);
+            }
+            assert_eq!(children.len(), 3, "contenido del diálogo, separador y vista previa");
+            assert_eq!(children[2], preview, "la vista previa va a la derecha");
+            assert_eq!(
+                preview.parent(),
+                Some(body.clone()),
+                "la vista previa cuelga del cuerpo del diálogo"
             );
-            window.close();
+            #[allow(deprecated)]
+            let apply = dialog.widget_for_response(gtk::ResponseType::Apply);
+            assert!(
+                apply.is_none_or(|button| !button.is_visible()),
+                "el botón Preview ya no se ofrece"
+            );
+            assert!(dialog.default_width() > 0, "la ventana se ensancha");
+            dialog.close();
         }
 
         std::fs::remove_file(&path).ok();

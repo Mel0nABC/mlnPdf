@@ -195,15 +195,15 @@ necesita una decisión o una dependencia nueva.
   y pinta rectángulos translúcidos al rasterizar. Los hits se limitan a 300 para
   que una palabra común no dispare tiempo y memoria. Antes bloqueaba el bucle
   principal ~1,4 s en un PDF de 666 páginas.
-- Impresión: el diálogo sigue siendo el de GTK (impresora, rango, copias, papel,
-  orientación e imprimir a PDF), sin tocar nada de él. Lo único que se agrega es
-  la vista previa, en la pestaña “Vista previa” que el propio diálogo arma con el
-  widget que pide por `create-custom-widget`: una miniatura de la página (260 px,
-  más grande que las del panel lateral) y flechas ‹ › con el contador para
-  recorrer el documento. La dibuja el render de la app, no el contexto de
-  impresión. El dibujado del trabajo escala la página al área imprimible y
-  respeta la rotación actual. En el folleto la vista previa cuenta hojas, que es
-  lo que imprime el trabajo.
+- Impresión: el diálogo sigue siendo el de GTK, con todas sus opciones intactas
+  (impresora, rango, copias, papel, orientación e imprimir a PDF). Lo único que se
+  agrega es la vista previa: un timer busca el diálogo mientras su propio bucle
+  corre, oculta su botón Preview (GTK lo destruye al pulsarlo) y envuelve el
+  contenido en una caja más ancha con la vista previa a la derecha, así la
+  ventana crece a lo ancho sin tocar nada de adentro. La vista previa trae una
+  miniatura de la página (260 px, más grande que las del panel lateral) dibujada
+  por el render de la app y, abajo, las flechas ‹ › con el contador para recorrer
+  el documento; en el folleto cuenta hojas, que es lo que imprime el trabajo.
 - Exportación: la página suelta se puede guardar en PDF (cairo `PdfSurface` con
   el contenido vectorial de poppler, sin la rotación ni la inversión de la vista),
   PNG o JPEG. La exportación por lotes pide una expresión de páginas
