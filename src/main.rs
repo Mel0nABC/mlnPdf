@@ -256,114 +256,33 @@ trailer\n<< /Root 1 0 R /Size 5 >>\n%%EOF\n";
         assert_eq!(viewer.ui.zoom_label.label(), "100 %");
         pump_until(|| size_request_at(&viewer.ui.pages, 0) == (200, 100));
 
-        // Print preview: the window is ours, so the print dialog underneath is
-        // never closed by GTK's hand-off, and pages render through the print
-        // context exactly like they print.
+        // The print dialog is ours: it shows the pages while you choose, and it
+        // has no Preview button to take the dialog away.
         {
-            let operation = gtk::PrintOperation::new();
-            operation.set_unit(gtk::Unit::Points);
-            operation.set_n_pages(2);
-
-            let drawn = Rc::new(std::cell::Cell::new(0_u32));
-            let painted = Rc::clone(&drawn);
-            operation.connect_draw_page(move |_, context, _page| {
-                painted.set(painted.get() + 1);
-                let cr = context.cairo_context();
-                let _ = cr.set_source_rgb(1.0, 0.0, 0.0);
-                let _ = cr.paint();
+            let viewer_for_dialog = Rc::clone(&viewer);
+            crate::ui::print::show_dialog(&viewer, 1, "prueba", move |_settings| {
+                let _ = &viewer_for_dialog;
             });
-
-            let seen: Rc<std::cell::RefCell<Option<gtk::Window>>> =
-                Rc::new(std::cell::RefCell::new(None));
-            let captured = Rc::clone(&seen);
-            let parent: gtk::Window = viewer.ui.window.clone().upcast();
-            operation.connect_preview(move |_, preview, context, _dialog| {
-                let (window, _area) = Viewer::print_preview_window(preview, context, &parent, 2);
-                window.present();
-                *captured.borrow_mut() = Some(window.clone());
-                // Closing the preview ends the operation, which is what lets the
-                // print dialog come back afterwards.
-                let ended = preview.clone();
-                window.connect_close_request(move |_| {
-                    ended.end_preview();
-                    gtk::glib::Propagation::Proceed
-                });
-                gtk::glib::timeout_add_local_once(
-                    std::time::Duration::from_millis(300),
-                    move || window.close(),
-                );
-                true
-            });
-
-            let result =
-                operation.run(gtk::PrintOperationAction::Preview, Some(&viewer.ui.window));
-            assert!(result.is_ok(), "la vista previa debe completarse: {:?}", result.err());
 
             let mut waited = 0;
-            while seen.borrow().is_none() && waited < 200 {
+            let dialog = loop {
+                let found = gtk::Window::list_toplevels()
+                    .into_iter()
+                    .find_map(|widget| widget.downcast::<gtk::Window>().ok())
+                    .filter(|window| window.title().is_some_and(|title| title == "Imprimir"));
+                if found.is_some() || waited >= 100 {
+                    break found;
+                }
                 gtk::glib::MainContext::default().iteration(false);
-                std::thread::sleep(std::time::Duration::from_millis(5));
+                std::thread::sleep(std::time::Duration::from_millis(10));
                 waited += 1;
-            }
-            let window = seen
-                .borrow()
-                .clone()
-                .expect("la vista previa debe abrir su propia ventana");
-            assert_eq!(window.title().unwrap_or_default(), "Vista previa");
+            };
+            let dialog = dialog.expect("el diálogo de imprimir tiene que abrirse");
             assert!(
-                drawn.get() > 0,
-                "la página se dibuja a través del contexto de impresión"
+                dialog.first_child().is_some(),
+                "el diálogo tiene que traer su contenido"
             );
-        }
-
-        // After a preview, the operation has to end on its own: that is what
-        // makes run_print_dialog open the print dialog again.
-        {
-            let operation = gtk::PrintOperation::new();
-            operation.set_unit(gtk::Unit::Points);
-            operation.set_n_pages(1);
-
-            let drawn = Rc::new(std::cell::Cell::new(0_u32));
-            let painted = Rc::clone(&drawn);
-            operation.connect_draw_page(move |_, context, _page| {
-                painted.set(painted.get() + 1);
-                let cr = context.cairo_context();
-                let _ = cr.set_source_rgb(1.0, 0.0, 0.0);
-                let _ = cr.paint();
-            });
-
-            let previewed = Rc::new(std::cell::Cell::new(false));
-            let flag = Rc::clone(&previewed);
-            let parent: gtk::Window = viewer.ui.window.clone().upcast();
-            operation.connect_preview(move |_, preview, context, _| {
-                flag.set(true);
-                let (window, _area) = Viewer::print_preview_window(preview, context, &parent, 1);
-                window.present();
-                let ended = preview.clone();
-                window.connect_close_request(move |_| {
-                    let ended = ended.clone();
-                    gtk::glib::idle_add_local_once(move || ended.end_preview());
-                    gtk::glib::Propagation::Proceed
-                });
-                let closing = window.clone();
-                gtk::glib::timeout_add_local_once(
-                    std::time::Duration::from_millis(300),
-                    move || closing.close(),
-                );
-                true
-            });
-
-            let result =
-                operation.run(gtk::PrintOperationAction::Preview, Some(&viewer.ui.window));
-            assert!(previewed.get(), "la vista previa tiene que atenderse en la app");
-            assert!(
-                drawn.get() > 0,
-                "la página se dibuja a través del contexto de impresión"
-            );
-            assert!(
-                matches!(result, Ok(gtk::PrintOperationResult::Apply)),
-                "cerrar la vista previa termina la operación, que es lo que hace volver al diálogo: {result:?}"
-            );
+            dialog.close();
         }
 
         std::fs::remove_file(&path).ok();
@@ -383,20 +302,23 @@ trailer\n<< /Root 1 0 R /Size 5 >>\n%%EOF\n";
         }
     }
 
-    /// The preview maps the page onto the whole drawing area, whatever size the
-    /// window ends up with.
+    /// Consecutive pages travel as one range, or a long selection would become
+    /// one range per page.
     #[test]
-    fn preview_dpi_maps_the_paper_onto_the_area_width() {
-        use crate::ui::shell::preview_dpi;
+    fn page_ranges_collapse_consecutive_pages() {
+        use crate::ui::print::ranges_from_pages;
 
-        let dpi = preview_dpi(535.5, 595.0);
-        assert!((dpi - 64.8).abs() < 1e-9, "90 % de una A4: {dpi}");
-        assert!(
-            (595.0 * dpi / 72.0 - 535.5).abs() < 1e-9,
-            "la página mide exactamente el ancho del área"
+        let ranges = ranges_from_pages(&[0, 1, 2, 5, 7, 8]);
+        let pairs: Vec<(i32, i32)> = ranges.iter().map(|range| (range.start(), range.end())).collect();
+        assert_eq!(pairs, vec![(0, 2), (5, 5), (7, 8)]);
+        assert!(ranges_from_pages(&[]).is_empty());
+        assert_eq!(
+            ranges_from_pages(&[3])
+                .iter()
+                .map(|range| (range.start(), range.end()))
+                .collect::<Vec<_>>(),
+            vec![(3, 3)]
         );
-        assert_eq!(preview_dpi(0.0, 595.0), 72.0, "sin área, dpi nominal");
-        assert_eq!(preview_dpi(535.5, 0.0), 72.0, "sin papel, dpi nominal");
     }
 
     fn size_request_at(pages: &gtk::Box, index: i32) -> (i32, i32) {

@@ -87,7 +87,7 @@ ventana.
 | Exportar la página actual | `Tools > Exportar página…`: PDF, PNG o JPEG |
 | Exportar una selección de páginas | `Tools > Exportar páginas…`: `1,2,100`, `1-55`, `pares`, `impares`, `última`, `todas` |
 | Exportar el texto plano del documento | `Tools > Exportar texto…` |
-| Imprimir, con opciones y folleto | `Ctrl+P`, `File > Imprimir con opciones…`, `File > Imprimir folleto…` |
+| Imprimir, con vista previa, opciones y folleto | `Ctrl+P`, `File > Imprimir con opciones…`, `File > Imprimir folleto…` |
 
 ## Atajos
 
