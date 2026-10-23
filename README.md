@@ -65,6 +65,7 @@ ventana.
 | Salto entre coincidencias con contador `n/m` | `Ctrl+G` / `Ctrl+Shift+G` |
 | Copiar el texto de la página actual | `Ctrl+Shift+C` |
 | Selección con el ratón y copiar solo lo seleccionado | Arrastrar y `Ctrl+C` |
+| Subrayar el texto como anotación real del PDF, en el color elegido | Botón al lado del zoom, `Ctrl+U` |
 | Metadatos del documento | `Ctrl+D` |
 
 ### Apariencia y lectura nocturna
@@ -88,6 +89,7 @@ ventana.
 | Exportar una selección de páginas | `Tools > Exportar páginas…`: `1,2,100`, `1-55`, `pares`, `impares`, `última`, `todas` |
 | Exportar el texto plano del documento | `Tools > Exportar texto…` |
 | Imprimir, con vista previa, opciones y folleto | `Ctrl+P`, `File > Imprimir con opciones…`, `File > Imprimir folleto…`; el diálogo suma a la derecha la miniatura de las páginas con flechas ‹ › |
+| Guardar los subrayados en el PDF abierto o en una copia, preguntando antes si quedan cambios sin guardar | `Ctrl+S` / `Ctrl+Shift+S` |
 
 ## Atajos
 
@@ -103,6 +105,7 @@ ventana.
 | `Alt+←` / `→` | Historial atrás / adelante | `F11` / `F5` | Pantalla completa / presentación |
 | `Ctrl` + rueda | Zoom con la rueda | `Espacio` + arrastrar | Herramienta mano, con inercia al soltar |
 | `Ctrl+C` / `Ctrl+Shift+C` | Copiar la selección / la página | `Esc` | Sale de presentación o del modo mano; limpia la búsqueda |
+| `Ctrl+U` | Subrayar | `Ctrl+S` / `Ctrl+Shift+S` | Guardar los subrayados / guardar una copia |
 
 La lista completa está en `Help > Atajos de teclado…` dentro de la aplicación.
 
@@ -111,12 +114,15 @@ La lista completa está en `Help > Atajos de teclado…` dentro de la aplicació
 ```
 src/
 ├── engine/     motor sin GTK: geometría, render, búsqueda, selección, sesión, zoom
+│   ├── annotation.rs  subrayados en memoria y paso al espacio de usuario del PDF
 │   ├── render.rs      poppler + cairo → textura, con escala de píxel y rotación
 │   ├── search.rs      layout por carácter (FFI) y armado de cajas de coincidencia
 │   ├── page_range.rs  expresión de páginas con validación contra el total
 │   └── session.rs     qué sobrevive entre ejecuciones
 ├── ui/         shell GTK: ventana, barras, menús, miniaturas, estilos
-└── services/   exportación a JPEG y PDF vectorial
+└── services/   exportación del documento y escritura del PDF
+    ├── export.rs        exportación a JPEG y PDF vectorial
+    └── annotations.rs   escritura de la anotación /Underline con lopdf
 ```
 
 | Decisión | Por qué |
@@ -127,6 +133,7 @@ src/
 | Búsqueda desde el layout por carácter, no desde `find_text` | `find_text` estira la caja hasta los blancos de al lado |
 | FFI propio para lo que `poppler-rs` no expone | `poppler_page_get_text_layout` y `poppler_page_get_selection_region` |
 | Motor sin dependencia de GTK | Geometría, búsqueda y sesión se prueban sin display |
+| El PDF se escribe con lopdf, en un temporal que después reemplaza al original | poppler-glib es de solo lectura, así que el subrayado solo puede quedar como anotación real escribiendo el archivo; el reemplazo al final evita dejar el PDF roto si el guardado falla |
 
 ## Requisitos
 
@@ -149,7 +156,7 @@ Probado con GTK 4.24 y poppler-glib 26.10.
 
 ```bash
 cargo build --release
-cargo test                 # 47 pruebas: motor, render, selección, búsqueda, páginas, sesión
+cargo test                 # 70 pruebas: motor, render, selección, búsqueda, páginas, sesión, anotaciones
 cargo test -- --ignored    # prueba de display: atajos, zoom y propiedad del viewer
 ```
 
@@ -171,16 +178,20 @@ Convenciones del repositorio:
 **Hecho y verificado:** todo lo de las tablas de arriba; el detalle casilla por
 casilla está en [TODO.md](TODO.md).
 
-**Bloqueado por el motor:** escritura de PDF (anotaciones, unir, dividir,
-comprimir) porque poppler-glib es de solo lectura; formularios AcroForm y firmas
-porque poppler no las guarda; OCR, que necesita `tesseract`; e índice/marcadores,
-porque `IndexIter` de `poppler-rs` no expone título ni acción.
+**Bloqueado por el motor:** unir, dividir y comprimir, porque poppler-glib es de
+solo lectura (la escritura de anotaciones ya se resuelve con lopdf), y el resto
+de las anotaciones, que sigue pendiente; formularios AcroForm y firmas porque
+poppler no las guarda; OCR, que necesita `tesseract`; e índice/marcadores, porque
+`IndexIter` de `poppler-rs` no expone título ni acción.
 
 **Límites conocidos:** el render es síncrono (cada bloqueo se acota a una página
 visible, así que un documento enorme puede tardar un instante en responder), la
 interfaz no es traducible todavía, no hay archivo `.desktop` ni registro MIME, y
 las pruebas automatizadas cubren el motor y el arranque, no cada comando de la
-interfaz.
+interfaz. El subrayado se guarda reescribiendo el PDF completo (no es un guardado
+incremental) y se escribe sin *appearance stream* (`/AP`), así que el grosor
+exacto de la línea lo decide cada lector; tampoco hay todavía deshacer ni
+borrado de subrayados.
 
 **Licencia:** todavía sin definir.
 

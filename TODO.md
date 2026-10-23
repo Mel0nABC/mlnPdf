@@ -37,8 +37,9 @@ Una línea por capacidad, sin agrupar cosas distintas en una sola casilla.
 
 ## 2. Anotaciones y edición
 
-- [ ] [BLOQUEADA: escritura de PDF] Subrayado en varios colores (amarillo, verde, azul, rosa)
-- [ ] [BLOQUEADA: escritura de PDF] Resaltado de bloque, tachado y subrayado de texto
+- [x] Subrayado del texto seleccionado en el color a elección (selector de color de GTK, ámbar por omisión), escrito en el PDF como anotación `/Underline` con `/QuadPoints` y `/C`: botón al lado del zoom, `Ctrl+U`, y `Esc` sale del modo
+- [x] Guardar los subrayados en el PDF abierto (`Ctrl+S`) o en una copia (`Ctrl+Shift+S`), con escritura atómica y pregunta de Descartar / Guardar / Guardar una copia al cerrar el documento, recargarlo, abrir otro o cerrar la ventana
+- [ ] [BLOQUEADA: escritura de PDF] Resaltado de bloque y tachado de texto
 - [ ] [BLOQUEADA: escritura de PDF] Notas adhesivas (sticky notes) y comentarios con hilos de respuesta
 - [ ] [BLOQUEADA: escritura de PDF] Texto libre sobre la página (fuente, tamaño, color)
 - [ ] [BLOQUEADA: escritura de PDF] Dibujo a mano alzada (lápiz) con grosor y color
@@ -119,9 +120,10 @@ se ofrece como aplicación predeterminada para `application/pdf`.
 Estas líneas no se pueden cerrar con el stack actual. No son olvidos: cada una
 necesita una decisión o una dependencia nueva.
 
-- **Escritura de PDF** (sección 2 completa, unir/dividir/comprimir): poppler-glib
-  es de solo lectura. Haría falta escribir el PDF (qpdf, mupdf, lopdf) o cambiar
-  de motor a pdfium.
+- **Escritura de PDF** (resto de la sección 2, unir/dividir/comprimir): poppler-glib
+  es de solo lectura. La escritura de anotaciones ya se resolvió con `lopdf`
+  (subrayado, sección 2); lo que queda sigue necesitando escribir el PDF (qpdf,
+  mupdf, lopdf) o cambiar de motor a pdfium.
 - **Formularios y firmas** (sección 3): poppler no guarda AcroForm ni firmas; PAdES
   además necesita un stack criptográfico (`openssl`/`ring`) y verificación de
   cadena.
