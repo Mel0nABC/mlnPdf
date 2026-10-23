@@ -513,11 +513,14 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
             gtk::glib::MainContext::default().iteration(false);
-            for toplevel in gtk::Window::list_toplevels() {
-                if toplevel == viewer.ui.window {
+            for widget in gtk::Window::list_toplevels() {
+                let Ok(window) = widget.clone().downcast::<gtk::Window>() else {
+                    continue;
+                };
+                if window == viewer.ui.window {
                     continue;
                 }
-                if let Some(button) = labeled_button(toplevel.upcast_ref(), label) {
+                if let Some(button) = labeled_button(&widget, label) {
                     button.emit_by_name::<()>("clicked", &[]);
                     return true;
                 }

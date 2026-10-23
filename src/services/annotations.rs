@@ -591,7 +591,9 @@ mod tests {
         document.save_to(&mut encrypted).expect("serializar cifrado");
         std::fs::write(&source, &encrypted).expect("escribir el cifrado");
         assert!(
-            Document::load_mem(&encrypted).expect("releer").was_encrypted(),
+            Document::load_mem(&encrypted)
+                .expect("releer")
+                .was_encrypted(),
             "el fixture tiene que venir cifrado"
         );
 
