@@ -2788,6 +2788,47 @@ impl Viewer {
         .map(|(texture, _, _)| texture)
     }
 
+    /// Runs the native print dialog until the reader prints or cancels.
+    ///
+    /// GTK can hand the preview off to another application; when that preview
+    /// closes, the dialog goes with it and the operation ends as cancelled, so
+    /// the reader is left with no dialog. The `preview` signal marks that case
+    /// and the dialog is shown again, which is also what makes closing the
+    /// preview land back in it.
+    fn run_print_dialog(
+        operation: &gtk::PrintOperation,
+        parent: &impl IsA<gtk::Window>,
+        error_title: &str,
+    ) {
+        // Bounded: a preview that keeps closing the dialog must not loop forever.
+        const MAX_ATTEMPTS: usize = 3;
+
+        let previewed = std::cell::Cell::new(false);
+        {
+            let previewed = previewed.clone();
+            operation.connect_preview(move |_, _, _, _| {
+                previewed.set(true);
+                // `false`: GTK keeps its own preview and its own hand-off.
+                false
+            });
+        }
+
+        for _ in 0..MAX_ATTEMPTS {
+            match operation.run(gtk::PrintOperationAction::PrintDialog, Some(parent)) {
+                Ok(result) => {
+                    if reopen_after_preview(&result, &previewed) {
+                        continue;
+                    }
+                    return;
+                }
+                Err(error) => {
+                    show_error(parent, error_title, &error.to_string());
+                    return;
+                }
+            }
+        }
+    }
+
     pub(crate) fn print_document(self: &Rc<Self>) {
         let (pages, job) = {
             let document = self.doc.document.borrow();
@@ -2840,12 +2881,7 @@ impl Viewer {
             let _ = cairo.restore();
         });
 
-        if let Err(error) = operation.run(
-            gtk::PrintOperationAction::PrintDialog,
-            Some(&self.ui.window),
-        ) {
-            show_error(&self.ui.window, "No se pudo imprimir.", &error.to_string());
-        }
+        Self::run_print_dialog(&operation, &self.ui.window, "No se pudo imprimir.");
     }
 
     /// Adds `path` to the in-memory recent list. Nothing is persisted here: the
@@ -3392,11 +3428,7 @@ impl Viewer {
             }
         });
 
-        if let Err(error) =
-            operation.run(gtk::PrintOperationAction::PrintDialog, Some(&self.ui.window))
-        {
-            show_error(&self.ui.window, "No se pudo imprimir.", &error.to_string());
-        }
+        Self::run_print_dialog(&operation, &self.ui.window, "No se pudo imprimir.");
     }
 
     /// Prints two pages per sheet in booklet imposition.
@@ -3473,11 +3505,7 @@ impl Viewer {
             }
         });
 
-        if let Err(error) =
-            operation.run(gtk::PrintOperationAction::PrintDialog, Some(&self.ui.window))
-        {
-            show_error(&self.ui.window, "No se pudo imprimir el folleto.", &error.to_string());
-        }
+        Self::run_print_dialog(&operation, &self.ui.window, "No se pudo imprimir el folleto.");
     }
 
     pub(crate) fn rotate_view(&self) {
@@ -3721,6 +3749,22 @@ fn toolbar_gap(width: i32) -> gtk::Box {
     let gap = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     gap.set_size_request(width, -1);
     gap
+}
+
+/// Whether a finished print dialog has to be shown again.
+///
+/// GTK can hand the preview to another application: when that preview closes,
+/// the dialog goes with it and the operation reports a cancel. The flag is
+/// consumed here, so a genuine cancel after coming back closes the dialog for
+/// good instead of reopening it.
+pub(crate) fn reopen_after_preview(
+    result: &gtk::PrintOperationResult,
+    previewed: &std::cell::Cell<bool>,
+) -> bool {
+    if !previewed.replace(false) {
+        return false;
+    }
+    matches!(result, gtk::PrintOperationResult::Cancel)
 }
 
 /// Renders one page at `pixel_scale` device pixels per point.

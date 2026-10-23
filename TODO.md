@@ -196,7 +196,11 @@ necesita una decisión o una dependencia nueva.
   que una palabra común no dispare tiempo y memoria. Antes bloqueaba el bucle
   principal ~1,4 s en un PDF de 666 páginas.
 - Impresión: el diálogo lo pone GTK (incluye imprimir a PDF); el dibujado escala
-  la página al área imprimible y respeta la rotación actual.
+  la página al área imprimible y respeta la rotación actual. La vista previa la
+  delega GTK a otra aplicación y, al cerrarla, el diálogo se iba con ella: la
+  señal `preview` marca ese caso y el diálogo se vuelve a mostrar (hasta tres
+  intentos), así cerrar la vista previa devuelve al lector a imprimir. Vale para
+  imprimir, imprimir con opciones y folleto.
 - Exportación: la página suelta se puede guardar en PDF (cairo `PdfSurface` con
   el contenido vectorial de poppler, sin la rotación ni la inversión de la vista),
   PNG o JPEG. La exportación por lotes pide una expresión de páginas

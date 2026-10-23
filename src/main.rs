@@ -273,6 +273,34 @@ trailer\n<< /Root 1 0 R /Size 5 >>\n%%EOF\n";
         }
     }
 
+    /// Guards the print-dialog reopening rule: only a cancel that came after a
+    /// preview means the dialog went away with it, and the flag is consumed so a
+    /// real cancel closes for good.
+    #[test]
+    fn a_cancel_after_a_preview_reopens_the_print_dialog_once() {
+        use crate::ui::shell::reopen_after_preview;
+        use gtk::PrintOperationResult;
+
+        let previewed = std::cell::Cell::new(true);
+        assert!(reopen_after_preview(&PrintOperationResult::Cancel, &previewed));
+        assert!(!previewed.get(), "la marca se consume al reabrir");
+        assert!(
+            !reopen_after_preview(&PrintOperationResult::Cancel, &previewed),
+            "un segundo cancelar cierra el diálogo"
+        );
+
+        let printed = std::cell::Cell::new(true);
+        assert!(
+            !reopen_after_preview(&PrintOperationResult::Apply, &printed),
+            "imprimir después de la vista previa no reabre nada"
+        );
+        assert!(!printed.get(), "la marca también se consume");
+
+        let untouched = std::cell::Cell::new(false);
+        assert!(!reopen_after_preview(&PrintOperationResult::Cancel, &untouched));
+        assert!(!reopen_after_preview(&PrintOperationResult::InProgress, &untouched));
+    }
+
     fn size_request_at(pages: &gtk::Box, index: i32) -> (i32, i32) {
         let mut child = pages.first_child();
         let mut position = 0;
