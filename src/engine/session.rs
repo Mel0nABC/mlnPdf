@@ -77,6 +77,30 @@ pub fn save_session(session: &Session) {
     save_session_to(session, &state_file());
 }
 
+/// True when both paths name the same file.
+///
+/// The application is launched with whatever the caller typed, so the same
+/// document can arrive as a relative path, an absolute one, or through a
+/// symlink. Resolving first keeps the session matching it.
+pub fn same_document(left: &Path, right: &Path) -> bool {
+    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
+/// Page and zoom saved for `path`, when the session remembers that document.
+///
+/// The single stored position belongs to the last file only, so any other
+/// document has no position to restore.
+pub fn saved_position_for(session: &Session, path: &Path) -> Option<(usize, f64)> {
+    let last = session.last.as_deref()?;
+    if !same_document(last, path) {
+        return None;
+    }
+    Some((session.page, session.zoom))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,5 +145,53 @@ mod tests {
         assert_eq!(loaded.zoom, 3.0);
         assert_eq!(loaded.last, Some(PathBuf::from("/x.pdf")));
         std::fs::remove_file(path).ok();
+    }
+
+    fn existing(name: &str) -> PathBuf {
+        let path = scratch(name);
+        std::fs::write(&path, b"%PDF-1.4\n").expect("write scratch pdf");
+        path
+    }
+
+    #[test]
+    fn same_document_resolves_relative_and_absolute_paths() {
+        let absolute = existing("session-same-document.pdf");
+        let relative = PathBuf::from(".")
+            .join(absolute.strip_prefix(env!("CARGO_MANIFEST_DIR")).expect("inside the project"));
+        assert!(same_document(&absolute, &relative));
+        assert!(same_document(&absolute, &absolute));
+        std::fs::remove_file(absolute).ok();
+    }
+
+    #[test]
+    fn same_document_rejects_other_files_and_missing_ones() {
+        let first = existing("session-first.pdf");
+        let second = existing("session-second.pdf");
+        assert!(!same_document(&first, &second));
+
+        let missing = scratch("session-does-not-exist.pdf");
+        std::fs::remove_file(&missing).ok();
+        assert!(!same_document(&first, &missing));
+        assert!(same_document(&missing, &missing), "sin archivo se comparan tal cual");
+        std::fs::remove_file(first).ok();
+        std::fs::remove_file(second).ok();
+    }
+
+    #[test]
+    fn saved_position_is_offered_only_for_the_remembered_document() {
+        let remembered = existing("session-offered.pdf");
+        let other = existing("session-not-offered.pdf");
+        let session = Session {
+            last: Some(remembered.clone()),
+            page: 39,
+            zoom: 1.5,
+            recent: Vec::new(),
+        };
+
+        assert_eq!(saved_position_for(&session, &remembered), Some((39, 1.5)));
+        assert_eq!(saved_position_for(&session, &other), None);
+        assert_eq!(saved_position_for(&Session::default(), &remembered), None);
+        std::fs::remove_file(remembered).ok();
+        std::fs::remove_file(other).ok();
     }
 }
