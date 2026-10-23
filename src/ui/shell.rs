@@ -2137,26 +2137,6 @@ impl Viewer {
         save_session(&session);
     }
 
-    /// Restores the last file, page and zoom when started without arguments.
-    pub(crate) fn restore_session(self: &Rc<Self>) {
-        let session = load_session();
-        let Some(path) = session.last else {
-            return;
-        };
-        if !path.exists() {
-            return;
-        }
-        self.open_reporting(&path);
-        if let Err(message) = self.set_zoom_checked(session.zoom) {
-            eprintln!("[sesión] zoom no restaurado: {message}");
-        }
-
-        // The viewport has no size yet, so scrolling would clamp to page 1.
-        // The jump is deferred until the adjustment reports a real extent.
-        self.input.pending_restore.set(Some(session.page));
-        self.apply_pending_restore();
-    }
-
     /// Applies a zoom coming from the session file, ignoring nonsense values.
     pub(crate) fn set_zoom_checked(&self, zoom: f64) -> Result<(), String> {
         if !(ZOOM_STEPS[0]..=ZOOM_STEPS[ZOOM_STEPS.len() - 1]).contains(&zoom) {

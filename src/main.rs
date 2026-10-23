@@ -20,6 +20,8 @@ mod tests {
     use gtk::prelude::*;
 
     use crate::app::install_viewer;
+    use crate::engine::session::{self, save_session_to, Session};
+    use crate::engine::zoom::ZOOM_DEFAULT;
     use crate::ui::actions::*;
     use std::rc::Rc;
     use crate::engine::geometry::*;
@@ -104,8 +106,33 @@ trailer\n<< /Root 1 0 R /Size 5 >>\n%%EOF\n";
     #[test]
     #[ignore = "requires a display"]
     fn ui_ownership_wiring_and_rendering_work_on_a_real_display() {
+        // The session file is redirected inside the project before GTK starts, so
+        // this test never reads the developer's real session and can seed the
+        // remembered document that startup has to ignore.
+        let xdg = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/test-work/xdg-config-x");
+        // SAFETY: this is the first statement of the process-wide opt-in GTK test
+        // and no other test in this binary reads the environment; the only reader
+        // is `state_file`, which then sees this directory.
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
         gtk::init().expect("GTK init needs a display (Wayland or X11)");
 
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/test-work");
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        let path = dir.join("red-page-ui.pdf");
+        std::fs::write(&path, RED_PAGE_PDF).expect("write scratch PDF");
+
+        // A session that remembers this document must not open it on its own:
+        // starting without an argument leaves the window empty, and the stored
+        // page and zoom come back only when the reader opens that file again.
+        save_session_to(
+            &Session {
+                last: Some(path.clone()),
+                page: 0,
+                zoom: ZOOM_DEFAULT,
+                recent: vec![path.clone()],
+            },
+            &session::state_file(),
+        );
 
         // The action path is exactly what a shortcut activates: zoom must update
         // the label and re-render the open document at the new size.
@@ -140,6 +167,12 @@ trailer\n<< /Root 1 0 R /Size 5 >>\n%%EOF\n";
         );
         let viewer = weak.upgrade().expect("viewer kept alive by the application");
 
+        assert!(
+            viewer.doc.current_path.borrow().is_none(),
+            "starting without an argument must not reopen the remembered document"
+        );
+        assert_eq!(viewer.ui.title.label(), WINDOW_TITLE, "no document, no title");
+
         // Every declared shortcut must be a valid trigger, and every action it
         // names must exist on the window, or the key silently does nothing.
         for (trigger, action) in SHORTCUTS {
@@ -153,11 +186,6 @@ trailer\n<< /Root 1 0 R /Size 5 >>\n%%EOF\n";
                 "{action} must be installed by Viewer::new"
             );
         }
-
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/test-work");
-        std::fs::create_dir_all(&dir).expect("create scratch dir");
-        let path = dir.join("red-page-ui.pdf");
-        std::fs::write(&path, RED_PAGE_PDF).expect("write scratch PDF");
 
         viewer.open(&path).expect("open a document from disk");
         assert_eq!(viewer.ui.zoom_label.label(), "100 %");
@@ -206,7 +234,13 @@ trailer\n<< /Root 1 0 R /Size 5 >>\n%%EOF\n";
         let mut position = 0;
         while let Some(widget) = child {
             if position == index {
-                let picture = widget.downcast::<gtk::Picture>().expect("Picture");
+                // The slot wraps the page in an overlay: the selection layer sits
+                // on top of the Picture, which carries the logical page size.
+                let overlay = widget.downcast::<gtk::Overlay>().expect("Overlay");
+                let picture = overlay
+                    .child()
+                    .and_then(|child| child.downcast::<gtk::Picture>().ok())
+                    .expect("Picture inside the overlay");
                 return picture.size_request();
             }
             child = widget.next_sibling();

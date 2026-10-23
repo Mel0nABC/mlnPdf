@@ -50,10 +50,11 @@ pub(crate) fn install_viewer(
     app.connect_activate(move |app| {
         let viewer = Viewer::new(app);
         viewer.ui.window.present();
+        // Startup never reopens the last document on its own: the session only
+        // remembers where the reader was, and that position is applied when the
+        // reader opens the document again (argument, recent list, dialog, drop).
         if let Some(path) = initial.as_ref() {
             viewer.open_reporting(path);
-        } else {
-            viewer.restore_session();
         }
 
         // Persist the reading position when the window goes away.
