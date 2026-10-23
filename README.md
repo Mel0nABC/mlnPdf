@@ -67,7 +67,7 @@ ventana.
 | Selección con el ratón y copiar solo lo seleccionado | Arrastrar y `Ctrl+C` |
 | Subrayar el texto como anotación real del PDF, en el color elegido (el botón muestra ese color) | Botón al lado del zoom, `Ctrl+U`: abre el selector de color y aplica a la selección o al siguiente arrastre |
 | Resaltar el texto como rotulador, en su propio color (el botón lo muestra de fondo) | Botón al lado del zoom, `Ctrl+Shift+U`: abre el selector de color y aplica a la selección o al siguiente arrastre |
-| Deshacer los marcados que todavía no están en el PDF, de a uno | `Ctrl+Z`, `Edit > Deshacer` |
+| Deshacer y rehacer los marcados que todavía no están en el PDF, de a uno | `Ctrl+Z` / `Ctrl+Shift+Z` (o `Ctrl+Y`), `Edit > Deshacer` / `Rehacer` |
 | Metadatos del documento | `Ctrl+D` |
 
 ### Apariencia y lectura nocturna
@@ -108,6 +108,7 @@ ventana.
 | `Ctrl` + rueda | Zoom con la rueda | `Espacio` + arrastrar | Herramienta mano, con inercia al soltar |
 | `Ctrl+C` / `Ctrl+Shift+C` | Copiar la selección / la página | `Esc` | Sale de presentación o del modo mano; limpia la búsqueda |
 | `Ctrl+U` / `Ctrl+Shift+U` | Subrayar / resaltar | `Ctrl+Z` | Deshacer el último marcado sin guardar |
+| `Ctrl+Shift+Z` / `Ctrl+Y` | Rehacer el marcado deshecho | | |
 | `Ctrl+S` / `Ctrl+Shift+S` | Guardar / guardar como | | |
 
 La lista completa está en `Help > Atajos de teclado…` dentro de la aplicación.
@@ -194,7 +195,7 @@ las pruebas automatizadas cubren el motor y el arranque, no cada comando de la
 interfaz. Los marcados (subrayado y resaltado) se guardan reescribiendo el PDF
 completo (no es un guardado incremental) y se escriben sin *appearance stream*
 (`/AP`), así que el aspecto exacto de cada marcado lo decide cada lector; tampoco
-no hay todavía borrado de marcados, y deshacer (`Ctrl+Z`) alcanza solo a lo que no se guardó: una anotación ya escrita en el PDF no se quita desde el visor.
+no hay todavía borrado de marcados, y deshacer/rehacer (`Ctrl+Z` / `Ctrl+Shift+Z`) alcanza solo a lo que no se guardó: una anotación ya escrita en el PDF no se quita desde el visor.
 
 **Licencia:** todavía sin definir.
 

@@ -654,6 +654,35 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
         );
         assert_eq!(viewer.annot.marks.borrow().len(), 6, "vuelve al estado guardado");
 
+        // Rehacer repone lo deshecho en orden y se agota.
+        assert!(viewer.redo_mark(), "se rehace el primero de los deshechos");
+        assert_eq!(viewer.annot.marks.borrow().len(), 7);
+        assert!(viewer.has_pending_marks(), "lo rehecho vuelve a estar pendiente");
+        assert!(viewer.redo_mark(), "se rehace el otro");
+        assert_eq!(viewer.annot.marks.borrow().len(), 8);
+        assert!(!viewer.redo_mark(), "no hay más que rehacer");
+        assert_eq!(
+            viewer.annot.marks.borrow()[6].kind,
+            MarkKind::Underline,
+            "el orden de rehacer es el de deshacer"
+        );
+        assert_eq!(viewer.annot.marks.borrow()[7].kind, MarkKind::Highlight);
+
+        // Deshacer y después marcar algo nuevo descarta lo que había para rehacer.
+        assert!(viewer.undo_mark() && viewer.undo_mark());
+        assert_eq!(viewer.annot.marks.borrow().len(), 6);
+        viewer.begin_selection(0, 20.0, 10.0);
+        viewer.update_selection(0, 180.0, 35.0);
+        viewer.finish_selection();
+        assert!(viewer.apply_mark(MarkKind::Underline), "un marcado nuevo");
+        assert!(
+            !viewer.redo_mark(),
+            "lo nuevo corta la línea de tiempo de rehacer"
+        );
+        assert_eq!(viewer.annot.marks.borrow().len(), 7);
+        assert!(viewer.undo_mark(), "y ese marcado nuevo se puede deshacer");
+        assert_eq!(viewer.annot.marks.borrow().len(), 6);
+
         // El atajo y el menú usan la misma acción: sin pendientes no rompe nada.
         gtk::prelude::WidgetExt::activate_action(&viewer.ui.window, "win.undo", None)
             .expect("la acción de deshacer tiene que existir");

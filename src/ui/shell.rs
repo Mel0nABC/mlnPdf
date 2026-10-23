@@ -195,6 +195,8 @@ pub(crate) struct AnnotationState {
     pub(crate)     saved: Cell<usize>,
     pub(crate)     underline: Cell<MarkTool>,
     pub(crate)     highlight: Cell<MarkTool>,
+    /// Marcados deshechos, en orden de deshacer: `Ctrl+Shift+Z` los repone.
+    pub(crate)     redo: RefCell<Vec<TextMark>>,
 }
 
 /// Transient interaction state.
@@ -476,6 +478,7 @@ impl Viewer {
                     color: HIGHLIGHT_COLOR,
                     active: false,
                 }),
+                redo: RefCell::new(Vec::new()),
             },
             input: InteractionState {
                 hand_mode: Cell::new(false),
@@ -783,6 +786,7 @@ impl Viewer {
             viewer.toggle_mark_mode(MarkKind::Highlight);
         });
         Self::install_action(viewer, "undo", |viewer| viewer.undo());
+        Self::install_action(viewer, "redo", |viewer| viewer.redo());
         Self::install_action(viewer, "save-annotations", |viewer| viewer.save_annotations());
         Self::install_action(viewer, "save-annotations-as", |viewer| {
             viewer.save_annotations_as(None);
@@ -1661,6 +1665,8 @@ impl Viewer {
             MarkKind::Highlight => TextMark::highlight(selection.page, rects, color),
         };
         self.annot.marks.borrow_mut().push(mark);
+        // Un marcado nuevo corta la línea de tiempo de rehacer.
+        self.annot.redo.borrow_mut().clear();
 
         // La selección azul taparía el marcado que se acaba de poner.
         *self.sel.selection.borrow_mut() = None;
@@ -1894,6 +1900,7 @@ impl Viewer {
             .map(|mark| mark.page)
             .collect();
         self.annot.marks.borrow_mut().truncate(saved);
+        self.annot.redo.borrow_mut().clear();
         for page in pages {
             self.queue_page_draw(page);
         }
@@ -1904,7 +1911,7 @@ impl Viewer {
     /// reescribir la anotación.
     pub(crate) fn undo_mark(&self) -> bool {
         let saved = self.annot.saved.get();
-        let page = {
+        let mark = {
             let mut marks = self.annot.marks.borrow_mut();
             if marks.len() <= saved {
                 return false;
@@ -1912,10 +1919,37 @@ impl Viewer {
             let Some(mark) = marks.pop() else {
                 return false;
             };
-            mark.page
+            mark
         };
-        self.queue_page_draw(page);
+        self.queue_page_draw(mark.page);
+        self.annot.redo.borrow_mut().push(mark);
         true
+    }
+
+    /// Vuelve a poner el último marcado deshecho. Un marcado nuevo descarta el
+    /// historial de rehacer: ya no hay una línea de tiempo que continuar.
+    pub(crate) fn redo_mark(&self) -> bool {
+        let Some(mark) = self.annot.redo.borrow_mut().pop() else {
+            return false;
+        };
+        self.queue_page_draw(mark.page);
+        self.annot.marks.borrow_mut().push(mark);
+        true
+    }
+
+    /// Ctrl+Shift+Z, con aviso cuando no hay nada que rehacer.
+    pub(crate) fn redo(self: &Rc<Self>) {
+        if self.redo_mark() {
+            self.ui.window.announce(
+                "Cambio rehecho",
+                gtk::AccessibleAnnouncementPriority::Medium,
+            );
+            return;
+        }
+        self.ui.window.announce(
+            "No hay cambios para rehacer.",
+            gtk::AccessibleAnnouncementPriority::Medium,
+        );
     }
 
     /// Ctrl+Z, con aviso cuando no hay nada que deshacer.
@@ -1938,6 +1972,7 @@ impl Viewer {
     /// Deja el documento sin marcados en memoria: se usan al abrir otro.
     pub(crate) fn clear_marks(&self) {
         self.annot.marks.borrow_mut().clear();
+        self.annot.redo.borrow_mut().clear();
         self.annot.saved.set(0);
         self.set_mark_mode(MarkKind::Underline, false);
         self.set_mark_mode(MarkKind::Highlight, false);
