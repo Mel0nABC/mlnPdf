@@ -110,6 +110,8 @@ pub(crate) struct UiHandles {
     /// Un juego de botón, diálogo y selector de color por cada herramienta de
     /// marcado, en el orden de `MarkKind::index`.
     pub(crate)     tools: [MarkToolUi; 2],
+    /// Botón de la herramienta «insertar texto».
+    pub(crate)     text_button: gtk::ToggleButton,
 }
 
 /// Widgets de una herramienta de marcado: el botón y el selector de color de
@@ -187,16 +189,28 @@ pub(crate) struct MarkTool {
     pub(crate) active: bool,
 }
 
-/// Marcados y el estado de las dos herramientas que los crean.
+/// Anotaciones y el estado de las herramientas que las crean.
 pub(crate) struct AnnotationState {
-    /// Marcados en memoria, en orden de creación. Los primeros `saved` ya
-    /// están escritos en el archivo; el resto son los cambios pendientes.
-    pub(crate)     marks: RefCell<Vec<TextMark>>,
+    /// Anotaciones en memoria, en orden de creación. Las primeras `saved` ya
+    /// están escritas en el archivo; el resto son los cambios pendientes.
+    pub(crate)     edits: RefCell<Vec<Annotation>>,
     pub(crate)     saved: Cell<usize>,
     pub(crate)     underline: Cell<MarkTool>,
     pub(crate)     highlight: Cell<MarkTool>,
-    /// Marcados deshechos, en orden de deshacer: `Ctrl+Shift+Z` los repone.
-    pub(crate)     redo: RefCell<Vec<TextMark>>,
+    /// Herramienta «insertar texto» armada: el próximo clic coloca la nota.
+    pub(crate)     text_tool: Cell<bool>,
+    /// Texto y fuente que dejó el diálogo, esperando ese clic.
+    pub(crate)     draft: RefCell<Option<TextDraft>>,
+    /// Anotaciones deshechas, en orden de deshacer: `Ctrl+Shift+Z` las repone.
+    pub(crate)     redo: RefCell<Vec<Annotation>>,
+}
+
+/// Borrador de la herramienta «insertar texto»: lo que se escribió en el
+/// diálogo, esperando el clic que fija la esquina de la nota.
+#[derive(Clone, Debug)]
+pub(crate) struct TextDraft {
+    pub(crate) text: String,
+    pub(crate) font: FontChoice,
 }
 
 /// Transient interaction state.
@@ -282,6 +296,15 @@ impl Viewer {
             build_mark_tool(&mark_spec(MarkKind::Highlight)),
         ];
 
+        // Tercera herramienta: insertar texto. También con una letra como
+        // glifo, por el mismo motivo que las otras dos.
+        let text_button = gtk::ToggleButton::builder()
+            .child(&gtk::Label::new(Some("T")))
+            .tooltip_text("Insertar texto (Ctrl+T)")
+            .margin_start(6)
+            .build();
+        accessible_label(&text_button, "Insertar texto en la página");
+
         let title = gtk::Label::new(Some(WINDOW_TITLE));
 
         let header = gtk::HeaderBar::new();
@@ -343,6 +366,7 @@ impl Viewer {
         controls.append(&zoom_box);
         controls.append(&tools[0].button);
         controls.append(&tools[1].button);
+        controls.append(&text_button);
 
         // Secondary toolbar: the group stays centred, whatever the window width.
         let toolbar = gtk::Box::builder()
@@ -429,6 +453,7 @@ impl Viewer {
                 thumbs_selection: thumbs_selection.clone(),
                 scale_provider: scale_provider.clone(),
                 tools,
+                text_button: text_button.clone(),
             },
             doc: DocumentState {
                 document: RefCell::new(None),
@@ -468,7 +493,7 @@ impl Viewer {
                 selection_start: Cell::new(None),
             },
             annot: AnnotationState {
-                marks: RefCell::new(Vec::new()),
+                edits: RefCell::new(Vec::new()),
                 saved: Cell::new(0),
                 underline: Cell::new(MarkTool {
                     color: UNDERLINE_COLOR,
@@ -478,6 +503,8 @@ impl Viewer {
                     color: HIGHLIGHT_COLOR,
                     active: false,
                 }),
+                text_tool: Cell::new(false),
+                draft: RefCell::new(None),
                 redo: RefCell::new(Vec::new()),
             },
             input: InteractionState {
@@ -517,6 +544,22 @@ impl Viewer {
                     } else {
                         viewer.set_mark_mode(kind, false);
                     }
+                }
+            });
+        }
+        {
+            // `clicked` y no `toggled`: pulsar la herramienta abre el diálogo de
+            // inserción; los cambios de estado que hace el visor por su cuenta
+            // (Esc, modo mano, las otras herramientas) no lo abren.
+            let weak = Rc::downgrade(&viewer);
+            text_button.connect_clicked(move |button| {
+                let Some(viewer) = weak.upgrade() else {
+                    return;
+                };
+                if button.is_active() {
+                    viewer.prompt_text_note();
+                } else {
+                    viewer.set_text_tool(false);
                 }
             });
         }
@@ -785,6 +828,7 @@ impl Viewer {
         Self::install_action(viewer, "highlight", |viewer| {
             viewer.toggle_mark_mode(MarkKind::Highlight);
         });
+        Self::install_action(viewer, "insert-text", |viewer| viewer.prompt_text_note());
         Self::install_action(viewer, "undo", |viewer| viewer.undo());
         Self::install_action(viewer, "redo", |viewer| viewer.redo());
         Self::install_action(viewer, "save-annotations", |viewer| viewer.save_annotations());
@@ -949,8 +993,8 @@ impl Viewer {
 
         *self.doc.document.borrow_mut() = Some(document);
         *self.doc.current_path.borrow_mut() = Some(path.to_path_buf());
-        // Los subrayados pertenecen al documento anterior.
-        self.clear_marks();
+        // Las anotaciones pertenecen al documento anterior.
+        self.clear_edits();
         *self.sel.selection.borrow_mut() = None;
         self.sel.selection_rects.borrow_mut().clear();
         self.view.zoom.set(ZOOM_DEFAULT);
@@ -1500,6 +1544,7 @@ impl Viewer {
     pub(crate) fn set_hand_mode(&self, active: bool) {
         if active {
             // Las tres herramientas no pueden estar activas a la vez.
+            self.set_text_tool(false);
             self.set_mark_mode(MarkKind::Underline, false);
             self.set_mark_mode(MarkKind::Highlight, false);
         }
@@ -1516,7 +1561,7 @@ impl Viewer {
     pub(crate) fn refresh_page_cursor(&self) {
         if self.input.hand_mode.get() {
             self.apply_hand_cursor(Some("grab"));
-        } else if self.active_mark_tool().is_some() {
+        } else if self.active_mark_tool().is_some() || self.text_tool_active() {
             self.apply_hand_cursor(Some("text"));
         } else {
             self.apply_hand_cursor(None);
@@ -1579,6 +1624,8 @@ impl Viewer {
                     self.set_mark_mode(other, false);
                 }
             }
+            // Y la de insertar texto también: una sola herramienta armada.
+            self.set_text_tool(false);
         }
 
         let mut tool = self.mark_tool(kind);
@@ -1607,6 +1654,183 @@ impl Viewer {
         } else {
             self.start_mark_tool(kind);
         }
+    }
+
+    /// True cuando la herramienta «insertar texto» está armada.
+    pub(crate) fn text_tool_active(&self) -> bool {
+        self.annot.text_tool.get()
+    }
+
+    /// Arma o desarma la herramienta «insertar texto»: el botón, el cursor y el
+    /// estado tienen que contar lo mismo. Es excluyente con el modo mano y con
+    /// las dos herramientas de marcado.
+    pub(crate) fn set_text_tool(&self, active: bool) {
+        let active = active && self.doc.document.borrow().is_some();
+        if active {
+            self.set_hand_mode(false);
+            self.set_mark_mode(MarkKind::Underline, false);
+            self.set_mark_mode(MarkKind::Highlight, false);
+        }
+        self.annot.text_tool.set(active);
+        if self.ui.text_button.is_active() != active {
+            self.ui.text_button.set_active(active);
+        }
+        self.refresh_page_cursor();
+    }
+
+    /// Recibe lo que dejó el diálogo: si hay texto, guarda el borrador y arma la
+    /// herramienta para que el próximo clic fije la esquina de la nota. Sin
+    /// texto no se inserta nada y la herramienta queda desarmada.
+    pub(crate) fn apply_text_draft(&self, text: String, font: FontChoice) {
+        if text.trim().is_empty() {
+            self.annot.draft.borrow_mut().take();
+            self.set_text_tool(false);
+            return;
+        }
+        *self.annot.draft.borrow_mut() = Some(TextDraft { text, font });
+        self.set_text_tool(true);
+    }
+
+    /// Coloca la nota del borrador en el punto `(x, y)` de la página y devuelve
+    /// si se insertó. El ancho y el alto salen de Pango en puntos, sin escalar
+    /// por el zoom: la nota vive en el espacio de la página.
+    pub(crate) fn insert_text_note(&self, page: usize, x: f64, y: f64) -> bool {
+        let Some(at) = self.view_to_pdf(page, x, y) else {
+            return false;
+        };
+        let Some(draft) = self.annot.draft.borrow().clone() else {
+            return false;
+        };
+        if draft.text.trim().is_empty() {
+            self.set_text_tool(false);
+            return false;
+        }
+
+        let (width, height) = measure_text(&draft.text, &draft.font);
+        let note = TextNote {
+            page,
+            at,
+            width,
+            height,
+            text: draft.text,
+            font: draft.font,
+        };
+        self.annot.edits.borrow_mut().push(Annotation::Note(note));
+        // Una nota nueva corta la línea de tiempo de rehacer.
+        self.annot.redo.borrow_mut().clear();
+        // El borrador se coloca una sola vez: el siguiente clic no repite el
+        // texto sin preguntar.
+        self.annot.draft.borrow_mut().take();
+        self.set_text_tool(false);
+        self.queue_page_draw(page);
+        true
+    }
+
+    /// Diálogo modal de la nota: el texto y el selector de fuente de GTK.
+    /// `Insertar` deja el borrador en el estado y arma la herramienta para el
+    /// clic que fija la esquina; `Cancelar` la desarma.
+    pub(crate) fn prompt_text_note(self: &Rc<Self>) {
+        // Sin documento no hay página donde insertar: la herramienta está tan
+        // inactiva como las de marcado.
+        if self.doc.document.borrow().is_none() {
+            return;
+        }
+        let window = gtk::Window::builder()
+            .title("Insertar texto")
+            .modal(true)
+            .transient_for(&self.ui.window)
+            .default_width(420)
+            .build();
+
+        let entry = gtk::Entry::builder()
+            .placeholder_text("Texto de la nota")
+            .activates_default(true)
+            .build();
+        accessible_label(&entry, "Texto de la nota");
+
+        // El selector de fuente de GTK, con «Sans 12» como punto de partida.
+        let font_dialog = gtk::FontDialog::builder()
+            .title("Fuente de la nota")
+            .modal(true)
+            .build();
+        let mut initial = pango::FontDescription::new();
+        initial.set_family("Sans");
+        initial.set_size(12 * pango::SCALE);
+        let font_button = gtk::FontDialogButton::builder()
+            .dialog(&font_dialog)
+            .font_desc(&initial)
+            .use_font(true)
+            .use_size(true)
+            .build();
+        accessible_label(&font_button, "Fuente de la nota");
+
+        let accept = gtk::Button::with_label("Insertar");
+        accept.add_css_class("suggested-action");
+        let cancel = gtk::Button::with_label("Cancelar");
+
+        let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        buttons.set_halign(gtk::Align::End);
+        buttons.append(&cancel);
+        buttons.append(&accept);
+
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 10);
+        content.set_margin_top(14);
+        content.set_margin_bottom(14);
+        content.set_margin_start(14);
+        content.set_margin_end(14);
+        content.append(&gtk::Label::new(Some(
+            "Texto a insertar en la página. Después, hacé clic en el lugar:",
+        )));
+        content.append(&entry);
+        content.append(&font_button);
+        content.append(&buttons);
+        window.set_child(Some(&content));
+        window.set_default_widget(Some(&accept));
+
+        let weak = Rc::downgrade(self);
+        let entry_ref = entry.clone();
+        let font_button_ref = font_button.clone();
+        let window_ref = window.clone();
+        accept.connect_clicked(move |_| {
+            let Some(viewer) = weak.upgrade() else {
+                return;
+            };
+            let text = entry_ref.text().to_string();
+            let font = font_button_ref
+                .font_desc()
+                .as_ref()
+                .map(font_choice)
+                .unwrap_or_else(default_font_choice);
+            window_ref.close();
+            viewer.apply_text_draft(text, font);
+        });
+
+        let weak = Rc::downgrade(self);
+        let window_ref = window.clone();
+        cancel.connect_clicked(move |_| {
+            window_ref.close();
+            if let Some(viewer) = weak.upgrade() {
+                viewer.set_text_tool(false);
+            }
+        });
+
+        // Esc cierra el diálogo y desarma la herramienta, como Cancelar.
+        let weak = Rc::downgrade(self);
+        let window_ref = window.clone();
+        let keys = gtk::EventControllerKey::new();
+        keys.connect_key_pressed(move |_, keyval, _, _| {
+            if keyval != gdk::Key::Escape {
+                return glib::Propagation::Proceed;
+            }
+            window_ref.close();
+            if let Some(viewer) = weak.upgrade() {
+                viewer.set_text_tool(false);
+            }
+            glib::Propagation::Stop
+        });
+        window.add_controller(keys);
+
+        window.present();
     }
 
     /// Abre el selector de color del sistema con el color que ya tiene la
@@ -1664,7 +1888,7 @@ impl Viewer {
             MarkKind::Underline => TextMark::underline(selection.page, rects, color),
             MarkKind::Highlight => TextMark::highlight(selection.page, rects, color),
         };
-        self.annot.marks.borrow_mut().push(mark);
+        self.annot.edits.borrow_mut().push(Annotation::Mark(mark));
         // Un marcado nuevo corta la línea de tiempo de rehacer.
         self.annot.redo.borrow_mut().clear();
 
@@ -1675,43 +1899,44 @@ impl Viewer {
         true
     }
 
-    /// True when there are marks that are not in the file yet.
+    /// True when there are annotations that are not in the file yet.
     pub(crate) fn has_pending_marks(&self) -> bool {
-        self.annot.saved.get() < self.annot.marks.borrow().len()
+        self.annot.saved.get() < self.annot.edits.borrow().len()
     }
 
-    /// Escribe los subrayados pendientes en `target` y devuelve si quedaron
-    /// guardados; si el guardado falla, deja el estado como estaba para que el
+    /// Escribe las anotaciones pendientes en `target` y devuelve si quedaron
+    /// guardadas; si el guardado falla, deja el estado como estaba para que el
     /// lector pueda reintentarlo.
-    pub(crate) fn save_pending_marks(&self, target: &Path) -> bool {
+    pub(crate) fn save_pending_edits(&self, target: &Path) -> bool {
         let source = self.doc.current_path.borrow().clone();
         let Some(source) = source else {
             show_error(&self.ui.window, "No hay ningún documento abierto.", "");
             return false;
         };
 
-        let pending: Vec<TextMark> = {
-            let marks = self.annot.marks.borrow();
-            marks[self.annot.saved.get().min(marks.len())..].to_vec()
-        };
+        let pending: Vec<Annotation> = self.pending_edits();
         if pending.is_empty() {
             return true;
         }
 
-        match write_marks(&source, target, &pending) {
+        match write_annotations(&source, target, &pending) {
             Ok(written) => {
                 // Sólo es un guardado del documento abierto si el destino es ese
                 // archivo: la copia no deja el original al día.
                 if self.is_open_file(target) {
-                    self.annot.saved.set(self.annot.marks.borrow().len());
+                    self.annot.saved.set(self.annot.edits.borrow().len());
                 }
-                let plural = if written == 1 { "marcado" } else { "marcados" };
+                let plural = if written == 1 {
+                    "anotación"
+                } else {
+                    "anotaciones"
+                };
                 self.ui.window.announce(
-                    &format!("Guardados {written} {plural} en el PDF"),
+                    &format!("Guardadas {written} {plural} en el PDF"),
                     gtk::AccessibleAnnouncementPriority::Medium,
                 );
                 self.notify(
-                    "Marcados guardados",
+                    "Anotaciones guardadas",
                     &format!("{written} {plural} en {}", display_name(target)),
                 );
                 true
@@ -1719,7 +1944,7 @@ impl Viewer {
             Err(message) => {
                 show_error(
                     &self.ui.window,
-                    "No se pudieron guardar los marcados.",
+                    "No se pudieron guardar las anotaciones.",
                     &message,
                 );
                 false
@@ -1751,7 +1976,7 @@ impl Viewer {
             );
             return;
         }
-        self.save_pending_marks(&path);
+        self.save_pending_edits(&path);
     }
 
     /// Guarda los subrayados en otro archivo, dejando el original como estaba.
@@ -1788,7 +2013,7 @@ impl Viewer {
             return true;
         }
         if self.has_pending_marks() {
-            return self.save_pending_marks(target);
+            return self.save_pending_edits(target);
         }
 
         match std::fs::copy(&source, target) {
@@ -1812,13 +2037,13 @@ impl Viewer {
         }
     }
 
-    /// Subrayados que todavía no están en el archivo.
-    pub(crate) fn pending_marks(&self) -> Vec<TextMark> {
-        let marks = self.annot.marks.borrow();
-        marks[self.annot.saved.get().min(marks.len())..].to_vec()
+    /// Anotaciones que todavía no están en el archivo.
+    pub(crate) fn pending_edits(&self) -> Vec<Annotation> {
+        let edits = self.annot.edits.borrow();
+        edits[self.annot.saved.get().min(edits.len())..].to_vec()
     }
 
-    /// Pregunta qué hacer con los subrayados sin guardar y sólo después ejecuta
+    /// Pregunta qué hacer con las anotaciones sin guardar y sólo después ejecuta
     /// `then`, con la decisión ya tomada. Sin cambios pendientes `then` corre en
     /// el acto: el camino normal no paga ningún diálogo.
     pub(crate) fn resolve_pending_marks(
@@ -1830,7 +2055,7 @@ impl Viewer {
             return;
         }
 
-        let count = self.pending_marks().len();
+        let count = self.pending_edits().len();
         let name = self
             .doc
             .current_path
@@ -1838,7 +2063,11 @@ impl Viewer {
             .as_ref()
             .map(|path| display_name(path))
             .unwrap_or_default();
-        let plural = if count == 1 { "marcado" } else { "marcados" };
+        let plural = if count == 1 {
+            "anotación"
+        } else {
+            "anotaciones"
+        };
 
         let dialog = gtk::AlertDialog::builder()
             .modal(true)
@@ -1860,12 +2089,12 @@ impl Viewer {
                 };
                 match result {
                     Ok(0) => {
-                        viewer.discard_marks();
+                        viewer.discard_edits();
                         then(&viewer);
                     }
                     // Guardar: si falla, no se sigue con la acción original.
                     Ok(1) => {
-                        if viewer.save_pending_marks_file() {
+                        if viewer.save_pending_edits_file() {
                             then(&viewer);
                         }
                     }
@@ -1873,7 +2102,7 @@ impl Viewer {
                     // los pendientes quedan resueltos; cancelar el diálogo de
                     // archivo deja todo como estaba.
                     Ok(2) => viewer.save_annotations_as(Some(Box::new(move |viewer| {
-                        viewer.discard_marks();
+                        viewer.discard_edits();
                         then(viewer);
                     }))),
                     // Cerrar el diálogo con Esc o con la X no elige nada: la
@@ -1884,56 +2113,56 @@ impl Viewer {
         );
     }
 
-    fn save_pending_marks_file(self: &Rc<Self>) -> bool {
+    fn save_pending_edits_file(self: &Rc<Self>) -> bool {
         let Some(path) = self.doc.current_path.borrow().clone() else {
             return false;
         };
-        self.save_pending_marks(&path)
+        self.save_pending_edits(&path)
     }
 
     /// Tira los cambios pendientes y redibuja para que desaparezcan de la página.
     /// Lo que ya está escrito en el archivo se queda.
-    pub(crate) fn discard_marks(&self) {
-        let saved = self.annot.saved.get().min(self.annot.marks.borrow().len());
-        let pages: Vec<usize> = self.annot.marks.borrow()[saved..]
+    pub(crate) fn discard_edits(&self) {
+        let saved = self.annot.saved.get().min(self.annot.edits.borrow().len());
+        let pages: Vec<usize> = self.annot.edits.borrow()[saved..]
             .iter()
-            .map(|mark| mark.page)
+            .map(Annotation::page)
             .collect();
-        self.annot.marks.borrow_mut().truncate(saved);
+        self.annot.edits.borrow_mut().truncate(saved);
         self.annot.redo.borrow_mut().clear();
         for page in pages {
             self.queue_page_draw(page);
         }
     }
 
-    /// Deshace el último marcado que todavía no está en el PDF. Lo que ya se
+    /// Deshace la última anotación que todavía no está en el PDF. Lo que ya se
     /// escribió en el archivo no se puede deshacer desde el visor: habría que
     /// reescribir la anotación.
     pub(crate) fn undo_mark(&self) -> bool {
         let saved = self.annot.saved.get();
-        let mark = {
-            let mut marks = self.annot.marks.borrow_mut();
-            if marks.len() <= saved {
+        let edit = {
+            let mut edits = self.annot.edits.borrow_mut();
+            if edits.len() <= saved {
                 return false;
             }
-            let Some(mark) = marks.pop() else {
+            let Some(edit) = edits.pop() else {
                 return false;
             };
-            mark
+            edit
         };
-        self.queue_page_draw(mark.page);
-        self.annot.redo.borrow_mut().push(mark);
+        self.queue_page_draw(edit.page());
+        self.annot.redo.borrow_mut().push(edit);
         true
     }
 
-    /// Vuelve a poner el último marcado deshecho. Un marcado nuevo descarta el
-    /// historial de rehacer: ya no hay una línea de tiempo que continuar.
+    /// Vuelve a poner la última anotación deshecha. Una anotación nueva descarta
+    /// el historial de rehacer: ya no hay una línea de tiempo que continuar.
     pub(crate) fn redo_mark(&self) -> bool {
-        let Some(mark) = self.annot.redo.borrow_mut().pop() else {
+        let Some(edit) = self.annot.redo.borrow_mut().pop() else {
             return false;
         };
-        self.queue_page_draw(mark.page);
-        self.annot.marks.borrow_mut().push(mark);
+        self.queue_page_draw(edit.page());
+        self.annot.edits.borrow_mut().push(edit);
         true
     }
 
@@ -1961,24 +2190,26 @@ impl Viewer {
             );
             return;
         }
-        let message = if self.annot.marks.borrow().is_empty() {
+        let message = if self.annot.edits.borrow().is_empty() {
             "No hay cambios para deshacer."
         } else {
-            "Los marcados ya escritos en el PDF no se pueden deshacer desde el visor."
+            "Las anotaciones ya escritas en el PDF no se pueden deshacer desde el visor."
         };
         self.ui.window.announce(message, gtk::AccessibleAnnouncementPriority::Medium);
     }
 
-    /// Deja el documento sin marcados en memoria: se usan al abrir otro.
-    pub(crate) fn clear_marks(&self) {
-        self.annot.marks.borrow_mut().clear();
+    /// Deja el documento sin anotaciones en memoria: se usan al abrir otro.
+    pub(crate) fn clear_edits(&self) {
+        self.annot.edits.borrow_mut().clear();
         self.annot.redo.borrow_mut().clear();
         self.annot.saved.set(0);
+        self.annot.draft.borrow_mut().take();
+        self.set_text_tool(false);
         self.set_mark_mode(MarkKind::Underline, false);
         self.set_mark_mode(MarkKind::Highlight, false);
     }
 
-    /// Dibuja la capa de la página: primero los marcados, que son parte del
+    /// Dibuja la capa de la página: primero las anotaciones, que son parte del
     /// documento, y encima la selección que se está arrastrando.
     pub(crate) fn draw_page_overlay(
         &self,
@@ -1988,15 +2219,16 @@ impl Viewer {
         width: i32,
         height: i32,
     ) {
-        self.draw_marks(page, context);
+        self.draw_annotations(page, context);
         self.draw_selection(page, area, context, width, height);
     }
 
-    /// Pinta los marcados de la página: el subrayado sobre el borde inferior de
-    /// cada línea de texto y el resaltado como fondo translúcido.
-    pub(crate) fn draw_marks(&self, page: usize, context: &cairo::Context) {
-        let marks = self.annot.marks.borrow();
-        if marks.iter().all(|mark| mark.page != page) {
+    /// Pinta las anotaciones de la página: el subrayado sobre el borde inferior
+    /// de cada línea de texto, el resaltado como fondo translúcido y las notas
+    /// de texto en negro con su fuente.
+    pub(crate) fn draw_annotations(&self, page: usize, context: &cairo::Context) {
+        let edits = self.annot.edits.borrow();
+        if edits.iter().all(|edit| edit.page() != page) {
             return;
         }
         let Some(size) = self.doc.page_sizes.borrow().get(page).copied() else {
@@ -2006,7 +2238,14 @@ impl Viewer {
         let zoom = self.view.zoom.get();
         let rotation = self.view.rotation.get();
 
-        for mark in marks.iter().filter(|mark| mark.page == page) {
+        for edit in edits.iter().filter(|edit| edit.page() == page) {
+            let mark = match edit {
+                Annotation::Mark(mark) => mark,
+                Annotation::Note(note) => {
+                    draw_note(context, note, size, rotation, zoom);
+                    continue;
+                }
+            };
             match mark.kind {
                 MarkKind::Underline => {
                     context.set_line_cap(cairo::LineCap::Butt);
@@ -2098,6 +2337,10 @@ impl Viewer {
         }
         if let Some(kind) = self.active_mark_tool() {
             self.set_mark_mode(kind, false);
+            return glib::Propagation::Stop;
+        }
+        if self.text_tool_active() {
+            self.set_text_tool(false);
             return glib::Propagation::Stop;
         }
         if self.input.hand_mode.get() {
@@ -2733,6 +2976,14 @@ impl Viewer {
                 gesture.set_state(gtk::EventSequenceState::Denied);
                 return;
             }
+            // Con la herramienta de texto armada no hay selección: el gesto
+            // entero es el clic que coloca la nota, y se niega para que el
+            // arrastre no siga vivo.
+            if viewer.text_tool_active() {
+                gesture.set_state(gtk::EventSequenceState::Denied);
+                viewer.insert_text_note(page, x, y);
+                return;
+            }
             viewer.begin_selection(page, x, y);
         });
 
@@ -2755,6 +3006,12 @@ impl Viewer {
 
     pub(crate) fn begin_selection(&self, page: usize, x: f64, y: f64) {
         if self.input.hand_mode.get() {
+            return;
+        }
+        // La herramienta de texto usa el mismo clic: inserta la nota en vez de
+        // empezar una selección.
+        if self.text_tool_active() {
+            self.insert_text_note(page, x, y);
             return;
         }
         let Some(anchor) = self.view_to_pdf(page, x, y) else {
@@ -4239,7 +4496,7 @@ impl Viewer {
         self.nav.current.set(0);
         *self.sel.selection.borrow_mut() = None;
         self.sel.selection_rects.borrow_mut().clear();
-        self.clear_marks();
+        self.clear_edits();
         self.ui.title.set_label(WINDOW_TITLE);
         self.sync_thumbnails();
         self.set_indicator(0);
@@ -4405,6 +4662,8 @@ impl Viewer {
                 tool.button.set_active(false);
                 tool.button.set_sensitive(false);
             }
+            self.ui.text_button.set_active(false);
+            self.ui.text_button.set_sensitive(false);
             for nav in &self.ui.navs {
                 nav.entry.set_text("");
                 nav.entry.set_sensitive(false);
@@ -4419,6 +4678,7 @@ impl Viewer {
         for tool in &self.ui.tools {
             tool.button.set_sensitive(true);
         }
+        self.ui.text_button.set_sensitive(true);
         self.nav.current.set(index);
         if self.ui.thumbs_selection.selected() != index as u32 {
             self.input.thumb_sync.set(true);
@@ -4443,6 +4703,119 @@ impl Viewer {
 
     pub(crate) fn device_scale(&self) -> f64 {
         f64::from(self.ui.window.scale_factor().max(1))
+    }
+}
+
+/// Descripción de Pango de la fuente de la nota, escalada por `zoom`. El tamaño
+/// va en puntos y el layout se crea a 72 dpi, así que una unidad de cairo es un
+/// punto del PDF.
+fn font_description(font: &FontChoice, zoom: f64) -> pango::FontDescription {
+    let mut description = pango::FontDescription::new();
+    description.set_family(&font.family);
+    let points = if font.size.is_finite() && font.size > 0.0 {
+        font.size
+    } else {
+        12.0
+    };
+    let size = (points * zoom.clamp(0.01, 128.0) * f64::from(pango::SCALE)).round();
+    // El tamaño va en puntos: el layout se crea con resolución de 72 dpi, así una
+    // unidad de cairo es un punto del PDF y no lo altera el DPI de la pantalla.
+    description.set_size(size.clamp(1.0, f64::from(i32::MAX / 2)) as i32);
+    description.set_weight(if font.bold {
+        pango::Weight::Bold
+    } else {
+        pango::Weight::Normal
+    });
+    description.set_style(if font.italic {
+        pango::Style::Italic
+    } else {
+        pango::Style::Normal
+    });
+    description
+}
+
+/// Fuente del selector de GTK al espacio de la nota: familia, tamaño en puntos
+/// y estilo.
+fn font_choice(description: &pango::FontDescription) -> FontChoice {
+    let points = f64::from(description.size()) / f64::from(pango::SCALE);
+    FontChoice {
+        family: description
+            .family()
+            .map(|family| family.to_string())
+            .unwrap_or_else(|| "Sans".to_string()),
+        size: if points > 0.0 { points } else { 12.0 },
+        bold: description.weight() >= pango::Weight::Bold,
+        italic: description.style() != pango::Style::Normal,
+    }
+}
+
+/// Fuente por omisión de la nota: «Sans 12» si el selector no devolvió nada.
+fn default_font_choice() -> FontChoice {
+    FontChoice {
+        family: "Sans".to_string(),
+        size: 12.0,
+        bold: false,
+        italic: false,
+    }
+}
+
+/// Mide el texto en puntos PDF con la fuente elegida. El layout se crea a tamaño
+/// real, sin zoom: el ancho de la nota es el que ocupa en la página.
+fn measure_text(text: &str, font: &FontChoice) -> (f64, f64) {
+    // El contexto necesita el mapa de fuentes de pangocairo: `Context::new()` a
+    // secas deja `font_map` en NULL y Pango no puede medir nada. A 72 dpi el
+    // tamaño en puntos se mide directo en puntos PDF.
+    let context = pango::Context::new();
+    context.set_font_map(Some(&pangocairo::FontMap::default()));
+    pangocairo::functions::context_set_resolution(&context, 72.0);
+    let layout = pango::Layout::new(&context);
+    layout.set_font_description(Some(&font_description(font, 1.0)));
+    layout.set_text(text);
+    let (_, logical) = layout.extents();
+    let scale = f64::from(pango::SCALE);
+    (
+        (f64::from(logical.width()) / scale).max(1.0),
+        (f64::from(logical.height()) / scale).max(1.0),
+    )
+}
+
+/// Pinta una nota con pangocairo: texto negro, escalado por el zoom y girado con
+/// la vista como el resto de la capa.
+fn draw_note(
+    context: &cairo::Context,
+    note: &TextNote,
+    page: (f64, f64),
+    rotation: i32,
+    zoom: f64,
+) {
+    let layout = pangocairo::functions::create_layout(context);
+    // 72 dpi: el tamaño en puntos de la nota es el tamaño en unidades del
+    // contexto, que ya están escaladas por el zoom.
+    pangocairo::functions::context_set_resolution(&layout.context(), 72.0);
+    layout.set_font_description(Some(&font_description(&note.font, zoom)));
+    layout.set_text(&note.text);
+
+    let (x, y) = forward_rotation(note.at, page, rotation);
+    let _ = context.save();
+    context.translate(x * zoom, y * zoom);
+    context.rotate(view_angle(rotation));
+    context.set_source_rgba(0.0, 0.0, 0.0, 1.0);
+    // `at` es la esquina superior izquierda de la nota y cairo dibuja desde la
+    // línea base: se baja por la línea base de Pango, que ya viene escalada por
+    // el zoom, para que la pantalla y el `/Rect` que se escribe coincidan.
+    context.move_to(0.0, f64::from(layout.baseline()) / f64::from(pango::SCALE));
+    pangocairo::functions::show_layout(context, &layout);
+    let _ = context.restore();
+}
+
+/// Ángulo de cairo de la rotación de la vista, el mismo que aplica
+/// `apply_rotation` al rasterizar la página.
+fn view_angle(rotation: i32) -> f64 {
+    match rotation.rem_euclid(360) {
+        90 => std::f64::consts::FRAC_PI_2,
+        180 => std::f64::consts::PI,
+        270 => -std::f64::consts::FRAC_PI_2,
+        _ => 0.0,
     }
 }
 

@@ -41,10 +41,10 @@ Una línea por capacidad, sin agrupar cosas distintas en una sola casilla.
 - [x] Resaltado del texto (rotulador) en el color a elección (selector de color de GTK, amarillo de rotulador por omisión), escrito en el PDF como anotación `/Highlight` con `/CA 0.4` para que el texto se siga leyendo: al pulsar el botón al lado del zoom se abre el selector de color de GTK y, si ya había texto seleccionado, se resalta en el acto; si no, la herramienta queda armada para el siguiente arrastre (`Ctrl+Shift+U`, `Esc` sale del modo)
 - [x] Deshacer y rehacer (`Ctrl+Z` / `Ctrl+Shift+Z`, también `Ctrl+Y`, y `Edit > Deshacer` / `Rehacer`) de los marcados que todavía no están en el PDF, uno por uno y en orden; un marcado nuevo descarta lo que había para rehacer, y lo ya escrito en el archivo no se deshace desde el visor porque habría que reescribir la anotación
 - [x] El color elegido se muestra en el botón de cada herramienta: la `U` con la línea en ese color y la `A` con ese fondo
-- [x] Guardar los marcados (subrayados y resaltados) en el PDF abierto (`Ctrl+S`) o en una copia (`Ctrl+Shift+S`), con escritura atómica y pregunta de Descartar / Guardar / Guardar como al cerrar el documento, recargarlo, abrir otro o cerrar la ventana
+- [x] Guardar los marcados (subrayados y resaltados) y las notas de texto en el PDF abierto (`Ctrl+S`) o en una copia (`Ctrl+Shift+S`), con escritura atómica y pregunta de Descartar / Guardar / Guardar como al cerrar el documento, recargarlo, abrir otro o cerrar la ventana
 - [ ] [BLOQUEADA: escritura de PDF] Tachado de texto
 - [ ] [BLOQUEADA: escritura de PDF] Notas adhesivas (sticky notes) y comentarios con hilos de respuesta
-- [ ] [BLOQUEADA: escritura de PDF] Texto libre sobre la página (fuente, tamaño, color)
+- [x] Texto libre sobre la página (`Ctrl+T`, botón `T` o `Edit > Insertar texto…`), escrito como anotación `/FreeText` con `/Contents`, `/Rect` y `/DA`: un diálogo modal pide el texto y la fuente (selector de fuente de GTK, arranca en «Sans 12») y el siguiente clic fija la esquina de la nota; la familia elegida se aproxima a una de las 14 estándar del PDF (`/Helv`, `/TiRo`, `/Cour` con su estilo), el ancho sale de medir con Pango en puntos y la nota se dibuja en negro sobre la capa de la página
 - [ ] [BLOQUEADA: escritura de PDF] Dibujo a mano alzada (lápiz) con grosor y color
 - [ ] [BLOQUEADA: escritura de PDF] Formas: rectángulo, elipse, línea, flecha
 - [ ] [BLOQUEADA: escritura de PDF] Sellos (aprobado, revisado, borrador) e imágenes pegadas
@@ -125,7 +125,7 @@ necesita una decisión o una dependencia nueva.
 
 - **Escritura de PDF** (resto de la sección 2, unir/dividir/comprimir): poppler-glib
   es de solo lectura. La escritura de anotaciones ya se resolvió con `lopdf`
-  (subrayado y resaltado, sección 2); lo que queda sigue necesitando escribir el PDF (qpdf,
+  (subrayado, resaltado y texto libre, sección 2); lo que queda sigue necesitando escribir el PDF (qpdf,
   mupdf, lopdf) o cambiar de motor a pdfium.
 - **Formularios y firmas** (sección 3): poppler no guarda AcroForm ni firmas; PAdES
   además necesita un stack criptográfico (`openssl`/`ring`) y verificación de

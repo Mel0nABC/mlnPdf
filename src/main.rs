@@ -26,7 +26,7 @@ mod tests {
     use crate::ui::actions::*;
     use std::rc::Rc;
     use crate::engine::geometry::*;
-    use crate::engine::annotation::MarkKind;
+    use crate::engine::annotation::{Annotation, FontChoice, MarkKind, TextMark};
     use crate::ui::shell::*;
 
     /// One page, 200x100 pt, fully filled with pure red, no xref table
@@ -200,8 +200,8 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
         };
         assert_eq!(
             children.len(),
-            7,
-            "búsqueda, hueco, páginas, hueco, zoom, subrayar, resaltar"
+            8,
+            "búsqueda, hueco, páginas, hueco, zoom, subrayar, resaltar, insertar texto"
         );
         for gap in [&children[1], &children[3]] {
             assert_eq!(
@@ -215,12 +215,21 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
             TOOLBAR_GAP,
             "el bloque de páginas no es una separación"
         );
-        for (index, name) in [(5, "el subrayado"), (6, "el resaltado")] {
+        for (index, name) in [
+            (5, "el subrayado"),
+            (6, "el resaltado"),
+            (7, "insertar texto"),
+        ] {
             assert!(
                 children[index].is::<gtk::ToggleButton>(),
                 "{name} va justo al lado del zoom"
             );
         }
+        assert_eq!(
+            children[7].tooltip_text().as_deref(),
+            Some("Insertar texto (Ctrl+T)"),
+            "la tercera herramienta se anuncia con su atajo"
+        );
 
         // El menú File: guardar con nombres cortos. "Guardar" escribe en el
         // archivo abierto y "Guardar como…" pide otro destino.
@@ -247,6 +256,28 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
             &file_labels[..3],
             ["Abrir…", "Guardar", "Guardar como…"],
             "el menú File guarda con nombres cortos: sin 'los subrayados' ni 'una copia'"
+        );
+
+        // El menú Edit ofrece la herramienta de texto junto a las de marcado.
+        let edit_labels: Vec<String> = (0..model.n_items())
+            .find(|index| {
+                model
+                    .item_attribute_value(*index, "label", None)
+                    .and_then(|value| value.get::<String>())
+                    .as_deref()
+                    == Some("Edit")
+            })
+            .and_then(|index| model.item_link(index, "submenu"))
+            .map(|menu| {
+                (0..menu.n_items())
+                    .filter_map(|index| menu.item_attribute_value(index, "label", None))
+                    .filter_map(|value| value.get::<String>())
+                    .collect()
+            })
+            .expect("el menú Edit tiene que existir");
+        assert!(
+            edit_labels.iter().any(|label| label == "Insertar texto…"),
+            "el menú Edit ofrece insertar texto: {edit_labels:?}"
         );
 
         // Every declared shortcut must be a valid trigger, and every action it
@@ -376,11 +407,11 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
         );
         viewer.accept_mark_color(MarkKind::Underline, (0.15, 0.45, 0.85));
         assert_eq!(
-            viewer.annot.marks.borrow().len(),
+            viewer.annot.edits.borrow().len(),
             1,
             "con texto seleccionado se subraya sin pedir otro gesto"
         );
-        let first = viewer.annot.marks.borrow()[0].clone();
+        let first = mark_at(&viewer, 0);
         assert_eq!(first.kind, MarkKind::Underline);
         assert_eq!(first.color, [0.15, 0.45, 0.85], "con el color elegido");
         assert!(
@@ -419,18 +450,18 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
         viewer.update_selection(0, 160.0, 40.0);
         viewer.finish_selection();
         assert_eq!(
-            viewer.annot.marks.borrow().len(),
+            viewer.annot.edits.borrow().len(),
             1,
             "sin herramienta armada el arrastre solo selecciona"
         );
         viewer.accept_mark_color(MarkKind::Underline, (0.15, 0.45, 0.85));
         assert_eq!(
-            viewer.annot.marks.borrow().len(),
+            viewer.annot.edits.borrow().len(),
             2,
             "el color sobre la selección pendiente la marca en el acto"
         );
         assert_eq!(
-            viewer.annot.marks.borrow()[1].color,
+            mark_at(&viewer, 1).color,
             [0.15, 0.45, 0.85],
             "el subrayado se crea con el color elegido"
         );
@@ -456,11 +487,11 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
         viewer.update_selection(0, 120.0, 20.0);
         viewer.finish_selection();
         assert_eq!(
-            viewer.annot.marks.borrow().len(),
+            viewer.annot.edits.borrow().len(),
             3,
             "con la herramienta de resaltar el arrastre marca solo"
         );
-        let highlight = viewer.annot.marks.borrow()[2].clone();
+        let highlight = mark_at(&viewer, 2);
         assert_eq!(
             highlight.kind,
             MarkKind::Highlight,
@@ -487,22 +518,96 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
             mark_glyph_markup(MarkKind::Highlight, (1.0, 0.5, 0.0)).contains("#ff8000"),
             "el botón de resaltar muestra su color de fondo"
         );
-        assert_eq!(viewer.annot.marks.borrow().len(), 4);
-        assert_eq!(viewer.annot.marks.borrow()[3].kind, MarkKind::Highlight);
-        assert_eq!(viewer.annot.marks.borrow()[3].color, [1.0, 0.5, 0.0]);
+        assert_eq!(viewer.annot.edits.borrow().len(), 4);
+        assert_eq!(mark_at(&viewer, 3).kind, MarkKind::Highlight);
+        assert_eq!(mark_at(&viewer, 3).color, [1.0, 0.5, 0.0]);
         viewer.set_mark_mode(MarkKind::Highlight, false);
+
+        // Insertar texto: el borrador que deja el diálogo (acá se carga directo,
+        // porque una prueba no puede manejar la ventana modal) se coloca con un
+        // clic sobre la página y queda pendiente como cualquier otra anotación.
+        let note_font = FontChoice {
+            family: "Liberation Serif".to_string(),
+            size: 14.0,
+            bold: true,
+            italic: false,
+        };
+        viewer.apply_text_draft("Nota (insertada) ñandú".to_string(), note_font.clone());
+        assert!(
+            viewer.text_tool_active(),
+            "Insertar texto deja la herramienta armada para el clic"
+        );
+        assert_eq!(
+            viewer.annot.edits.borrow().len(),
+            4,
+            "todavía no se insertó nada"
+        );
+
+        // Un clic con la herramienta armada no selecciona: inserta la nota.
+        viewer.begin_selection(0, 40.0, 20.0);
+        assert_eq!(
+            viewer.annot.edits.borrow().len(),
+            5,
+            "el clic inserta la nota en el punto"
+        );
+        assert!(
+            !viewer.text_tool_active(),
+            "colocarla desarma la herramienta"
+        );
+        let note = match viewer.annot.edits.borrow()[4].clone() {
+            Annotation::Note(note) => note,
+            other => panic!("la quinta anotación tiene que ser una nota: {other:?}"),
+        };
+        assert_eq!(note.page, 0);
+        assert_eq!(
+            note.at,
+            (40.0, 20.0),
+            "el clic fija la esquina superior izquierda"
+        );
+        assert_eq!(note.text, "Nota (insertada) ñandú");
+        assert_eq!(note.font, note_font, "la fuente elegida viaja con la nota");
+        assert!(
+            note.width > 50.0 && note.height > 1.0,
+            "Pango mide el texto en puntos: {}x{}",
+            note.width,
+            note.height
+        );
+
+        // La nota se dibuja sobre la capa de la página sin romper el canvas: el
+        // texto negro tiene que aparecer en el contexto aparte.
+        assert!(
+            annotation_ink(&viewer, 0) > 0,
+            "la nota se pinta en la capa de la página"
+        );
+
+        // Deshacer y rehacer también alcanzan a la nota.
+        assert!(viewer.undo_mark(), "deshacer alcanza a la nota");
+        assert_eq!(viewer.annot.edits.borrow().len(), 4);
+        assert!(viewer.redo_mark(), "rehacer la repone");
+        assert!(
+            matches!(viewer.annot.edits.borrow()[4], Annotation::Note(_)),
+            "rehacer repone la nota, no otra anotación"
+        );
 
         // Guardar: los marcados entran en el archivo abierto y dejan de estar
         // pendientes. Descartar tira sólo lo que todavía no se escribió.
         assert!(
-            viewer.save_pending_marks(&text_path),
-            "guardar escribe los marcados en el archivo abierto"
+            viewer.save_pending_edits(&text_path),
+            "guardar escribe las anotaciones en el archivo abierto"
         );
         assert!(!viewer.has_pending_marks(), "ya no queda nada pendiente");
         assert_eq!(
             written_annotations(&text_path),
-            4,
-            "el archivo tiene una anotación por marcado, subrayados y resaltados"
+            5,
+            "el archivo tiene una anotación por marcado y por nota"
+        );
+        assert_eq!(
+            written_subtypes(&text_path)
+                .iter()
+                .filter(|subtype| *subtype == "FreeText")
+                .count(),
+            1,
+            "la nota se guarda como /FreeText"
         );
         assert!(
             poppler::Document::from_data(&std::fs::read(&text_path).expect("leer"), None).is_ok(),
@@ -514,19 +619,19 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
         viewer.finish_selection();
         assert!(viewer.apply_mark(MarkKind::Underline), "otro subrayado");
         assert!(viewer.has_pending_marks());
-        viewer.discard_marks();
+        viewer.discard_edits();
         assert!(
             !viewer.has_pending_marks(),
             "descartar limpia lo que estaba pendiente"
         );
         assert_eq!(
-            viewer.annot.marks.borrow().len(),
-            4,
+            viewer.annot.edits.borrow().len(),
+            5,
             "lo que ya estaba guardado se queda"
         );
         assert_eq!(
             written_annotations(&text_path),
-            4,
+            5,
             "descartar no toca el archivo"
         );
 
@@ -560,7 +665,7 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
         );
         assert_eq!(
             written_annotations(&text_path),
-            4,
+            5,
             "descartar no escribe nada en el archivo"
         );
 
@@ -585,8 +690,8 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
         );
         assert_eq!(
             written_annotations(&text_path),
-            5,
-            "el marcado pendiente llegó al archivo"
+            6,
+            "la anotación pendiente llegó al archivo"
         );
 
         // Guardar una copia no puede dejar como "guardado en el archivo abierto"
@@ -597,12 +702,12 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
         assert!(viewer.apply_mark(MarkKind::Underline), "un marcado más");
         let copy = dir.join("copy-ui.pdf");
         std::fs::remove_file(&copy).ok();
-        assert!(viewer.save_pending_marks(&copy), "guardar la copia");
-        assert_eq!(written_annotations(&copy), 6, "la copia lleva los seis");
+        assert!(viewer.save_pending_edits(&copy), "guardar la copia");
+        assert_eq!(written_annotations(&copy), 7, "la copia lleva las siete");
         assert_eq!(
             written_annotations(&text_path),
-            5,
-            "el original sigue con cinco"
+            6,
+            "el original sigue con seis"
         );
         assert!(
             viewer.has_pending_marks(),
@@ -611,8 +716,8 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
         viewer.save_annotations();
         assert_eq!(
             written_annotations(&text_path),
-            6,
-            "el original recibe el sexto"
+            7,
+            "el original recibe la séptima"
         );
         assert!(!viewer.has_pending_marks());
         std::fs::remove_file(&copy).ok();
@@ -633,44 +738,55 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
             viewer.apply_mark(MarkKind::Highlight),
             "segundo cambio pendiente"
         );
-        assert_eq!(viewer.annot.marks.borrow().len(), 8, "seis guardados y dos más");
+        assert_eq!(
+            viewer.annot.edits.borrow().len(),
+            9,
+            "siete guardadas y dos más"
+        );
 
-        assert!(viewer.undo_mark(), "se deshace el último marcado");
-        assert_eq!(viewer.annot.marks.borrow().len(), 7);
+        assert!(viewer.undo_mark(), "se deshace la última anotación");
+        assert_eq!(viewer.annot.edits.borrow().len(), 8);
         assert!(
             viewer.has_pending_marks(),
             "todavía queda un cambio sin guardar"
         );
         assert_eq!(
             written_annotations(&text_path),
-            6,
+            7,
             "deshacer no reescribe el archivo"
         );
-        assert!(viewer.undo_mark(), "se deshace el otro");
+        assert!(viewer.undo_mark(), "se deshace la otra");
         assert!(!viewer.has_pending_marks());
         assert!(
             !viewer.undo_mark(),
             "lo que ya está escrito en el PDF no se deshace"
         );
-        assert_eq!(viewer.annot.marks.borrow().len(), 6, "vuelve al estado guardado");
+        assert_eq!(
+            viewer.annot.edits.borrow().len(),
+            7,
+            "vuelve al estado guardado"
+        );
 
         // Rehacer repone lo deshecho en orden y se agota.
         assert!(viewer.redo_mark(), "se rehace el primero de los deshechos");
-        assert_eq!(viewer.annot.marks.borrow().len(), 7);
-        assert!(viewer.has_pending_marks(), "lo rehecho vuelve a estar pendiente");
+        assert_eq!(viewer.annot.edits.borrow().len(), 8);
+        assert!(
+            viewer.has_pending_marks(),
+            "lo rehecho vuelve a estar pendiente"
+        );
         assert!(viewer.redo_mark(), "se rehace el otro");
-        assert_eq!(viewer.annot.marks.borrow().len(), 8);
+        assert_eq!(viewer.annot.edits.borrow().len(), 9);
         assert!(!viewer.redo_mark(), "no hay más que rehacer");
         assert_eq!(
-            viewer.annot.marks.borrow()[6].kind,
+            mark_at(&viewer, 7).kind,
             MarkKind::Underline,
             "el orden de rehacer es el de deshacer"
         );
-        assert_eq!(viewer.annot.marks.borrow()[7].kind, MarkKind::Highlight);
+        assert_eq!(mark_at(&viewer, 8).kind, MarkKind::Highlight);
 
         // Deshacer y después marcar algo nuevo descarta lo que había para rehacer.
         assert!(viewer.undo_mark() && viewer.undo_mark());
-        assert_eq!(viewer.annot.marks.borrow().len(), 6);
+        assert_eq!(viewer.annot.edits.borrow().len(), 7);
         viewer.begin_selection(0, 20.0, 10.0);
         viewer.update_selection(0, 180.0, 35.0);
         viewer.finish_selection();
@@ -679,14 +795,14 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
             !viewer.redo_mark(),
             "lo nuevo corta la línea de tiempo de rehacer"
         );
-        assert_eq!(viewer.annot.marks.borrow().len(), 7);
+        assert_eq!(viewer.annot.edits.borrow().len(), 8);
         assert!(viewer.undo_mark(), "y ese marcado nuevo se puede deshacer");
-        assert_eq!(viewer.annot.marks.borrow().len(), 6);
+        assert_eq!(viewer.annot.edits.borrow().len(), 7);
 
         // El atajo y el menú usan la misma acción: sin pendientes no rompe nada.
         gtk::prelude::WidgetExt::activate_action(&viewer.ui.window, "win.undo", None)
             .expect("la acción de deshacer tiene que existir");
-        assert_eq!(viewer.annot.marks.borrow().len(), 6);
+        assert_eq!(viewer.annot.edits.borrow().len(), 7);
 
         // Guardar como (Ctrl+Shift+S) tiene que dejar un archivo en el destino
         // aunque no haya nada pendiente: es una copia del documento abierto.
@@ -714,6 +830,34 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
             "el archivo abierto sobrevive a un guardar como sobre sí mismo"
         );
         std::fs::remove_file(&plain).ok();
+
+        // Una sola herramienta armada: armar un marcado apaga insertar texto, y
+        // Esc desarma la herramienta de texto.
+        viewer.set_text_tool(true);
+        assert!(viewer.text_tool_active());
+        viewer.set_mark_mode(MarkKind::Underline, true);
+        assert!(
+            !viewer.text_tool_active(),
+            "armar un marcado apaga insertar texto"
+        );
+        viewer.set_mark_mode(MarkKind::Underline, false);
+
+        viewer.apply_text_draft(
+            "Otra nota".to_string(),
+            FontChoice {
+                family: "Sans".to_string(),
+                size: 12.0,
+                bold: false,
+                italic: false,
+            },
+        );
+        assert!(viewer.text_tool_active());
+        assert_eq!(
+            viewer.escape_pressed(),
+            gtk::glib::Propagation::Stop,
+            "Esc tiene que desarmar la herramienta de texto"
+        );
+        assert!(!viewer.text_tool_active(), "Esc desarma insertar texto");
 
         // Pulsar la herramienta abre el selector de color del sistema. Es la
         // única parte del flujo que no se puede probar sin un clic real, así que
@@ -785,6 +929,63 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
             .get_page_annotations(page_id)
             .expect("anotaciones")
             .len()
+    }
+
+    /// Marcado de la posición `index`, para las pruebas que comparan color y tipo.
+    fn mark_at(viewer: &Viewer, index: usize) -> TextMark {
+        match viewer.annot.edits.borrow()[index].clone() {
+            Annotation::Mark(mark) => mark,
+            other => panic!("la anotación {index} tenía que ser un marcado: {other:?}"),
+        }
+    }
+
+    /// Subtipos (`/Underline`, `/Highlight`, `/FreeText`, ...) de las anotaciones
+    /// del archivo, leídos con lopdf.
+    fn written_subtypes(path: &Path) -> Vec<String> {
+        let document = lopdf::Document::load(path).expect("lopdf abre el archivo");
+        let page_id = *document.get_pages().get(&1).expect("página 1");
+        document
+            .get_page_annotations(page_id)
+            .expect("anotaciones")
+            .iter()
+            .map(|annotation| {
+                annotation
+                    .get(b"Subtype")
+                    .and_then(lopdf::Object::as_name)
+                    .map(|name| String::from_utf8_lossy(name).into_owned())
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    /// Dibuja la capa de anotaciones de una página en una superficie aparte y
+    /// cuenta los píxeles oscuros: prueba que el texto de la nota se pinta sin
+    /// necesitar que el canvas esté en pantalla.
+    fn annotation_ink(viewer: &Viewer, page: usize) -> usize {
+        let mut surface = cairo::ImageSurface::create(cairo::Format::ARgb32, 200, 200)
+            .expect("crear la superficie");
+        {
+            let context = cairo::Context::new(&surface).expect("contexto");
+            context.set_source_rgb(1.0, 1.0, 1.0);
+            context.paint().expect("fondo blanco");
+            viewer.draw_annotations(page, &context);
+        }
+        surface.flush();
+
+        let stride = usize::try_from(surface.stride()).expect("stride");
+        let (width, height) = (surface.width() as usize, surface.height() as usize);
+        let data = surface.data().expect("píxeles");
+        let mut dark = 0;
+        for row in 0..height {
+            for column in 0..width {
+                let offset = row * stride + column * 4;
+                let (blue, green, red) = (data[offset], data[offset + 1], data[offset + 2]);
+                if red < 80 && green < 80 && blue < 80 {
+                    dark += 1;
+                }
+            }
+        }
+        dark
     }
 
     /// Runs the main loop until `done` holds, so an animated change can settle.

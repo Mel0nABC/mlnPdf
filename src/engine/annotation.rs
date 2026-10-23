@@ -94,6 +94,152 @@ impl TextMark {
     }
 }
 
+/// Fuente base del PDF para una nota de texto. Las familias arbitrarias del
+/// sistema no se pueden usar sin incrustar el archivo de fuente, así que se
+/// aproximan a una de las 14 estándar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BaseFont {
+    Helvetica,
+    Times,
+    Courier,
+}
+
+/// Familia + estilo elegidos en el selector de fuente de GTK, ya resueltos al
+/// espacio de la nota.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FontChoice {
+    /// Familia tal como la devuelve GTK, p. ej. `DejaVu Sans Mono`.
+    pub family: String,
+    /// Tamaño en puntos.
+    pub size: f64,
+    pub bold: bool,
+    pub italic: bool,
+}
+
+impl FontChoice {
+    /// Familia y estilo aproximados a una fuente base del PDF.
+    ///
+    /// La comparación no distingue mayúsculas porque las familias llegan con el
+    /// nombre que les da el sistema (`Times New Roman`, `Liberation Serif`,
+    /// `Noto Sans Mono`). El orden importa: `Serif` gana sobre `Mono`, y una
+    /// familia que además dice `Sans` (`Sans Serif`) no es Times sino
+    /// Helvetica.
+    pub fn base_font(&self) -> BaseFont {
+        let family = self.family.to_lowercase();
+        if family.contains("times") || (family.contains("serif") && !family.contains("sans")) {
+            BaseFont::Times
+        } else if family.contains("mono")
+            || family.contains("courier")
+            || family.contains("code")
+        {
+            BaseFont::Courier
+        } else {
+            BaseFont::Helvetica
+        }
+    }
+
+    /// Nombre completo de la fuente base, con el estilo ya aplicado:
+    /// `Helvetica-BoldOblique`, `Times-Italic`, `Courier-Bold`, ...
+    pub fn pdf_name(&self) -> &'static str {
+        match (self.base_font(), self.bold, self.italic) {
+            (BaseFont::Helvetica, false, false) => "Helvetica",
+            (BaseFont::Helvetica, true, false) => "Helvetica-Bold",
+            (BaseFont::Helvetica, false, true) => "Helvetica-Oblique",
+            (BaseFont::Helvetica, true, true) => "Helvetica-BoldOblique",
+            (BaseFont::Times, false, false) => "Times-Roman",
+            (BaseFont::Times, true, false) => "Times-Bold",
+            (BaseFont::Times, false, true) => "Times-Italic",
+            (BaseFont::Times, true, true) => "Times-BoldItalic",
+            (BaseFont::Courier, false, false) => "Courier",
+            (BaseFont::Courier, true, false) => "Courier-Bold",
+            (BaseFont::Courier, false, true) => "Courier-Oblique",
+            (BaseFont::Courier, true, true) => "Courier-BoldOblique",
+        }
+    }
+
+    /// Nombre abreviado con el que `/DA` referencia la fuente base (`Helv`,
+    /// `TiBo`, `CoOb`, ...). Una nota `/FreeText` no lleva recursos de fuente
+    /// propios, así que el lector tiene que reconocer el nombre en su tabla de
+    /// las 14 estándar.
+    pub fn da_name(&self) -> &'static str {
+        // La abreviatura se deriva del nombre completo: así el estilo se decide
+        // en un solo lugar.
+        match self.pdf_name() {
+            "Helvetica" => "Helv",
+            "Helvetica-Bold" => "HeBo",
+            "Helvetica-Oblique" => "HeOb",
+            "Helvetica-BoldOblique" => "HeBO",
+            "Times-Roman" => "TiRo",
+            "Times-Bold" => "TiBo",
+            "Times-Italic" => "TiIt",
+            "Times-BoldItalic" => "TiBI",
+            "Courier" => "Cour",
+            "Courier-Bold" => "CoBo",
+            "Courier-Oblique" => "CoOb",
+            _ => "CoBO",
+        }
+    }
+}
+
+/// Una nota de texto insertada en la página.
+/// `at` es la esquina superior izquierda del texto en puntos PDF con el origen
+/// arriba a la izquierda (el mismo espacio que la selección).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextNote {
+    pub page: usize,
+    pub at: (f64, f64),
+    pub width: f64,
+    pub height: f64,
+    pub text: String,
+    pub font: FontChoice,
+}
+
+/// Cualquier cosa que el lector agregue al documento.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Annotation {
+    Mark(TextMark),
+    Note(TextNote),
+}
+
+impl Annotation {
+    /// Página a la que pertenece la anotación, empezando en cero.
+    pub fn page(&self) -> usize {
+        match self {
+            Self::Mark(mark) => mark.page,
+            Self::Note(note) => note.page,
+        }
+    }
+
+    /// True cuando no hay nada que escribir: una nota sin texto o un marcado
+    /// sin rectángulos.
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::Mark(mark) => mark.is_empty(),
+            Self::Note(note) => note.text.trim().is_empty(),
+        }
+    }
+}
+
+/// `/Rect` de una nota: las dos esquinas opuestas del recuadro de texto, en el
+/// espacio de usuario del archivo y ordenadas como pide la lista.
+///
+/// La nota se mide en el espacio de la selección (origen arriba), así que las
+/// dos esquinas se convierten por separado: con `/Rotate` los ejes se
+/// intercambian y el mínimo y el máximo dejan de ser los de la esquina de
+/// origen.
+pub fn note_rect(note: &TextNote, page: PageBox) -> Rect {
+    let corner = note.at;
+    let opposite = (note.at.0 + note.width, note.at.1 + note.height);
+    let (x1, y1) = user_point(corner, page);
+    let (x2, y2) = user_point(opposite, page);
+    (
+        x1.min(x2),
+        y1.min(y2),
+        x1.max(x2),
+        y1.max(y2),
+    )
+}
+
 /// Quads de `/QuadPoints`: ocho números por línea, en el orden que pide el PDF
 /// (arriba a la izquierda, arriba a la derecha, abajo a la izquierda, abajo a la
 /// derecha).
@@ -295,5 +441,144 @@ mod tests {
         assert_eq!(highlight.kind, MarkKind::Highlight);
         assert_eq!(underline.color, highlight.color);
         assert_eq!(underline.rects, highlight.rects);
+    }
+
+    /// Elección de fuente con familia, tamaño y estilo, para las pruebas.
+    fn font(family: &str, bold: bool, italic: bool) -> FontChoice {
+        FontChoice {
+            family: family.to_string(),
+            size: 12.0,
+            bold,
+            italic,
+        }
+    }
+
+    /// Nota de texto con un recuadro conocido, para las pruebas.
+    fn note(text: &str) -> TextNote {
+        TextNote {
+            page: 2,
+            at: (10.0, 20.0),
+            width: 30.0,
+            height: 5.0,
+            text: text.to_string(),
+            font: font("Sans", false, false),
+        }
+    }
+
+    #[test]
+    fn an_arbitrary_family_falls_back_to_one_of_the_standard_fonts() {
+        // Las familias del sistema no están en el PDF: se aproximan a una de las
+        // 14 estándar según lo que el nombre de la familia delata.
+        assert_eq!(font("DejaVu Sans", false, false).base_font(), BaseFont::Helvetica);
+        assert_eq!(font("Cantarell", false, false).base_font(), BaseFont::Helvetica);
+        assert_eq!(
+            font("Times New Roman", false, false).base_font(),
+            BaseFont::Times,
+            "Times es serif"
+        );
+        assert_eq!(
+            font("Liberation Serif", false, false).base_font(),
+            BaseFont::Times
+        );
+        assert_eq!(
+            font("Sans Serif", false, false).base_font(),
+            BaseFont::Helvetica,
+            "una familia que dice Sans no es Times"
+        );
+        assert_eq!(
+            font("Noto Sans Mono", false, false).base_font(),
+            BaseFont::Courier
+        );
+        assert_eq!(
+            font("Courier New", false, false).base_font(),
+            BaseFont::Courier
+        );
+        assert_eq!(
+            font("Source Code Pro", false, false).base_font(),
+            BaseFont::Courier
+        );
+    }
+
+    #[test]
+    fn the_pdf_name_carries_the_style_of_the_chosen_font() {
+        assert_eq!(font("DejaVu Sans", false, false).pdf_name(), "Helvetica");
+        assert_eq!(font("DejaVu Sans", true, false).pdf_name(), "Helvetica-Bold");
+        assert_eq!(
+            font("DejaVu Sans", false, true).pdf_name(),
+            "Helvetica-Oblique"
+        );
+        assert_eq!(
+            font("DejaVu Sans", true, true).pdf_name(),
+            "Helvetica-BoldOblique"
+        );
+        assert_eq!(font("Times New Roman", false, false).pdf_name(), "Times-Roman");
+        assert_eq!(font("Liberation Serif", true, false).pdf_name(), "Times-Bold");
+        assert_eq!(
+            font("Liberation Serif", false, true).pdf_name(),
+            "Times-Italic"
+        );
+        assert_eq!(
+            font("Liberation Serif", true, true).pdf_name(),
+            "Times-BoldItalic"
+        );
+        assert_eq!(font("Noto Sans Mono", false, false).pdf_name(), "Courier");
+        assert_eq!(
+            font("Courier New", true, true).pdf_name(),
+            "Courier-BoldOblique"
+        );
+        assert_eq!(
+            font("Source Code Pro", true, false).pdf_name(),
+            "Courier-Bold"
+        );
+    }
+
+    #[test]
+    fn the_da_name_is_the_abbreviation_the_readers_recognize() {
+        assert_eq!(font("DejaVu Sans", false, false).da_name(), "Helv");
+        assert_eq!(font("DejaVu Sans", true, false).da_name(), "HeBo");
+        assert_eq!(font("DejaVu Sans", false, true).da_name(), "HeOb");
+        assert_eq!(font("DejaVu Sans", true, true).da_name(), "HeBO");
+        assert_eq!(font("Times New Roman", false, false).da_name(), "TiRo");
+        assert_eq!(font("Times New Roman", true, false).da_name(), "TiBo");
+        assert_eq!(font("Times New Roman", false, true).da_name(), "TiIt");
+        assert_eq!(font("Times New Roman", true, true).da_name(), "TiBI");
+        assert_eq!(font("Noto Sans Mono", false, false).da_name(), "Cour");
+        assert_eq!(font("Noto Sans Mono", true, false).da_name(), "CoBo");
+        assert_eq!(font("Noto Sans Mono", false, true).da_name(), "CoOb");
+        assert_eq!(font("Noto Sans Mono", true, true).da_name(), "CoBO");
+    }
+
+    #[test]
+    fn a_note_without_text_is_empty_and_a_note_with_text_is_not() {
+        let empty = Annotation::Note(note("   "));
+        assert_eq!(empty.page(), 2);
+        assert!(empty.is_empty(), "una nota en blanco no se escribe");
+
+        let filled = Annotation::Note(note("Hola"));
+        assert_eq!(filled.page(), 2);
+        assert!(!filled.is_empty());
+
+        let mark = Annotation::Mark(TextMark::underline(4, vec![line(20.0, 30.0)], (0.0, 0.0, 0.0)));
+        assert_eq!(mark.page(), 4, "la página la decide el marcado");
+        assert!(!mark.is_empty());
+        assert!(Annotation::Mark(TextMark::underline(4, Vec::new(), (0.0, 0.0, 0.0))).is_empty());
+    }
+
+    #[test]
+    fn the_note_rectangle_flips_the_top_left_corner_into_user_space() {
+        // Una nota de 30x5 pt en (10, 20) de una página de 200x100: el borde
+        // superior está a 20 pt del borde de arriba, o sea y=80 desde abajo.
+        let rect = note_rect(&note("Hola"), PLAIN);
+        assert_eq!(rect, (10.0, 75.0, 40.0, 80.0));
+
+        // Con /Rotate 90 el recuadro se acuesta: los ejes se intercambian.
+        let turned = note_rect(
+            &note("Hola"),
+            PageBox {
+                rotation: 90,
+                ..PLAIN
+            },
+        );
+        assert_eq!(turned, (20.0, 10.0, 25.0, 40.0));
     }
 }

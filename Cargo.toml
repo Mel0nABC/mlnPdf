@@ -16,3 +16,7 @@ glib = "0.22"
 # with a pure-Rust PDF writer. No default features: neither rayon nor chrono is
 # needed to append an object and save, and both drag extra dependencies in.
 lopdf = { version = "0.46", default-features = false }
+# Texto de las notas: el layout de Pango mide el ancho y pangocairo lo pinta
+# sobre la capa de la página. Mismo tren 0.22 que usa gtk4.
+pango = "0.22"
+pangocairo = "0.22"

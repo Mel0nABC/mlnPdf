@@ -6,15 +6,21 @@ use std::path::{Path, PathBuf};
 
 use lopdf::{Dictionary, Document, Object, ObjectId};
 
-use crate::engine::annotation::{bounds_rect, mark_quads, MarkKind, PageBox, TextMark};
+use crate::engine::annotation::{
+    Annotation, FontChoice, MarkKind, PageBox, TextNote, bounds_rect, mark_quads, note_rect,
+};
 
-/// Agrega los marcados al PDF y lo escribe en `target`; devuelve cuántas
+/// Agrega las anotaciones al PDF y lo escribe en `target`; devuelve cuántas
 /// anotaciones quedaron escritas.
 ///
 /// `source` es el archivo que hay que editar y no se toca hasta que el nuevo
 /// documento está completo en el disco. Cuando `target` es el mismo archivo que
 /// `source`, el guardado es atómico: primero el temporal, después el reemplazo.
-pub fn write_marks(source: &Path, target: &Path, marks: &[TextMark]) -> Result<u32, String> {
+pub fn write_annotations(
+    source: &Path,
+    target: &Path,
+    annotations: &[Annotation],
+) -> Result<u32, String> {
     let mut document = Document::load(source)
         .map_err(|error| format!("no se pudo abrir el PDF para editarlo: {error}"))?;
     // `is_encrypted` mira el trailer actual y `was_encrypted` recuerda el archivo
@@ -30,17 +36,22 @@ pub fn write_marks(source: &Path, target: &Path, marks: &[TextMark]) -> Result<u
     let pages = document.get_pages();
     let mut written = 0;
 
-    for mark in marks.iter().filter(|mark| !mark.is_empty()) {
-        let Some(page_id) = pages.get(&(mark.page as u32 + 1)).copied() else {
+    for annotation in annotations.iter().filter(|annotation| !annotation.is_empty()) {
+        let Some(page_id) = pages.get(&(annotation.page() as u32 + 1)).copied() else {
             continue;
         };
         let page_box = page_box(&document, page_id)?;
-        let quads = mark_quads(&mark.rects, page_box);
-        if quads.is_empty() {
-            continue;
-        }
-        let annotation = annotation_dictionary(&quads, mark.color, mark.kind);
-        push_annotation(&mut document, page_id, annotation)?;
+        let object = match annotation {
+            Annotation::Mark(mark) => {
+                let quads = mark_quads(&mark.rects, page_box);
+                if quads.is_empty() {
+                    continue;
+                }
+                mark_dictionary(&quads, mark.color, mark.kind)
+            }
+            Annotation::Note(note) => note_dictionary(note, page_box),
+        };
+        push_annotation(&mut document, page_id, object)?;
         written += 1;
     }
 
@@ -49,7 +60,7 @@ pub fn write_marks(source: &Path, target: &Path, marks: &[TextMark]) -> Result<u
 }
 
 /// Diccionario de la anotación de marcado, listo para colgar de `/Annots`.
-fn annotation_dictionary(quads: &[[f64; 8]], color: [f64; 3], kind: MarkKind) -> Object {
+fn mark_dictionary(quads: &[[f64; 8]], color: [f64; 3], kind: MarkKind) -> Object {
     let rect = bounds_rect(quads);
 
     let mut dictionary = Dictionary::new();
@@ -91,6 +102,70 @@ fn annotation_dictionary(quads: &[[f64; 8]], color: [f64; 3], kind: MarkKind) ->
 
 fn real(value: f64) -> Object {
     Object::Real(value as f32)
+}
+
+/// Diccionario de una nota de texto, listo para colgar de `/Annots`: un
+/// `/FreeText` con el texto en `/Contents`, su recuadro y la fuente en `/DA`.
+/// No lleva `/QuadPoints`: no está atada a ningún texto de la página.
+fn note_dictionary(note: &TextNote, page: PageBox) -> Object {
+    let rect = note_rect(note, page);
+
+    let mut dictionary = Dictionary::new();
+    dictionary.set("Type", Object::Name(b"Annot".to_vec()));
+    dictionary.set("Subtype", Object::Name(b"FreeText".to_vec()));
+    dictionary.set(
+        "Rect",
+        Object::Array(vec![real(rect.0), real(rect.1), real(rect.2), real(rect.3)]),
+    );
+    dictionary.set("Contents", contents(&note.text));
+    dictionary.set(
+        "DA",
+        Object::String(da_string(&note.font).into_bytes(), lopdf::StringFormat::Literal),
+    );
+    // Print flag without a border and left-aligned text: la nota es texto suelto
+    // sobre la página, no una caja de anotación.
+    dictionary.set("F", Object::Integer(4));
+    dictionary.set(
+        "Border",
+        Object::Array(vec![
+            Object::Integer(0),
+            Object::Integer(0),
+            Object::Integer(0),
+        ]),
+    );
+    dictionary.set("Q", Object::Integer(0));
+    Object::Dictionary(dictionary)
+}
+
+/// `/DA` de la nota: la fuente base en notación abreviada, su tamaño en puntos
+/// con un decimal y el color negro.
+fn da_string(font: &FontChoice) -> String {
+    let size = if font.size.is_finite() && font.size > 0.0 {
+        font.size
+    } else {
+        // Un tamaño inválido no puede dejar la nota sin fuente.
+        12.0
+    };
+    format!("{} {size:.1} Tf 0 g", font.da_name())
+}
+
+/// `/Contents`: literal PDF cuando el texto es ASCII y hexadecimal UTF-16BE con
+/// BOM `FE FF` cuando tiene caracteres fuera de ASCII.
+///
+/// lopdf escapa el literal al escribirlo, incluidos `\`, `\r` y los paréntesis
+/// desbalanceados; escaparlos acá también los duplicaría y el texto leído no
+/// sería el original. La cadena hexadecimal no se escapa: los bytes son el
+/// texto mismo en UTF-16BE.
+fn contents(text: &str) -> Object {
+    if text.is_ascii() {
+        Object::String(text.as_bytes().to_vec(), lopdf::StringFormat::Literal)
+    } else {
+        let mut bytes = vec![0xFE, 0xFF];
+        for unit in text.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_be_bytes());
+        }
+        Object::String(bytes, lopdf::StringFormat::Hexadecimal)
+    }
 }
 
 /// Caja visible de la página, leída del archivo: `/CropBox` (o `/MediaBox`) y
@@ -243,7 +318,8 @@ fn temporary_path(target: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lopdf::{dictionary, Stream};
+    use crate::engine::annotation::TextMark;
+    use lopdf::{Stream, dictionary};
 
     /// Directorio de trabajo de las pruebas, dentro del proyecto.
     fn scratch(name: &str) -> PathBuf {
@@ -319,8 +395,26 @@ mod tests {
         bytes
     }
 
-    fn mark(rects: Vec<(f64, f64, f64, f64)>) -> TextMark {
-        TextMark::underline(0, rects, (1.0, 0.0, 0.0))
+    fn mark(rects: Vec<(f64, f64, f64, f64)>) -> Annotation {
+        Annotation::Mark(TextMark::underline(0, rects, (1.0, 0.0, 0.0)))
+    }
+
+    /// Texto de `/Contents`, sea literal ASCII o hexadecimal UTF-16BE.
+    fn contents_text(annotation: &Dictionary) -> String {
+        match annotation.get(b"Contents").expect("la nota lleva su texto") {
+            Object::String(bytes, lopdf::StringFormat::Hexadecimal) => {
+                assert_eq!(&bytes[..2], &[0xFE, 0xFF], "el hexadecimal lleva BOM");
+                let units: Vec<u16> = bytes[2..]
+                    .chunks_exact(2)
+                    .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+                    .collect();
+                String::from_utf16(&units).expect("UTF-16BE válido")
+            }
+            Object::String(bytes, lopdf::StringFormat::Literal) => {
+                String::from_utf8(bytes.clone()).expect("un literal ASCII es UTF-8 válido")
+            }
+            other => panic!("Contents no es una cadena: {other:?}"),
+        }
     }
 
     /// Números de `/QuadPoints` o de cualquier lista del diccionario.
@@ -341,7 +435,7 @@ mod tests {
         let target = scratch("plain-out.pdf");
         std::fs::write(&source, fixture([0.0, 0.0, 200.0, 200.0], 0)).expect("escribir el PDF");
 
-        let written = write_marks(&source, &target, &[mark(vec![(20.0, 20.0, 120.0, 40.0)])])
+        let written = write_annotations(&source, &target, &[mark(vec![(20.0, 20.0, 120.0, 40.0)])])
             .expect("el subrayado tiene que escribirse");
         assert_eq!(written, 1);
 
@@ -389,7 +483,7 @@ mod tests {
         let original = fixture([0.0, 0.0, 200.0, 100.0], 0);
         std::fs::write(&source, &original).expect("escribir el PDF");
 
-        write_marks(&source, &target, &[mark(vec![(10.0, 10.0, 60.0, 20.0)])])
+        write_annotations(&source, &target, &[mark(vec![(10.0, 10.0, 60.0, 20.0)])])
             .expect("guardar como");
 
         assert_eq!(
@@ -404,7 +498,7 @@ mod tests {
         let path = scratch("same.pdf");
         std::fs::write(&path, fixture([0.0, 0.0, 200.0, 100.0], 0)).expect("escribir el PDF");
 
-        write_marks(&path, &path, &[mark(vec![(10.0, 10.0, 60.0, 20.0)])])
+        write_annotations(&path, &path, &[mark(vec![(10.0, 10.0, 60.0, 20.0)])])
             .expect("guardar encima");
 
         let bytes = std::fs::read(&path).expect("leer el resultado");
@@ -457,7 +551,15 @@ mod tests {
                 "rotación {rotation}: sin anotación no hay nada rojo"
             );
 
-            write_marks(&source, &target, &[TextMark::underline(0, rects.clone(), (1.0, 0.0, 0.0))])
+            write_annotations(
+                &source,
+                &target,
+                &[Annotation::Mark(TextMark::underline(
+                    0,
+                    rects.clone(),
+                    (1.0, 0.0, 0.0),
+                ))],
+            )
                 .expect("escribir el subrayado");
             let line = reddish_bbox(
                 &std::fs::read(&target).expect("leer resultado"),
@@ -587,10 +689,14 @@ mod tests {
         );
         assert!(!rects.is_empty(), "el texto tiene que estar");
 
-        write_marks(
+        write_annotations(
             &source,
             &target,
-            &[TextMark::highlight(0, rects, (1.0, 0.9, 0.0))],
+            &[Annotation::Mark(TextMark::highlight(
+                0,
+                rects,
+                (1.0, 0.9, 0.0),
+            ))],
         )
         .expect("escribir el resaltado");
 
@@ -663,6 +769,77 @@ mod tests {
     }
 
     #[test]
+    fn poppler_paints_the_inserted_text_from_the_written_file() {
+        // La prueba de que la nota se ve en otro lector: sin `/AP`, poppler arma
+        // la apariencia desde `/DA` y `/Contents`. Si no la pintara, el archivo
+        // tendría la anotación pero nadie la vería.
+        let source = scratch("note-painted.pdf");
+        let target = scratch("note-painted-out.pdf");
+        std::fs::write(&source, fixture([0.0, 0.0, 300.0, 200.0], 0)).expect("escribir el PDF");
+
+        let note = TextNote {
+            page: 0,
+            at: (40.0, 60.0),
+            width: 120.0,
+            height: 18.0,
+            text: "Texto insertado".to_string(),
+            font: FontChoice {
+                family: "Sans".to_string(),
+                size: 14.0,
+                bold: false,
+                italic: false,
+            },
+        };
+
+        write_annotations(&source, &target, &[Annotation::Note(note)]).expect("escribir la nota");
+
+        let size = (300.0, 200.0);
+        assert_eq!(
+            dark_pixels(&std::fs::read(&source).expect("original"), size),
+            0,
+            "la página vacía no tiene texto"
+        );
+        assert!(
+            dark_pixels(&std::fs::read(&target).expect("resultado"), size) > 0,
+            "poppler dibuja el texto de la nota"
+        );
+    }
+
+    /// Cuenta píxeles oscuros de la página rasterizada: la tinta del texto.
+    fn dark_pixels(bytes: &[u8], size: (f64, f64)) -> usize {
+        let document = poppler::Document::from_data(bytes, None).expect("poppler abre el PDF");
+        let page = document.page(0).expect("página 0");
+        let mut surface = cairo::ImageSurface::create(
+            cairo::Format::ARgb32,
+            size.0.ceil() as i32,
+            size.1.ceil() as i32,
+        )
+        .expect("crear la superficie");
+        {
+            let context = cairo::Context::new(&surface).expect("contexto");
+            context.set_source_rgb(1.0, 1.0, 1.0);
+            context.paint().expect("fondo blanco");
+            page.render(&context);
+        }
+        surface.flush();
+
+        let stride = usize::try_from(surface.stride()).expect("stride");
+        let (pixel_width, pixel_height) = (surface.width() as usize, surface.height() as usize);
+        let data = surface.data().expect("píxeles");
+        let mut found = 0;
+        for row in 0..pixel_height {
+            for column in 0..pixel_width {
+                let offset = row * stride + column * 4;
+                let (blue, green, red) = (data[offset], data[offset + 1], data[offset + 2]);
+                if red < 100 && green < 100 && blue < 100 {
+                    found += 1;
+                }
+            }
+        }
+        found
+    }
+
+    #[test]
     fn a_protected_pdf_is_never_rewritten_unencrypted() {
         // Contraseña de dueño con la de usuario vacía: se abre sin preguntar y
         // lopdf la descifra al cargar, así que el guardado tiene que negarse o
@@ -696,7 +873,7 @@ mod tests {
             "el fixture tiene que venir cifrado"
         );
 
-        let result = write_marks(&source, &target, &[mark(vec![(10.0, 10.0, 60.0, 20.0)])]);
+        let result = write_annotations(&source, &target, &[mark(vec![(10.0, 10.0, 60.0, 20.0)])]);
 
         assert!(result.is_err(), "un PDF protegido no se puede reescribir");
         assert_eq!(
@@ -715,7 +892,7 @@ mod tests {
         std::fs::write(&path, fixture([0.0, 0.0, 200.0, 200.0], 0)).expect("escribir el PDF");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
 
-        write_marks(&path, &path, &[mark(vec![(10.0, 10.0, 60.0, 20.0)])])
+        write_annotations(&path, &path, &[mark(vec![(10.0, 10.0, 60.0, 20.0)])])
             .expect("guardar encima");
 
         assert_eq!(
@@ -731,7 +908,7 @@ mod tests {
         let target = scratch("inherited-out.pdf");
         std::fs::write(&source, inherited_fixture()).expect("escribir el PDF");
 
-        write_marks(&source, &target, &[mark(vec![(0.0, 0.0, 50.0, 10.0)])])
+        write_annotations(&source, &target, &[mark(vec![(0.0, 0.0, 50.0, 10.0)])])
             .expect("escribir el subrayado");
 
         let document = Document::load(&target).expect("cargar el resultado");
@@ -750,10 +927,10 @@ mod tests {
         let target = scratch("missing-out.pdf");
         std::fs::write(&source, fixture([0.0, 0.0, 200.0, 200.0], 0)).expect("escribir el PDF");
 
-        let mut out_of_range = mark(vec![(10.0, 10.0, 60.0, 20.0)]);
+        let mut out_of_range = TextMark::underline(0, vec![(10.0, 10.0, 60.0, 20.0)], (1.0, 0.0, 0.0));
         out_of_range.page = 7;
-        let written =
-            write_marks(&source, &target, &[out_of_range]).expect("guardar sin subrayados");
+        let written = write_annotations(&source, &target, &[Annotation::Mark(out_of_range)])
+            .expect("guardar sin subrayados");
         assert_eq!(written, 0);
 
         let document = Document::load(&target).expect("el archivo sigue siendo un PDF");
@@ -773,9 +950,9 @@ mod tests {
         let path = scratch("twice-same.pdf");
         std::fs::write(&source, fixture([0.0, 0.0, 200.0, 200.0], 0)).expect("escribir el PDF");
 
-        write_marks(&source, &path, &[mark(vec![(10.0, 10.0, 60.0, 20.0)])])
+        write_annotations(&source, &path, &[mark(vec![(10.0, 10.0, 60.0, 20.0)])])
             .expect("primer subrayado");
-        write_marks(&path, &path, &[mark(vec![(10.0, 50.0, 60.0, 60.0)])])
+        write_annotations(&path, &path, &[mark(vec![(10.0, 50.0, 60.0, 60.0)])])
             .expect("segundo subrayado");
 
         let document = Document::load(&path).expect("cargar el resultado");
@@ -785,5 +962,115 @@ mod tests {
             2,
             "/Annots conserva lo que ya estaba escrito"
         );
+    }
+
+    /// Texto ASCII de un valor de cadena del diccionario, como `/DA`.
+    fn text_of(annotation: &Dictionary, key: &[u8]) -> String {
+        String::from_utf8(
+            annotation
+                .get(key)
+                .and_then(Object::as_str)
+                .expect("la clave tiene que ser una cadena")
+                .to_vec(),
+        )
+        .expect("un valor ASCII es UTF-8 válido")
+    }
+
+    #[test]
+    fn a_free_text_note_is_written_with_its_text_font_and_rectangle() {
+        let source = scratch("note.pdf");
+        let target = scratch("note-out.pdf");
+        std::fs::write(&source, fixture([0.0, 0.0, 200.0, 100.0], 0)).expect("escribir el PDF");
+
+        // Una nota con acentos y paréntesis (cadena hexadecimal UTF-16BE) y otra
+        // sólo ASCII (literal), para cubrir las dos formas de `/Contents`.
+        let accented = TextNote {
+            page: 0,
+            at: (20.0, 10.0),
+            width: 60.0,
+            height: 15.0,
+            text: "Nota (con) paréntesis \\ y acentos: ñandú".to_string(),
+            font: FontChoice {
+                family: "Noto Sans Mono".to_string(),
+                size: 12.0,
+                bold: true,
+                italic: false,
+            },
+        };
+        let plain = TextNote {
+            page: 0,
+            at: (100.0, 50.0),
+            width: 50.0,
+            height: 12.0,
+            text: "Cita (texto) sin acentos".to_string(),
+            font: FontChoice {
+                family: "Liberation Serif".to_string(),
+                size: 10.0,
+                bold: false,
+                italic: true,
+            },
+        };
+
+        let written = write_annotations(
+            &source,
+            &target,
+            &[
+                Annotation::Note(accented.clone()),
+                Annotation::Note(plain.clone()),
+            ],
+        )
+        .expect("las notas tienen que escribirse");
+        assert_eq!(written, 2, "una anotación por nota");
+
+        let document = Document::load(&target).expect("el archivo escrito tiene que cargarse");
+        let page_id = *document.get_pages().get(&1).expect("página 1");
+        let annotations = document.get_page_annotations(page_id).expect("anotaciones");
+        assert_eq!(annotations.len(), 2);
+
+        let note = annotations[0];
+        assert_eq!(
+            note.get(b"Subtype").and_then(Object::as_name).expect("Subtype"),
+            b"FreeText",
+            "el lector de PDF tiene que reconocer la nota de texto"
+        );
+        assert_eq!(
+            note.get(b"Type").and_then(Object::as_name).expect("Type"),
+            b"Annot"
+        );
+        assert_eq!(
+            numbers(note, b"Rect"),
+            vec![20.0, 75.0, 80.0, 90.0],
+            "el rectángulo va de la esquina superior izquierda a la opuesta, en espacio de usuario"
+        );
+        assert_eq!(contents_text(note), accented.text, "el texto viaja entero");
+        assert_eq!(
+            text_of(note, b"DA"),
+            "CoBo 12.0 Tf 0 g",
+            "la fuente base abreviada, su tamaño y el color negro"
+        );
+        assert!(
+            note.get(b"QuadPoints").is_err(),
+            "una nota de texto no usa /QuadPoints"
+        );
+        assert_eq!(
+            note.get(b"F").and_then(Object::as_i64).expect("F"),
+            4,
+            "la anotación se imprime"
+        );
+        assert_eq!(
+            note.get(b"Q").and_then(Object::as_i64).expect("Q"),
+            0,
+            "el texto va alineado a la izquierda"
+        );
+
+        assert_eq!(contents_text(annotations[1]), plain.text);
+        assert_eq!(
+            text_of(annotations[1], b"DA"),
+            "TiIt 10.0 Tf 0 g"
+        );
+
+        let bytes = std::fs::read(&target).expect("leer el resultado");
+        let document = poppler::Document::from_data(&bytes, None).expect("poppler abre el PDF");
+        assert_eq!(document.n_pages(), 1, "el PDF sigue siendo válido para poppler");
     }
 }

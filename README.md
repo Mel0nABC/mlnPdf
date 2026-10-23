@@ -67,6 +67,7 @@ ventana.
 | Selección con el ratón y copiar solo lo seleccionado | Arrastrar y `Ctrl+C` |
 | Subrayar el texto como anotación real del PDF, en el color elegido (el botón muestra ese color) | Botón al lado del zoom, `Ctrl+U`: abre el selector de color y aplica a la selección o al siguiente arrastre |
 | Resaltar el texto como rotulador, en su propio color (el botón lo muestra de fondo) | Botón al lado del zoom, `Ctrl+Shift+U`: abre el selector de color y aplica a la selección o al siguiente arrastre |
+| Insertar texto libre sobre la página, con la fuente elegida en el selector de fuente de GTK (familia aproximada a una de las 14 estándar del PDF) | Botón `T` al lado de las otras herramientas, `Ctrl+T` o `Edit > Insertar texto…`: el diálogo pide texto y fuente, y el siguiente clic fija la esquina de la nota |
 | Deshacer y rehacer los marcados que todavía no están en el PDF, de a uno | `Ctrl+Z` / `Ctrl+Shift+Z` (o `Ctrl+Y`), `Edit > Deshacer` / `Rehacer` |
 | Metadatos del documento | `Ctrl+D` |
 
@@ -91,7 +92,7 @@ ventana.
 | Exportar una selección de páginas | `Tools > Exportar páginas…`: `1,2,100`, `1-55`, `pares`, `impares`, `última`, `todas` |
 | Exportar el texto plano del documento | `Tools > Exportar texto…` |
 | Imprimir, con vista previa, opciones y folleto | `Ctrl+P`, `File > Imprimir con opciones…`, `File > Imprimir folleto…`; el diálogo suma a la derecha la miniatura de las páginas con flechas ‹ › |
-| `File > Guardar` escribe los marcados (subrayados y resaltados) en el PDF abierto; `File > Guardar como…` guarda una copia. Si quedan cambios sin guardar, pregunta antes | `Ctrl+S` / `Ctrl+Shift+S` |
+| `File > Guardar` escribe las anotaciones (subrayados, resaltados y notas de texto) en el PDF abierto; `File > Guardar como…` guarda una copia. Si quedan cambios sin guardar, pregunta antes | `Ctrl+S` / `Ctrl+Shift+S` |
 
 ## Atajos
 
@@ -106,9 +107,9 @@ ventana.
 | `↑` / `↓` | Página anterior / siguiente | `Ctrl+Inicio` / `Fin` | Primera / última página |
 | `Alt+←` / `→` | Historial atrás / adelante | `F11` / `F5` | Pantalla completa / presentación |
 | `Ctrl` + rueda | Zoom con la rueda | `Espacio` + arrastrar | Herramienta mano, con inercia al soltar |
-| `Ctrl+C` / `Ctrl+Shift+C` | Copiar la selección / la página | `Esc` | Sale de presentación o del modo mano; limpia la búsqueda |
-| `Ctrl+U` / `Ctrl+Shift+U` | Subrayar / resaltar | `Ctrl+Z` | Deshacer el último marcado sin guardar |
-| `Ctrl+Shift+Z` / `Ctrl+Y` | Rehacer el marcado deshecho | | |
+| `Ctrl+C` / `Ctrl+Shift+C` | Copiar la selección / la página | `Esc` | Sale de presentación, del modo mano o de una herramienta de anotación; limpia la búsqueda |
+| `Ctrl+U` / `Ctrl+Shift+U` | Subrayar / resaltar | `Ctrl+T` | Insertar una nota de texto en la página |
+| `Ctrl+Z` | Deshacer el último cambio sin guardar | `Ctrl+Shift+Z` / `Ctrl+Y` | Rehacer el cambio deshecho |
 | `Ctrl+S` / `Ctrl+Shift+S` | Guardar / guardar como | | |
 
 La lista completa está en `Help > Atajos de teclado…` dentro de la aplicación.
@@ -118,7 +119,7 @@ La lista completa está en `Help > Atajos de teclado…` dentro de la aplicació
 ```
 src/
 ├── engine/     motor sin GTK: geometría, render, búsqueda, selección, sesión, zoom
-│   ├── annotation.rs  subrayados en memoria y paso al espacio de usuario del PDF
+│   ├── annotation.rs  anotaciones en memoria (marcados y notas) y paso al espacio de usuario del PDF
 │   ├── render.rs      poppler + cairo → textura, con escala de píxel y rotación
 │   ├── search.rs      layout por carácter (FFI) y armado de cajas de coincidencia
 │   ├── page_range.rs  expresión de páginas con validación contra el total
@@ -126,7 +127,7 @@ src/
 ├── ui/         shell GTK: ventana, barras, menús, miniaturas, estilos
 └── services/   exportación del documento y escritura del PDF
     ├── export.rs        exportación a JPEG y PDF vectorial
-    └── annotations.rs   escritura de la anotación /Underline con lopdf
+    └── annotations.rs   escritura de /Underline, /Highlight y /FreeText con lopdf
 ```
 
 | Decisión | Por qué |
@@ -137,7 +138,8 @@ src/
 | Búsqueda desde el layout por carácter, no desde `find_text` | `find_text` estira la caja hasta los blancos de al lado |
 | FFI propio para lo que `poppler-rs` no expone | `poppler_page_get_text_layout` y `poppler_page_get_selection_region` |
 | Motor sin dependencia de GTK | Geometría, búsqueda y sesión se prueban sin display |
-| Las anotaciones de marcado se escriben con lopdf, en un temporal que después reemplaza al original | poppler-glib es de solo lectura, así que el subrayado (`/Underline`) y el resaltado (`/Highlight` con `/CA`) solo pueden quedar como anotación real escribiendo el archivo; el reemplazo al final evita dejar el PDF roto si el guardado falla |
+| Las anotaciones de marcado y de texto se escriben con lopdf, en un temporal que después reemplaza al original | poppler-glib es de solo lectura, así que el subrayado (`/Underline`), el resaltado (`/Highlight` con `/CA`) y la nota (`/FreeText` con `/DA`) solo pueden quedar como anotación real escribiendo el archivo; el reemplazo al final evita dejar el PDF roto si el guardado falla |
+| Las familias del sistema se aproximan a una de las 14 fuentes estándar del PDF | Incrustar el archivo de fuente elegido en el PDF está fuera de alcance: sin `/FontFile` la única opción portable es `/Helv`, `/TiRo` o `/Cour` con su estilo |
 
 ## Requisitos
 
@@ -160,7 +162,7 @@ Probado con GTK 4.24 y poppler-glib 26.10.
 
 ```bash
 cargo build --release
-cargo test                 # 74 pruebas: motor, render, selección, búsqueda, páginas, sesión, anotaciones
+cargo test                 # 81 pruebas: motor, render, selección, búsqueda, páginas, sesión, anotaciones
 cargo test -- --ignored    # prueba de display: atajos, zoom y propiedad del viewer
 ```
 
@@ -184,18 +186,23 @@ casilla está en [TODO.md](TODO.md).
 
 **Bloqueado por el motor:** unir, dividir y comprimir, porque poppler-glib es de
 solo lectura (la escritura de anotaciones ya se resuelve con lopdf), y el resto
-de las anotaciones, que sigue pendiente; formularios AcroForm y firmas porque
-poppler no las guarda; OCR, que necesita `tesseract`; e índice/marcadores, porque
-`IndexIter` de `poppler-rs` no expone título ni acción.
+de las anotaciones (borrado, inspector, FDF/XFDF), que sigue pendiente;
+formularios AcroForm y firmas porque poppler no las guarda; OCR, que necesita
+`tesseract`; e índice/marcadores, porque `IndexIter` de `poppler-rs` no expone
+título ni acción.
 
 **Límites conocidos:** el render es síncrono (cada bloqueo se acota a una página
 visible, así que un documento enorme puede tardar un instante en responder), la
 interfaz no es traducible todavía, no hay archivo `.desktop` ni registro MIME, y
 las pruebas automatizadas cubren el motor y el arranque, no cada comando de la
-interfaz. Los marcados (subrayado y resaltado) se guardan reescribiendo el PDF
-completo (no es un guardado incremental) y se escriben sin *appearance stream*
-(`/AP`), así que el aspecto exacto de cada marcado lo decide cada lector; tampoco
-no hay todavía borrado de marcados, y deshacer/rehacer (`Ctrl+Z` / `Ctrl+Shift+Z`) alcanza solo a lo que no se guardó: una anotación ya escrita en el PDF no se quita desde el visor.
+interfaz. Los marcados (subrayado y resaltado) y las notas de texto se guardan
+reescribiendo el PDF completo (no es un guardado incremental) y se escriben sin
+*appearance stream* (`/AP`), así que el aspecto exacto lo decide cada lector; la
+nota usa una fuente estándar aproximada (`/Helv`, `/TiRo`, `/Cour`), el texto va
+en una sola línea (sin ajuste automático ni edición posterior) y su posición no
+se puede arrastrar después de insertarla. Tampoco hay todavía borrado de
+anotaciones, y deshacer/rehacer (`Ctrl+Z` / `Ctrl+Shift+Z`) alcanza solo a lo que
+no se guardó: una anotación ya escrita en el PDF no se quita desde el visor.
 
 **Licencia:** todavía sin definir.
 
