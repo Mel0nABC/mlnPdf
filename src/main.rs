@@ -474,6 +474,35 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
             "el tercer subrayado llegó al archivo"
         );
 
+        // Guardar una copia no puede dejar como "guardado en el archivo abierto"
+        // lo que sólo está en la copia.
+        viewer.begin_selection(0, 20.0, 10.0);
+        viewer.update_selection(0, 180.0, 35.0);
+        viewer.finish_selection();
+        viewer.refresh_underline_actions();
+        assert!(viewer.apply_underline_to_selection(), "un cuarto subrayado");
+        let copy = dir.join("copy-ui.pdf");
+        std::fs::remove_file(&copy).ok();
+        assert!(viewer.save_pending_underlines(&copy), "guardar la copia");
+        assert_eq!(written_annotations(&copy), 4, "la copia lleva los cuatro");
+        assert_eq!(
+            written_annotations(&text_path),
+            3,
+            "el original sigue con tres"
+        );
+        assert!(
+            viewer.has_pending_underlines(),
+            "guardar una copia deja el original pendiente de guardar"
+        );
+        viewer.save_annotations();
+        assert_eq!(
+            written_annotations(&text_path),
+            4,
+            "el original recibe el cuarto"
+        );
+        assert!(!viewer.has_pending_underlines());
+        std::fs::remove_file(&copy).ok();
+
         std::fs::remove_file(&text_path).ok();
         std::fs::remove_file(&path).ok();
     }

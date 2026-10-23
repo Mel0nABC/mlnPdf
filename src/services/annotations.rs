@@ -17,7 +17,11 @@ use crate::engine::annotation::{bounds_rect, underline_quads, PageBox, Underline
 pub fn write_underlines(source: &Path, target: &Path, marks: &[Underline]) -> Result<u32, String> {
     let mut document = Document::load(source)
         .map_err(|error| format!("no se pudo abrir el PDF para editarlo: {error}"))?;
-    if document.is_encrypted() {
+    // `is_encrypted` mira el trailer actual y `was_encrypted` recuerda el archivo
+    // tal como vino: lopdf descifra al cargar cuando la contraseña de usuario está
+    // vacía, y el trailer ya no lo delata. Reescribir eso borraría la protección
+    // y los permisos sin avisar.
+    if document.is_encrypted() || document.was_encrypted() {
         return Err(
             "el PDF está protegido: no se pueden escribir anotaciones en él.".to_string(),
         );
@@ -40,7 +44,7 @@ pub fn write_underlines(source: &Path, target: &Path, marks: &[Underline]) -> Re
         written += 1;
     }
 
-    save_atomically(&mut document, source, target)?;
+    save_atomically(&mut document, target)?;
     Ok(written)
 }
 
@@ -198,36 +202,28 @@ fn push_annotation(
     Ok(())
 }
 
-/// Escribe el documento completo y sólo después lo pone en su lugar.
-fn save_atomically(document: &mut Document, source: &Path, target: &Path) -> Result<(), String> {
-    if !is_same_path(source, target) {
-        document
-            .save(target)
-            .map(|_| ())
-            .map_err(|error| format!("no se pudo escribir el PDF: {error}"))?;
-        return Ok(());
-    }
+/// Escribe el documento completo en un temporal y sólo después lo pone en su
+/// lugar. El archivo existente no se toca hasta que el nuevo está entero.
+fn save_atomically(document: &mut Document, target: &Path) -> Result<(), String> {
+    // Si el destino existe, el enlace se resuelve: el guardado reemplaza al
+    // archivo real y no al enlace simbólico.
+    let resolved = std::fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
+    let temporary = temporary_path(&resolved);
 
-    let temporary = temporary_path(target);
     if let Err(error) = document.save(&temporary) {
         let _ = std::fs::remove_file(&temporary);
         return Err(format!("no se pudo escribir el PDF: {error}"));
     }
-    if let Err(error) = std::fs::rename(&temporary, target) {
+    // El temporal nace con los permisos del proceso; el archivo que reemplaza
+    // conserva los suyos.
+    if let Ok(metadata) = std::fs::metadata(&resolved) {
+        let _ = std::fs::set_permissions(&temporary, metadata.permissions());
+    }
+    if let Err(error) = std::fs::rename(&temporary, &resolved) {
         let _ = std::fs::remove_file(&temporary);
         return Err(format!("no se pudo reemplazar el PDF: {error}"));
     }
     Ok(())
-}
-
-fn is_same_path(source: &Path, target: &Path) -> bool {
-    match (
-        std::fs::canonicalize(source),
-        std::fs::canonicalize(target),
-    ) {
-        (Ok(source), Ok(target)) => source == target,
-        _ => source == target,
-    }
 }
 
 /// Temporal oculto al lado del destino: el mismo sistema de archivos, así el
@@ -424,22 +420,207 @@ mod tests {
     }
 
     #[test]
-    fn a_rotated_page_keeps_the_mark_under_the_text() {
-        // Página vertical 100x200 girada 90°: se ve apaisada 200x100, así que una
-        // línea horizontal en pantalla es vertical en el archivo.
-        let source = scratch("rotated.pdf");
-        let target = scratch("rotated-out.pdf");
-        std::fs::write(&source, fixture([0.0, 0.0, 100.0, 200.0], 90)).expect("escribir el PDF");
+    fn the_written_line_stays_under_the_text_when_the_page_is_rotated() {
+        // La prueba que manda: se rasteriza el archivo escrito con poppler, que es
+        // el que dibuja el subrayado sobre el borde inferior del quad. Se elige el
+        // texto con la misma API de selección que usa el visor, así que la prueba
+        // compara contra la coordenada que ve el lector.
+        for rotation in [0, 90, 180, 270] {
+            let source = scratch(&format!("rotation-{rotation}.pdf"));
+            let target = scratch(&format!("rotation-{rotation}-out.pdf"));
+            std::fs::write(&source, upright_text_page(rotation)).expect("escribir fixture");
 
-        write_underlines(&source, &target, &[mark(vec![(10.0, 10.0, 60.0, 20.0)])])
-            .expect("escribir el subrayado");
+            let bytes = std::fs::read(&source).expect("leer fixture");
+            let pdf = poppler::Document::from_data(&bytes, None).expect("poppler abre");
+            let page = pdf.page(0).expect("página");
+            let (width, height) = page.size();
+            let rects = crate::engine::selection::page_selection_region(
+                &page,
+                crate::engine::selection::Selection {
+                    page: 0,
+                    anchor: (0.0, 0.0),
+                    head: (width, height),
+                },
+            );
+            assert_eq!(rects.len(), 1, "rotación {rotation}: una línea de texto");
+            let (x1, y1, x2, y2) = rects[0];
+            assert!(
+                x2 - x1 > y2 - y1,
+                "rotación {rotation}: el texto se ve horizontal"
+            );
+            assert!(
+                reddish_bbox(&bytes, (width, height)).is_none(),
+                "rotación {rotation}: sin anotación no hay nada rojo"
+            );
 
-        let document = Document::load(&target).expect("cargar el resultado");
-        let page_id = *document.get_pages().get(&1).expect("página 1");
-        let annotations = document.get_page_annotations(page_id).expect("anotaciones");
+            write_underlines(&source, &target, &[Underline::new(0, rects.clone(), (1.0, 0.0, 0.0))])
+                .expect("escribir el subrayado");
+            let line = reddish_bbox(
+                &std::fs::read(&target).expect("leer resultado"),
+                (width, height),
+            )
+            .expect("poppler pinta la línea");
+            assert!(
+                (line.1 - y2).abs() <= 4.0 && (line.3 - y2).abs() <= 4.0,
+                "rotación {rotation}: la línea va en el borde inferior y={y2:.0}; quedó en \
+                 ({:.0},{:.0})-({:.0},{:.0})",
+                line.0,
+                line.1,
+                line.2,
+                line.3
+            );
+            assert!(
+                line.2 - line.0 > 0.6 * (x2 - x1),
+                "rotación {rotation}: la línea corre a lo largo del texto"
+            );
+        }
+    }
+
+    /// Página con CropBox heredado y una palabra girada para que `/Rotate` la
+    /// muestre horizontal y derecha, el caso de un escaneo girado.
+    fn upright_text_page(rotation: i32) -> Vec<u8> {
+        let matrix = match rotation.rem_euclid(360) {
+            90 => "0 1 -1 0 100 60",
+            180 => "-1 0 0 -1 200 150",
+            270 => "0 -1 1 0 100 200",
+            _ => "1 0 0 1 50 150",
+        };
+        let stream = format!("BT /F1 36 Tf {matrix} Tm (Arriba) Tj ET");
+        let mut document = Document::with_version("1.4");
+        let pages_id = document.new_object_id();
+        let font_id = document.add_object(
+            dictionary! { "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica" },
+        );
+        let contents_id = document.add_object(Stream::new(Dictionary::new(), stream.into_bytes()));
+        let page_id = document.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => Object::Reference(pages_id),
+            "Contents" => Object::Reference(contents_id),
+            "Rotate" => Object::Integer(i64::from(rotation)),
+            "Resources" => dictionary! { "Font" => dictionary! { "F1" => Object::Reference(font_id) } },
+        });
+        document.set_object(
+            pages_id,
+            dictionary! {
+                "Type" => "Pages",
+                "Kids" => Object::Array(vec![Object::Reference(page_id)]),
+                "Count" => Object::Integer(1),
+                "MediaBox" => Object::Array(vec![0.into(), 0.into(), 300.into(), 400.into()]),
+                "CropBox" => Object::Array(vec![10.into(), 20.into(), 210.into(), 220.into()]),
+            },
+        );
+        let catalog_id = document.add_object(
+            dictionary! { "Type" => "Catalog", "Pages" => Object::Reference(pages_id) },
+        );
+        document.trailer.set("Root", Object::Reference(catalog_id));
+
+        let mut bytes = Vec::new();
+        document.save_to(&mut bytes).expect("serializar el fixture");
+        bytes
+    }
+
+    /// Caja `(x1, y1, x2, y2)`, en píxeles, de lo rojo de la página rasterizada.
+    fn reddish_bbox(bytes: &[u8], size: (f64, f64)) -> Option<(f64, f64, f64, f64)> {
+        let document = poppler::Document::from_data(bytes, None).expect("poppler abre el PDF");
+        let page = document.page(0).expect("página 0");
+
+        let mut surface = cairo::ImageSurface::create(
+            cairo::Format::ARgb32,
+            size.0.ceil() as i32,
+            size.1.ceil() as i32,
+        )
+        .expect("crear la superficie");
+        {
+            let context = cairo::Context::new(&surface).expect("contexto");
+            context.set_source_rgb(1.0, 1.0, 1.0);
+            context.paint().expect("fondo blanco");
+            page.render(&context);
+        }
+        surface.flush();
+
+        let stride = usize::try_from(surface.stride()).expect("stride");
+        let (pixel_width, pixel_height) = (surface.width() as usize, surface.height() as usize);
+        let data = surface.data().expect("píxeles");
+        let mut bounds: Option<(f64, f64, f64, f64)> = None;
+        for row in 0..pixel_height {
+            for column in 0..pixel_width {
+                let offset = row * stride + column * 4;
+                let (blue, green, red) = (data[offset], data[offset + 1], data[offset + 2]);
+                if red > 150 && green < 120 && blue < 120 {
+                    let point = (column as f64, row as f64);
+                    bounds = Some(match bounds {
+                        None => (point.0, point.1, point.0, point.1),
+                        Some(b) => (
+                            b.0.min(point.0),
+                            b.1.min(point.1),
+                            b.2.max(point.0),
+                            b.3.max(point.1),
+                        ),
+                    });
+                }
+            }
+        }
+        bounds
+    }
+
+    #[test]
+    fn a_protected_pdf_is_never_rewritten_unencrypted() {
+        // Contraseña de dueño con la de usuario vacía: se abre sin preguntar y
+        // lopdf la descifra al cargar, así que el guardado tiene que negarse o
+        // reescribiría el archivo sin cifrado y sin permisos.
+        let source = scratch("protected.pdf");
+        let target = scratch("protected-out.pdf");
+        let mut document =
+            Document::load_mem(&fixture([0.0, 0.0, 200.0, 200.0], 0)).expect("cargar el fixture");
+        document.trailer.set(
+            "ID",
+            Object::Array(vec![
+                Object::string_literal("0123456789abcdef"),
+                Object::string_literal("0123456789abcdef"),
+            ]),
+        );
+        let state = lopdf::EncryptionState::try_from(lopdf::EncryptionVersion::V1 {
+            document: &document,
+            owner_password: "duenio",
+            user_password: "",
+            permissions: lopdf::Permissions::PRINTABLE,
+        })
+        .expect("estado de cifrado");
+        document.encrypt(&state).expect("cifrar");
+        let mut encrypted = Vec::new();
+        document.save_to(&mut encrypted).expect("serializar cifrado");
+        std::fs::write(&source, &encrypted).expect("escribir el cifrado");
+        assert!(
+            Document::load_mem(&encrypted).expect("releer").was_encrypted(),
+            "el fixture tiene que venir cifrado"
+        );
+
+        let result = write_underlines(&source, &target, &[mark(vec![(10.0, 10.0, 60.0, 20.0)])]);
+
+        assert!(result.is_err(), "un PDF protegido no se puede reescribir");
         assert_eq!(
-            numbers(annotations[0], b"QuadPoints"),
-            vec![10.0, 60.0, 20.0, 60.0, 10.0, 10.0, 20.0, 10.0]
+            std::fs::read(&source).expect("releer el original"),
+            encrypted,
+            "el original queda intacto"
+        );
+        assert!(!target.exists(), "no se escribe nada en el destino");
+    }
+
+    #[test]
+    fn saving_over_a_file_keeps_its_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = scratch("mode.pdf");
+        std::fs::write(&path, fixture([0.0, 0.0, 200.0, 200.0], 0)).expect("escribir el PDF");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+
+        write_underlines(&path, &path, &[mark(vec![(10.0, 10.0, 60.0, 20.0)])])
+            .expect("guardar encima");
+
+        assert_eq!(
+            std::fs::metadata(&path).expect("metadata").permissions().mode() & 0o777,
+            0o600,
+            "el guardado atómico conserva los permisos del original"
         );
     }
 
@@ -483,60 +664,6 @@ mod tests {
                 .is_empty(),
             "no se inventan anotaciones en páginas que no existen"
         );
-    }
-
-    #[test]
-    fn poppler_paints_the_underline_from_the_written_file() {
-        // La prueba que importa: el archivo escrito, leído por poppler, se ve con
-        // el subrayado. Un rectángulo (20, 20, 120, 40) deja la línea en el borde
-        // inferior, que en pantalla es y = 200 - 160 = 40.
-        let source = scratch("painted.pdf");
-        let target = scratch("painted-out.pdf");
-        std::fs::write(&source, fixture([0.0, 0.0, 200.0, 200.0], 0)).expect("escribir el PDF");
-
-        write_underlines(&source, &target, &[mark(vec![(20.0, 20.0, 120.0, 40.0)])])
-            .expect("escribir el subrayado");
-
-        assert_eq!(
-            reddish_pixels(&std::fs::read(&source).expect("original")),
-            0,
-            "sin anotación no hay nada rojo en la página"
-        );
-        assert!(
-            reddish_pixels(&std::fs::read(&target).expect("resultado")) > 0,
-            "poppler dibuja el subrayado que se escribió"
-        );
-    }
-
-    /// Cuenta los píxeles rojos de la franja donde cae la línea, al rasterizar
-    /// la página con poppler a escala 1.
-    fn reddish_pixels(bytes: &[u8]) -> usize {
-        let document = poppler::Document::from_data(bytes, None).expect("poppler abre el PDF");
-        let page = document.page(0).expect("página 0");
-
-        let mut surface = cairo::ImageSurface::create(cairo::Format::ARgb32, 200, 200)
-            .expect("crear la superficie");
-        {
-            let context = cairo::Context::new(&surface).expect("contexto");
-            context.set_source_rgb(1.0, 1.0, 1.0);
-            context.paint().expect("fondo blanco");
-            page.render(&context);
-        }
-        surface.flush();
-
-        let stride = usize::try_from(surface.stride()).expect("stride");
-        let data = surface.data().expect("píxeles");
-        let mut found = 0;
-        for y in 30..50usize {
-            for x in 40..100usize {
-                let offset = y * stride + x * 4;
-                let (blue, green, red) = (data[offset], data[offset + 1], data[offset + 2]);
-                if red > 150 && green < 120 && blue < 120 {
-                    found += 1;
-                }
-            }
-        }
-        found
     }
 
     #[test]

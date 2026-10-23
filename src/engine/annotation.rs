@@ -49,18 +49,27 @@ impl Underline {
 
 /// Quads de `/QuadPoints`: ocho números por línea, en el orden que pide el PDF
 /// (arriba a la izquierda, arriba a la derecha, abajo a la izquierda, abajo a la
-/// derecha). El borde inferior del quad es donde los lectores dibujan el
-/// subrayado.
+/// derecha).
+///
+/// El orden es el que ve el lector: los dos últimos puntos son el borde inferior
+/// del texto en la página tal como se muestra. En una página con `/Rotate` esa
+/// arista no es la de menor `y` en el archivo, y los lectores dibujan el
+/// subrayado sobre ella, así que cada esquina se convierte por separado.
 pub fn underline_quads(rects: &[Rect], page: PageBox) -> Vec<[f64; 8]> {
     rects
         .iter()
         .map(|rect| {
-            let (left, bottom, right, top) = user_rect(*rect, page);
+            let (x1, x2) = (rect.0.min(rect.2), rect.0.max(rect.2));
+            let (y1, y2) = (rect.1.min(rect.3), rect.1.max(rect.3));
+            let upper_left = user_point((x1, y1), page);
+            let upper_right = user_point((x2, y1), page);
+            let lower_left = user_point((x1, y2), page);
+            let lower_right = user_point((x2, y2), page);
             [
-                left, top, // arriba a la izquierda
-                right, top, // arriba a la derecha
-                left, bottom, // abajo a la izquierda
-                right, bottom, // abajo a la derecha
+                upper_left.0, upper_left.1,
+                upper_right.0, upper_right.1,
+                lower_left.0, lower_left.1,
+                lower_right.0, lower_right.1,
             ]
         })
         .collect()
@@ -81,31 +90,21 @@ pub fn bounds_rect(quads: &[[f64; 8]]) -> Rect {
     bounds
 }
 
-/// Pasa un rectángulo medido en pantalla (origen arriba, con la rotación de la
+/// Pasa un punto medido en pantalla (origen arriba, con la rotación de la
 /// página ya aplicada) al espacio de usuario del archivo (origen abajo).
-/// Devuelve `(izquierda, abajo, derecha, arriba)`; los cuatro valores en
-/// espacio de usuario, sin rotación.
-fn user_rect(rect: Rect, page: PageBox) -> (f64, f64, f64, f64) {
-    let (x1, x2) = (rect.0.min(rect.2), rect.0.max(rect.2));
-    let (y1, y2) = (rect.1.min(rect.3), rect.1.max(rect.3));
+fn user_point(point: (f64, f64), page: PageBox) -> (f64, f64) {
+    let (x, y) = point;
     let (width, height) = (page.width, page.height);
 
-    // Deshacer `/Rotate`: en 90° y 270° los ejes están intercambiados. Las
-    // parejas se escriben siempre de menor a mayor, así que el orden de los
-    // puntos no depende de cómo se arrastró la selección.
-    let (left, right, bottom, top) = match page.rotation.rem_euclid(360) {
-        90 => (y1, y2, x1, x2),
-        180 => (width - x2, width - x1, y1, y2),
-        270 => (width - y2, width - y1, height - x2, height - x1),
-        _ => (x1, x2, height - y2, height - y1),
+    // Deshacer `/Rotate`: en 90° y 270° los ejes están intercambiados.
+    let (ux, uy) = match page.rotation.rem_euclid(360) {
+        90 => (y, x),
+        180 => (width - x, y),
+        270 => (width - y, height - x),
+        _ => (x, height - y),
     };
 
-    (
-        left + page.x0,
-        bottom + page.y0,
-        right + page.x0,
-        top + page.y0,
-    )
+    (ux + page.x0, uy + page.y0)
 }
 
 #[cfg(test)]
@@ -140,7 +139,7 @@ mod tests {
     }
 
     #[test]
-    fn the_quote_follows_the_rotation_of_the_page() {
+    fn every_rotated_quad_keeps_the_visible_bottom_edge_last() {
         // /Rotate gira la página al mostrarla, así que la caja visible cambia de
         // ejes y el subrayado tiene que volver al espacio sin girar del archivo.
         let rect = line(20.0, 30.0);
@@ -152,9 +151,11 @@ mod tests {
                 ..PLAIN
             },
         );
+        // Los dos últimos puntos son el borde inferior que se ve: con /Rotate 90
+        // esa arista es una x constante en el archivo, no una y.
         assert_eq!(
             rotated_90[0],
-            [20.0, 60.0, 30.0, 60.0, 20.0, 10.0, 30.0, 10.0]
+            [20.0, 10.0, 20.0, 60.0, 30.0, 10.0, 30.0, 60.0]
         );
 
         let rotated_180 = underline_quads(
@@ -166,7 +167,7 @@ mod tests {
         );
         assert_eq!(
             rotated_180[0],
-            [140.0, 30.0, 190.0, 30.0, 140.0, 20.0, 190.0, 20.0]
+            [190.0, 20.0, 140.0, 20.0, 190.0, 30.0, 140.0, 30.0]
         );
 
         let rotated_270 = underline_quads(
@@ -178,7 +179,7 @@ mod tests {
         );
         assert_eq!(
             rotated_270[0],
-            [170.0, 90.0, 180.0, 90.0, 170.0, 40.0, 180.0, 40.0]
+            [180.0, 90.0, 180.0, 40.0, 170.0, 90.0, 170.0, 40.0]
         );
     }
 
@@ -199,7 +200,7 @@ mod tests {
             ..offset
         };
         let quads = underline_quads(&[line(20.0, 30.0)], sideways);
-        assert_eq!(quads[0], [30.0, 80.0, 40.0, 80.0, 30.0, 30.0, 40.0, 30.0]);
+        assert_eq!(quads[0], [30.0, 30.0, 30.0, 80.0, 40.0, 30.0, 40.0, 80.0]);
     }
 
     #[test]

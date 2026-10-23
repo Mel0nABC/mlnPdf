@@ -1648,7 +1648,11 @@ impl Viewer {
 
         match write_underlines(&source, target, &pending) {
             Ok(written) => {
-                self.annot.saved.set(self.annot.marks.borrow().len());
+                // Sólo es un guardado del documento abierto si el destino es ese
+                // archivo: la copia no deja el original al día.
+                if self.is_open_file(target) {
+                    self.annot.saved.set(self.annot.marks.borrow().len());
+                }
                 let plural = if written == 1 { "subrayado" } else { "subrayados" };
                 self.ui.window.announce(
                     &format!("Guardados {written} {plural} en el PDF"),
@@ -1668,6 +1672,17 @@ impl Viewer {
                 );
                 false
             }
+        }
+    }
+
+    /// True cuando `target` es el archivo que se está leyendo.
+    fn is_open_file(&self, target: &Path) -> bool {
+        let Some(source) = self.doc.current_path.borrow().clone() else {
+            return false;
+        };
+        match (std::fs::canonicalize(&source), std::fs::canonicalize(target)) {
+            (Ok(source), Ok(target)) => source == target,
+            _ => source == target,
         }
     }
 
@@ -1739,7 +1754,6 @@ impl Viewer {
                 "«{name}» todavía no tiene {count} {plural}. Si seguís sin guardar, se pierden."
             ))
             .buttons(["Descartar", "Guardar", "Guardar una copia…"])
-            .cancel_button(0)
             .default_button(1)
             .build();
 
@@ -1752,19 +1766,26 @@ impl Viewer {
                     return;
                 };
                 match result {
+                    Ok(0) => {
+                        viewer.discard_underlines();
+                        then(&viewer);
+                    }
                     // Guardar: si falla, no se sigue con la acción original.
-                    Ok(choice) if choice == 1 => {
+                    Ok(1) => {
                         if viewer.save_pending_underlines_file() {
                             then(&viewer);
                         }
                     }
-                    // Guardar una copia: el diálogo de archivo decide si se
-                    // sigue; cancelarlo deja todo como estaba.
-                    Ok(choice) if choice == 2 => viewer.save_annotations_as(Some(Box::new(then))),
-                    _ => {
+                    // Guardar una copia: la copia es la decisión del lector, así
+                    // que los pendientes quedan resueltos; cancelar el diálogo de
+                    // archivo deja todo como estaba.
+                    Ok(2) => viewer.save_annotations_as(Some(Box::new(move |viewer| {
                         viewer.discard_underlines();
-                        then(&viewer);
-                    }
+                        then(viewer);
+                    }))),
+                    // Cerrar el diálogo con Esc o con la X no elige nada: la
+                    // acción original se cancela en vez de descartar en silencio.
+                    _ => {}
                 }
             },
         );

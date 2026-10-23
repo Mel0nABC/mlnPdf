@@ -156,7 +156,7 @@ Probado con GTK 4.24 y poppler-glib 26.10.
 
 ```bash
 cargo build --release
-cargo test                 # 70 pruebas: motor, render, selección, búsqueda, páginas, sesión, anotaciones
+cargo test                 # 71 pruebas: motor, render, selección, búsqueda, páginas, sesión, anotaciones
 cargo test -- --ignored    # prueba de display: atajos, zoom y propiedad del viewer
 ```
 
