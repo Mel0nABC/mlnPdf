@@ -33,6 +33,10 @@ const SEARCH_HIT_LIMIT: usize = 300;
 /// Width of the thumbnails in the side panel, in logical pixels.
 const THUMB_WIDTH: i32 = 120;
 
+/// Distance between the page controls and the search and zoom groups in the
+/// toolbar, in logical pixels.
+pub(crate) const TOOLBAR_GAP: i32 = 100;
+
 /// Time between two fling frames: a 60 Hz redraw, the same cadence as the
 /// smooth zoom.
 const PAN_FRAME_MS: u64 = 16;
@@ -269,16 +273,27 @@ impl Viewer {
         search_box.append(&search_status);
         accessible_label(&search_entry, "Buscar en el documento");
 
-        // Secondary toolbar: search left, page controls central, zoom right.
-        let toolbar = gtk::CenterBox::builder()
+        // Search and zoom flank the page controls, one fixed gap away on each
+        // side, so the three read as a single group instead of being pushed to
+        // the edges of the bar by the free space.
+        let controls = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        controls.set_halign(gtk::Align::Center);
+        controls.set_hexpand(true);
+        controls.append(&search_box);
+        controls.append(&toolbar_gap(TOOLBAR_GAP));
+        controls.append(&toolbar_nav.root);
+        controls.append(&toolbar_gap(TOOLBAR_GAP));
+        controls.append(&zoom_box);
+
+        // Secondary toolbar: the group stays centred, whatever the window width.
+        let toolbar = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
             .margin_top(6)
             .margin_bottom(6)
             .margin_start(6)
             .margin_end(6)
             .build();
-        toolbar.set_start_widget(Some(&search_box));
-        toolbar.set_center_widget(Some(&toolbar_nav.root));
-        toolbar.set_end_widget(Some(&zoom_box));
+        toolbar.append(&controls);
 
         let menu_bar = build_menu_bar();
         // Thumbnail side panel: a virtualised list, so a 666-page document only
@@ -3683,6 +3698,15 @@ fn thumbnail_row_page(row: &gtk::Widget) -> Option<usize> {
     let canvas = row.first_child()?.first_child()?;
     let number = canvas.next_sibling()?.downcast::<gtk::Label>().ok()?.text();
     number.parse::<usize>().ok()?.checked_sub(1)
+}
+
+/// Fixed-width spacer for the toolbar: the two gaps that separate the search,
+/// the page controls and the zoom, so the distance between them is a number of
+/// the layout and not of the leftover space.
+fn toolbar_gap(width: i32) -> gtk::Box {
+    let gap = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    gap.set_size_request(width, -1);
+    gap
 }
 
 /// Renders one page at `pixel_scale` device pixels per point.

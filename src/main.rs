@@ -173,6 +173,34 @@ trailer\n<< /Root 1 0 R /Size 5 >>\n%%EOF\n";
         );
         assert_eq!(viewer.ui.title.label(), WINDOW_TITLE, "no document, no title");
 
+        // The toolbar keeps the search, the page controls and the zoom in one
+        // group, a fixed gap apart, instead of spreading them to the edges.
+        let controls = viewer.ui.chrome[1]
+            .first_child()
+            .expect("the toolbar holds the control group");
+        let children: Vec<gtk::Widget> = {
+            let mut children = Vec::new();
+            let mut child = controls.first_child();
+            while let Some(widget) = child {
+                child = widget.next_sibling();
+                children.push(widget);
+            }
+            children
+        };
+        assert_eq!(children.len(), 5, "search, gap, pages, gap, zoom");
+        for gap in [&children[1], &children[3]] {
+            assert_eq!(
+                gap.size_request().0,
+                TOOLBAR_GAP,
+                "cada separación pide los {TOOLBAR_GAP} px"
+            );
+        }
+        assert_ne!(
+            children[2].size_request().0,
+            TOOLBAR_GAP,
+            "el bloque de páginas no es una separación"
+        );
+
         // Every declared shortcut must be a valid trigger, and every action it
         // names must exist on the window, or the key silently does nothing.
         for (trigger, action) in SHORTCUTS {
