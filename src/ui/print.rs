@@ -1,9 +1,10 @@
-//! Preview of the pages, for the print dialog.
+//! Preview of the pages, for GTK's print dialog.
 //!
-//! GTK's dialog stays GTK's: the preview opens in a window of its own next to it,
-//! and follows the pages selected there.
+//! GTK's dialog cannot be reshaped, but it can host a widget of the application:
+//! the operation asks for it with the `create-custom-widget` signal and the
+//! dialog shows it in its own page. Everything else in the dialog stays GTK's.
 
-use std::cell::RefCell;
+use std::cell::Cell;
 use std::rc::Rc;
 
 use gtk::prelude::*;
@@ -14,24 +15,12 @@ use crate::ui::shell::Viewer;
 /// thumbnails, so a page reads at a glance.
 pub(crate) const PREVIEW_WIDTH: i32 = 260;
 
-/// What the preview shows: the pages to walk and where the reader is.
-struct State {
-    pages: Vec<usize>,
-    current: usize,
-}
-
-/// The preview widget, plus the handle that swaps the pages it shows.
-pub(crate) struct Preview {
-    pub(crate) root: gtk::Widget,
-    /// Replaces the pages; the counter and the arrows follow them, so a change in
-    /// the dialog's range updates what the preview walks.
-    pub(crate) set_pages: Rc<dyn Fn(Vec<usize>)>,
-}
-
-/// Builds the preview for `pages` (zero-based document indices).
-pub(crate) fn preview(viewer: &Rc<Viewer>, pages: Vec<usize>) -> Preview {
-    let state = Rc::new(RefCell::new(State { pages, current: 0 }));
-
+/// Widget with one page of the document and the arrows that walk through them.
+///
+/// Its own renderer draws it, so it does not depend on what the dialog is about
+/// to print: it answers "what pages are in this document".
+pub(crate) fn preview_widget(viewer: &Rc<Viewer>, pages: usize) -> gtk::Widget {
+    let current = Rc::new(Cell::new(0_usize));
     let picture = gtk::Picture::new();
     picture.set_can_shrink(true);
     let status = gtk::Label::new(None);
@@ -41,51 +30,21 @@ pub(crate) fn preview(viewer: &Rc<Viewer>, pages: Vec<usize>) -> Preview {
     let next = gtk::Button::with_label("›");
     next.set_tooltip_text(Some("Página siguiente"));
 
-    let refresh: Rc<dyn Fn()> = {
-        let viewer = Rc::clone(viewer);
-        let picture = picture.clone();
-        let status = status.clone();
-        let state = Rc::clone(&state);
-        Rc::new(move || {
-            let state = state.borrow();
-            let total = state.pages.len();
-            if total == 0 {
-                picture.set_paintable(None::<&gtk::gdk::Paintable>);
-                status.set_label("sin páginas");
-                return;
-            }
-            let page = state.pages[state.current.min(total - 1)];
-            let (width, _height) = viewer
-                .doc
-                .page_sizes
-                .borrow()
-                .get(page)
-                .copied()
-                .unwrap_or((595.0, 842.0));
-            let scale = f64::from(PREVIEW_WIDTH) / width.max(1.0);
-            match viewer.render_page_texture_at(page, scale) {
-                Ok(texture) => picture.set_paintable(Some(&texture)),
-                Err(_) => picture.set_paintable(None::<&gtk::gdk::Paintable>),
-            }
-            status.set_label(&format!("{} / {total}", state.current + 1));
-        })
-    };
-    refresh();
+    show_page(viewer, &picture, &status, 0, pages);
 
     for step in [-1_i32, 1] {
         let button = if step < 0 { &previous } else { &next };
-        let state = Rc::clone(&state);
-        let refresh = Rc::clone(&refresh);
+        let viewer = Rc::clone(viewer);
+        let picture = picture.clone();
+        let status = status.clone();
+        let current = Rc::clone(&current);
         button.connect_clicked(move |_| {
-            let total = state.borrow().pages.len();
-            if total == 0 {
+            if pages == 0 {
                 return;
             }
-            {
-                let mut state = state.borrow_mut();
-                state.current = (state.current as i32 + step).rem_euclid(total as i32) as usize;
-            }
-            refresh();
+            let target = (current.get() as i32 + step).rem_euclid(pages as i32) as usize;
+            current.set(target);
+            show_page(&viewer, &picture, &status, target, pages);
         });
     }
 
@@ -100,33 +59,43 @@ pub(crate) fn preview(viewer: &Rc<Viewer>, pages: Vec<usize>) -> Preview {
         .vexpand(true)
         .hscrollbar_policy(gtk::PolicyType::Never)
         .build();
-    sheet.set_size_request(PREVIEW_WIDTH + 24, 380);
+    sheet.set_size_request(PREVIEW_WIDTH + 24, 320);
 
-    let root = gtk::Box::new(gtk::Orientation::Vertical, 6);
-    root.set_margin_top(12);
-    root.set_margin_bottom(12);
-    root.set_margin_start(12);
-    root.set_margin_end(12);
-    root.append(&sheet);
-    root.append(&arrows);
+    let preview = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    preview.set_margin_top(12);
+    preview.set_margin_bottom(12);
+    preview.set_margin_start(12);
+    preview.set_margin_end(12);
+    preview.append(&sheet);
+    preview.append(&arrows);
+    preview.upcast()
+}
 
-    let setter: Rc<dyn Fn(Vec<usize>)> = {
-        let state = Rc::clone(&state);
-        let refresh = Rc::clone(&refresh);
-        Rc::new(move |pages| {
-            {
-                let mut state = state.borrow_mut();
-                state.pages = pages;
-                if state.current >= state.pages.len() {
-                    state.current = 0;
-                }
-            }
-            refresh();
-        })
-    };
-
-    Preview {
-        root: root.upcast(),
-        set_pages: setter,
+/// Renders page `index` of `total` into the preview.
+fn show_page(
+    viewer: &Rc<Viewer>,
+    picture: &gtk::Picture,
+    status: &gtk::Label,
+    index: usize,
+    total: usize,
+) {
+    if total == 0 || index >= total {
+        picture.set_paintable(None::<&gtk::gdk::Paintable>);
+        status.set_label("sin páginas");
+        return;
     }
+
+    let (width, _height) = viewer
+        .doc
+        .page_sizes
+        .borrow()
+        .get(index)
+        .copied()
+        .unwrap_or((595.0, 842.0));
+    let scale = f64::from(PREVIEW_WIDTH) / width.max(1.0);
+    match viewer.render_page_texture_at(index, scale) {
+        Ok(texture) => picture.set_paintable(Some(&texture)),
+        Err(_) => picture.set_paintable(None::<&gtk::gdk::Paintable>),
+    }
+    status.set_label(&format!("{} / {total}", index + 1));
 }
