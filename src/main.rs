@@ -392,6 +392,27 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
             "la herramienta queda armada para seguir marcando"
         );
 
+        // El color elegido se ve en el botón: la "U" lleva la línea de ese color.
+        assert!(
+            mark_glyph_markup(MarkKind::Underline, (0.15, 0.45, 0.85)).contains("#2673d9"),
+            "el glifo del botón pinta el color elegido"
+        );
+        let glyph = viewer.ui.tools[0]
+            .button
+            .child()
+            .and_then(|child| child.downcast::<gtk::Label>().ok())
+            .expect("el botón tiene su glifo");
+        assert!(
+            glyph.label().contains("#2673d9"),
+            "el glifo del botón muestra el color elegido: {}",
+            glyph.label()
+        );
+        assert!(
+            glyph.label().contains("underline"),
+            "el glifo del botón aplica la línea de color: {}",
+            glyph.label()
+        );
+
         // Sin selección: la herramienta espera al arrastre y usa el mismo color.
         viewer.set_mark_mode(MarkKind::Underline, false);
         viewer.begin_selection(0, 20.0, 155.0);
@@ -462,6 +483,10 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
         viewer.update_selection(0, 160.0, 40.0);
         viewer.finish_selection();
         viewer.accept_mark_color(MarkKind::Highlight, (1.0, 0.5, 0.0));
+        assert!(
+            mark_glyph_markup(MarkKind::Highlight, (1.0, 0.5, 0.0)).contains("#ff8000"),
+            "el botón de resaltar muestra su color de fondo"
+        );
         assert_eq!(viewer.annot.marks.borrow().len(), 4);
         assert_eq!(viewer.annot.marks.borrow()[3].kind, MarkKind::Highlight);
         assert_eq!(viewer.annot.marks.borrow()[3].color, [1.0, 0.5, 0.0]);
@@ -591,6 +616,48 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
         );
         assert!(!viewer.has_pending_marks());
         std::fs::remove_file(&copy).ok();
+
+        // Ctrl+Z deshace los marcados que todavía no están en el PDF, de a uno.
+        // Lo que ya se escribió en el archivo no se puede deshacer desde acá.
+        viewer.begin_selection(0, 20.0, 10.0);
+        viewer.update_selection(0, 180.0, 35.0);
+        viewer.finish_selection();
+        assert!(
+            viewer.apply_mark(MarkKind::Underline),
+            "primer cambio pendiente"
+        );
+        viewer.begin_selection(0, 20.0, 155.0);
+        viewer.update_selection(0, 160.0, 40.0);
+        viewer.finish_selection();
+        assert!(
+            viewer.apply_mark(MarkKind::Highlight),
+            "segundo cambio pendiente"
+        );
+        assert_eq!(viewer.annot.marks.borrow().len(), 8, "seis guardados y dos más");
+
+        assert!(viewer.undo_mark(), "se deshace el último marcado");
+        assert_eq!(viewer.annot.marks.borrow().len(), 7);
+        assert!(
+            viewer.has_pending_marks(),
+            "todavía queda un cambio sin guardar"
+        );
+        assert_eq!(
+            written_annotations(&text_path),
+            6,
+            "deshacer no reescribe el archivo"
+        );
+        assert!(viewer.undo_mark(), "se deshace el otro");
+        assert!(!viewer.has_pending_marks());
+        assert!(
+            !viewer.undo_mark(),
+            "lo que ya está escrito en el PDF no se deshace"
+        );
+        assert_eq!(viewer.annot.marks.borrow().len(), 6, "vuelve al estado guardado");
+
+        // El atajo y el menú usan la misma acción: sin pendientes no rompe nada.
+        gtk::prelude::WidgetExt::activate_action(&viewer.ui.window, "win.undo", None)
+            .expect("la acción de deshacer tiene que existir");
+        assert_eq!(viewer.annot.marks.borrow().len(), 6);
 
         // Guardar como (Ctrl+Shift+S) tiene que dejar un archivo en el destino
         // aunque no haya nada pendiente: es una copia del documento abierto.

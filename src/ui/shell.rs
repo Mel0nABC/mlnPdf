@@ -782,6 +782,7 @@ impl Viewer {
         Self::install_action(viewer, "highlight", |viewer| {
             viewer.toggle_mark_mode(MarkKind::Highlight);
         });
+        Self::install_action(viewer, "undo", |viewer| viewer.undo());
         Self::install_action(viewer, "save-annotations", |viewer| viewer.save_annotations());
         Self::install_action(viewer, "save-annotations-as", |viewer| {
             viewer.save_annotations_as(None);
@@ -1550,6 +1551,16 @@ impl Viewer {
         let mut tool = self.mark_tool(kind);
         tool.color = color;
         self.set_mark_tool(kind, tool);
+        self.refresh_mark_button(kind);
+    }
+
+    /// Pinta el color elegido en el botón de la herramienta, para no tener que
+    /// abrir el selector solo para recordarlo.
+    fn refresh_mark_button(&self, kind: MarkKind) {
+        let ui = &self.ui.tools[kind.index()];
+        if let Some(glyph) = ui.button.child().and_then(|child| child.downcast::<gtk::Label>().ok()) {
+            glyph.set_markup(&mark_glyph_markup(kind, self.mark_tool(kind).color));
+        }
     }
 
     /// Arma o desarma una herramienta de marcado: el botón, el cursor y el
@@ -1886,6 +1897,42 @@ impl Viewer {
         for page in pages {
             self.queue_page_draw(page);
         }
+    }
+
+    /// Deshace el último marcado que todavía no está en el PDF. Lo que ya se
+    /// escribió en el archivo no se puede deshacer desde el visor: habría que
+    /// reescribir la anotación.
+    pub(crate) fn undo_mark(&self) -> bool {
+        let saved = self.annot.saved.get();
+        let page = {
+            let mut marks = self.annot.marks.borrow_mut();
+            if marks.len() <= saved {
+                return false;
+            }
+            let Some(mark) = marks.pop() else {
+                return false;
+            };
+            mark.page
+        };
+        self.queue_page_draw(page);
+        true
+    }
+
+    /// Ctrl+Z, con aviso cuando no hay nada que deshacer.
+    pub(crate) fn undo(self: &Rc<Self>) {
+        if self.undo_mark() {
+            self.ui.window.announce(
+                "Cambio deshecho",
+                gtk::AccessibleAnnouncementPriority::Medium,
+            );
+            return;
+        }
+        let message = if self.annot.marks.borrow().is_empty() {
+            "No hay cambios para deshacer."
+        } else {
+            "Los marcados ya escritos en el PDF no se pueden deshacer desde el visor."
+        };
+        self.ui.window.announce(message, gtk::AccessibleAnnouncementPriority::Medium);
     }
 
     /// Deja el documento sin marcados en memoria: se usan al abrir otro.
@@ -4387,35 +4434,63 @@ fn thumbnail_row_page(row: &gtk::Widget) -> Option<usize> {
 /// the layout and not of the leftover space.
 /// Lo que distingue a una herramienta de marcado de la otra al construirla.
 struct MarkToolSpec {
-    glyph_markup: &'static str,
+    kind: MarkKind,
     tooltip: &'static str,
     accessible: &'static str,
     color_title: &'static str,
+    default_color: (f64, f64, f64),
 }
 
 fn mark_spec(kind: MarkKind) -> MarkToolSpec {
     match kind {
         MarkKind::Underline => MarkToolSpec {
-            // Una "U" subrayada: Adwaita no trae glifo de subrayado.
-            glyph_markup: "<u>U</u>",
+            kind,
             tooltip: "Subrayar (Ctrl+U)",
             accessible: "Subrayar el texto seleccionado",
             color_title: "Color del subrayado",
+            default_color: UNDERLINE_COLOR,
         },
         MarkKind::Highlight => MarkToolSpec {
-            // Una "A" con fondo de rotulador.
-            glyph_markup: "<span background=\"#FFE082\">A</span>",
+            kind,
             tooltip: "Resaltar (Ctrl+Shift+U)",
             accessible: "Resaltar el texto seleccionado",
             color_title: "Color del resaltado",
+            default_color: HIGHLIGHT_COLOR,
         },
     }
+}
+
+/// Glifo del botón con el color de la herramienta: la "U" lleva la línea en ese
+/// color y la "A" lo lleva de fondo, con letra clara si el fondo es oscuro.
+pub(crate) fn mark_glyph_markup(kind: MarkKind, color: (f64, f64, f64)) -> String {
+    let hex = hex_color(color);
+    match kind {
+        MarkKind::Underline => format!(
+            "<span underline=\"single\" underline_color=\"{hex}\">U</span>"
+        ),
+        MarkKind::Highlight => {
+            let luminance = 0.299 * color.0 + 0.587 * color.1 + 0.114 * color.2;
+            let ink = if luminance > 0.55 { "#000000" } else { "#FFFFFF" };
+            format!("<span background=\"{hex}\" foreground=\"{ink}\">A</span>")
+        }
+    }
+}
+
+/// Color RGB en `0..=1` a `#rrggbb`, que es lo que entiende el marcado de Pango.
+fn hex_color(color: (f64, f64, f64)) -> String {
+    let channel = |value: f64| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+    format!(
+        "#{:02x}{:02x}{:02x}",
+        channel(color.0),
+        channel(color.1),
+        channel(color.2)
+    )
 }
 
 /// Botón y selector de color de una herramienta de marcado.
 fn build_mark_tool(spec: &MarkToolSpec) -> MarkToolUi {
     let glyph = gtk::Label::new(None);
-    glyph.set_markup(spec.glyph_markup);
+    glyph.set_markup(&mark_glyph_markup(spec.kind, spec.default_color));
     let button = gtk::ToggleButton::builder()
         .child(&glyph)
         .tooltip_text(spec.tooltip)
