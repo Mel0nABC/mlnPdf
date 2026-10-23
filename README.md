@@ -90,7 +90,7 @@ ventana.
 | Exportar una selección de páginas | `Tools > Exportar páginas…`: `1,2,100`, `1-55`, `pares`, `impares`, `última`, `todas` |
 | Exportar el texto plano del documento | `Tools > Exportar texto…` |
 | Imprimir, con vista previa, opciones y folleto | `Ctrl+P`, `File > Imprimir con opciones…`, `File > Imprimir folleto…`; el diálogo suma a la derecha la miniatura de las páginas con flechas ‹ › |
-| Guardar los marcados (subrayados y resaltados) en el PDF abierto o en una copia, preguntando antes si quedan cambios sin guardar | `Ctrl+S` / `Ctrl+Shift+S` |
+| `File > Guardar` escribe los marcados (subrayados y resaltados) en el PDF abierto; `File > Guardar como…` guarda una copia. Si quedan cambios sin guardar, pregunta antes | `Ctrl+S` / `Ctrl+Shift+S` |
 
 ## Atajos
 
@@ -106,7 +106,7 @@ ventana.
 | `Alt+←` / `→` | Historial atrás / adelante | `F11` / `F5` | Pantalla completa / presentación |
 | `Ctrl` + rueda | Zoom con la rueda | `Espacio` + arrastrar | Herramienta mano, con inercia al soltar |
 | `Ctrl+C` / `Ctrl+Shift+C` | Copiar la selección / la página | `Esc` | Sale de presentación o del modo mano; limpia la búsqueda |
-| `Ctrl+U` / `Ctrl+Shift+U` | Subrayar / resaltar | `Ctrl+S` / `Ctrl+Shift+S` | Guardar los marcados / guardar una copia |
+| `Ctrl+U` / `Ctrl+Shift+U` | Subrayar / resaltar | `Ctrl+S` / `Ctrl+Shift+S` | Guardar / guardar como |
 
 La lista completa está en `Help > Atajos de teclado…` dentro de la aplicación.
 

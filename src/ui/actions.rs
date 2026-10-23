@@ -60,7 +60,7 @@ pub const SHORTCUT_HELP: [(&str, &str); 23] = [
     ("Ctrl+C", "Copiar el texto seleccionado"),
     ("Ctrl+U", "Subrayar el texto seleccionado"),
     ("Ctrl+Shift+U", "Resaltar el texto seleccionado"),
-    ("Ctrl+S / Ctrl+Shift+S", "Guardar los subrayados / guardar una copia"),
+    ("Ctrl+S / Ctrl+Shift+S", "Guardar los marcados / guardar como"),
     ("Ctrl+Shift+C", "Copiar el texto de la página actual"),
     ("Ctrl+G / Ctrl+Shift+G", "Siguiente / anterior coincidencia"),
     ("Ctrl+rueda", "Zoom con la rueda"),
@@ -78,8 +78,8 @@ pub fn build_menu_bar() -> gtk::PopoverMenuBar {
 
     let file_menu = gio::Menu::new();
     file_menu.append(Some("Abrir…"), Some("win.open"));
-    file_menu.append(Some("Guardar los subrayados"), Some("win.save-annotations"));
-    file_menu.append(Some("Guardar una copia…"), Some("win.save-annotations-as"));
+    file_menu.append(Some("Guardar"), Some("win.save-annotations"));
+    file_menu.append(Some("Guardar como…"), Some("win.save-annotations-as"));
     file_menu.append(Some("Imprimir…"), Some("win.print"));
     file_menu.append(Some("Imprimir con opciones…"), Some("win.print-options"));
     file_menu.append(Some("Imprimir folleto…"), Some("win.print-booklet"));

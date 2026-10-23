@@ -17,6 +17,7 @@ mod tests {
     use std::path::Path;
 
     use gtk::gio;
+    use gtk::gio::prelude::*;
     use gtk::prelude::*;
 
     use crate::app::install_viewer;
@@ -220,6 +221,33 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
                 "{name} va justo al lado del zoom"
             );
         }
+
+        // El menú File: guardar con nombres cortos. "Guardar" escribe en el
+        // archivo abierto y "Guardar como…" pide otro destino.
+        let menu_bar = viewer.ui.chrome[0]
+            .clone()
+            .downcast::<gtk::PopoverMenuBar>()
+            .expect("la barra de menús es el primer elemento del chrome");
+        let model = menu_bar.menu_model().expect("la barra tiene un modelo");
+        let file_menu = (0..model.n_items())
+            .find(|index| {
+                model
+                    .item_attribute_value(*index, "label", None)
+                    .and_then(|value| value.get::<String>())
+                    .as_deref()
+                    == Some("File")
+            })
+            .and_then(|index| model.item_link(index, "submenu"))
+            .expect("el menú File tiene que existir");
+        let file_labels: Vec<String> = (0..file_menu.n_items())
+            .filter_map(|index| file_menu.item_attribute_value(index, "label", None))
+            .filter_map(|value| value.get::<String>())
+            .collect();
+        assert_eq!(
+            &file_labels[..3],
+            ["Abrir…", "Guardar", "Guardar como…"],
+            "el menú File guarda con nombres cortos: sin 'los subrayados' ni 'una copia'"
+        );
 
         // Every declared shortcut must be a valid trigger, and every action it
         // names must exist on the window, or the key silently does nothing.

@@ -1742,7 +1742,7 @@ impl Viewer {
         let name = self.suggested_name("pdf");
         Self::ask_save_path(
             self,
-            "Guardar una copia con los marcados",
+            "Guardar como",
             Some(name),
             move |viewer, target| {
                 if viewer.save_pending_marks(target) {
@@ -1788,7 +1788,7 @@ impl Viewer {
             .detail(format!(
                 "«{name}» todavía no tiene {count} {plural}. Si seguís sin guardar, se pierden."
             ))
-            .buttons(["Descartar", "Guardar", "Guardar una copia…"])
+            .buttons(["Descartar", "Guardar", "Guardar como…"])
             .default_button(1)
             .build();
 
@@ -1811,8 +1811,8 @@ impl Viewer {
                             then(&viewer);
                         }
                     }
-                    // Guardar una copia: la copia es la decisión del lector, así
-                    // que los pendientes quedan resueltos; cancelar el diálogo de
+                    // Guardar como: la copia es la decisión del lector, así que
+                    // los pendientes quedan resueltos; cancelar el diálogo de
                     // archivo deja todo como estaba.
                     Ok(2) => viewer.save_annotations_as(Some(Box::new(move |viewer| {
                         viewer.discard_marks();
