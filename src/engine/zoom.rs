@@ -55,6 +55,32 @@ pub fn zoom_text(zoom: f64) -> String {
     format!("{:.0} %", zoom * 100.0)
 }
 
+/// Total duration of the smooth-zoom animation.
+pub const ZOOM_ANIMATION_MS: u64 = 240;
+
+/// Time between two animation frames: a 60 Hz redraw.
+pub const ZOOM_FRAME_MS: u64 = 16;
+
+/// Zoom to draw at `progress` (0..=1) of an animation from `from` to `to`.
+///
+/// The easing is cubic ease-in-out: the change starts slowly, speeds up in the
+/// middle and settles gently, which reads softer than an ease-out (that one
+/// spends almost the whole jump in the first half and looks abrupt on arrival).
+/// The endpoints are exact, so the animation always lands on the requested step.
+pub fn zoom_at_progress(from: f64, to: f64, progress: f64) -> f64 {
+    let progress = progress.clamp(0.0, 1.0);
+    if progress >= 1.0 {
+        return to;
+    }
+    let eased = if progress < 0.5 {
+        4.0 * progress * progress * progress
+    } else {
+        let remaining = -2.0 * progress + 2.0;
+        1.0 - remaining * remaining * remaining / 2.0
+    };
+    from + (to - from) * eased
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -81,6 +107,38 @@ mod tests {
         assert_eq!(scroll_zoom_step(0.0, -1.0), (0.0, Some(-1)));
         assert_eq!(scroll_zoom_step(0.7, -0.2), (-0.2, None));
         assert_eq!(scroll_zoom_step(0.7, 0.0), (0.7, None));
+    }
+
+    #[test]
+    fn animation_starts_and_ends_on_the_requested_steps() {
+        assert_eq!(zoom_at_progress(1.0, 1.5, 0.0), 1.0);
+        assert_eq!(zoom_at_progress(1.0, 1.5, 1.0), 1.5);
+        assert_eq!(zoom_at_progress(1.5, 1.0, 1.0), 1.0, "también al reducir");
+        assert_eq!(zoom_at_progress(1.0, 1.5, -0.3), 1.0, "progreso negativo");
+        assert_eq!(zoom_at_progress(1.0, 1.5, 2.0), 1.5, "progreso pasado de 1");
+    }
+
+    #[test]
+    fn animation_advances_monotonically_and_passes_the_halfway_point_at_half_time() {
+        let previous = zoom_at_progress(1.0, 2.0, 0.2);
+        let later = zoom_at_progress(1.0, 2.0, 0.4);
+        assert!(previous < later, "un aumento no puede retroceder");
+        assert!(
+            (zoom_at_progress(1.0, 2.0, 0.5) - 1.5).abs() < 1e-9,
+            "ease-in-out: la mitad del tiempo recorre la mitad"
+        );
+        assert!(
+            zoom_at_progress(2.0, 1.0, 0.25) > 1.75,
+            "al reducir, la misma curva invierte el sentido"
+        );
+    }
+
+    #[test]
+    fn animation_starts_and_ends_slowly() {
+        let start = zoom_at_progress(1.0, 2.0, 0.1);
+        let end = zoom_at_progress(1.0, 2.0, 0.9);
+        assert!(start < 1.05, "arranque suave: {start}");
+        assert!(end > 1.95, "llegada suave: {end}");
     }
 
     #[test]
