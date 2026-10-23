@@ -22,6 +22,14 @@ entry.page-number > text {
   min-height: 0;
   padding: 0;
 }
+/* Thumbnail panel: Adwaita paints the selected row with a neutral gray. Use the
+   theme's selection colour, the same blue as the row's focus outline, so the
+   chosen page is identifiable at a glance instead of reading as a hover. */
+.navigation-sidebar > row:selected,
+.navigation-sidebar > row:selected:hover {
+  background-color: @theme_selected_bg_color;
+  color: @theme_selected_fg_color;
+}
 .paper { background: #ffffff; }
 .paper-dark { background: #000000; }
 ";

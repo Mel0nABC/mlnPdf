@@ -68,6 +68,7 @@ pub(crate) struct UiHandles {
     pub(crate)     search_entry: gtk::Entry,
     pub(crate)     search_status: gtk::Label,
     pub(crate)     sidebar: gtk::ScrolledWindow,
+    pub(crate)     thumbs_view: gtk::ListView,
     pub(crate)     thumbs_store: gio::ListStore,
     pub(crate)     thumbs_selection: gtk::SingleSelection,
     pub(crate)     scale_provider: gtk::CssProvider,
@@ -120,6 +121,9 @@ pub(crate) struct SearchState {
     pub(crate)     search_hit_pages: RefCell<Vec<usize>>,
     pub(crate)     search_cursor: Cell<usize>,
     pub(crate)     search_epoch: Cell<u32>,
+    /// Query the loaded results belong to, so Enter can step instead of
+    /// searching again when the field still holds it.
+    pub(crate)     search_query: RefCell<String>,
 }
 
 /// Current drag selection and its per-line rectangles (PDF points).
@@ -138,8 +142,27 @@ pub(crate) struct InteractionState {
     /// Set when a view change reshapes the viewport: the zoom is refitted once
     /// the new width is known.
     pub(crate)     refit_pending: Cell<bool>,
-    /// Page to scroll to once the viewport has a real size (session restore).
+    /// Page to scroll to once the viewport has a real size (saved position).
     pub(crate)     pending_restore: Cell<Option<usize>>,
+    /// Set while the thumbnail panel is being centred: its own minimal scroll
+    /// request would otherwise override the computed position.
+    pub(crate)     centering_thumbnails: Cell<bool>,
+    /// Running smooth-zoom transition, if any.
+    pub(crate)     zoom_animation: Cell<Option<ZoomAnimation>>,
+    /// Bumped whenever a zoom is started or cancelled, so frames scheduled for
+    /// an older transition stop instead of fighting the current one.
+    pub(crate)     zoom_generation: Cell<u64>,
+}
+
+/// One smooth-zoom transition in progress.
+#[derive(Clone, Copy)]
+pub(crate) struct ZoomAnimation {
+    from: f64,
+    to: f64,
+    /// Page kept in place while the geometry changes.
+    anchor: usize,
+    started: std::time::Instant,
+    generation: u64,
 }
 
 pub(crate) struct PageSlot {
@@ -302,6 +325,7 @@ impl Viewer {
                 search_entry: search_entry.clone(),
                 search_status: search_status.clone(),
                 sidebar: sidebar.clone(),
+                thumbs_view: thumbs_view.clone(),
                 thumbs_store: thumbs_store.clone(),
                 thumbs_selection: thumbs_selection.clone(),
                 scale_provider: scale_provider.clone(),
@@ -336,6 +360,7 @@ impl Viewer {
                 search_hit_pages: RefCell::new(Vec::new()),
                 search_cursor: Cell::new(0),
                 search_epoch: Cell::new(0),
+                search_query: RefCell::new(String::new()),
             },
             sel: SelectionState {
                 selection: RefCell::new(None),
@@ -348,6 +373,9 @@ impl Viewer {
                 thumb_sync: Cell::new(false),
                 refit_pending: Cell::new(false),
                 pending_restore: Cell::new(None),
+                centering_thumbnails: Cell::new(false),
+                zoom_animation: Cell::new(None),
+                zoom_generation: Cell::new(0),
             },
             me: RefCell::new(std::rc::Weak::new()),
         });
@@ -360,10 +388,40 @@ impl Viewer {
         }
         let weak = Rc::downgrade(&viewer);
         search_entry.connect_activate(move |entry| {
-            if let Some(viewer) = weak.upgrade() {
+            let Some(viewer) = weak.upgrade() else {
+                return;
+            };
+            // Enter on a query that already has results walks them one by one,
+            // like Ctrl+G; a changed query starts a fresh search.
+            if viewer.search_already_done(&entry.text()) {
+                viewer.search_step(1);
+            } else {
                 viewer.search(&entry.text());
             }
         });
+
+        // Escape empties the field and drops the highlights that came with it.
+        {
+            let weak = Rc::downgrade(&viewer);
+            let entry = search_entry.clone();
+            let key = gtk::EventControllerKey::new();
+            key.connect_key_pressed(move |_, keyval, _, _| {
+                if keyval != gdk::Key::Escape {
+                    return glib::Propagation::Proceed;
+                }
+                let Some(viewer) = weak.upgrade() else {
+                    return glib::Propagation::Proceed;
+                };
+                // A hidden field can still hold the focus in presentation mode.
+                if viewer.view.presentation.get() {
+                    return viewer.escape_pressed();
+                }
+                entry.set_text("");
+                viewer.search("");
+                glib::Propagation::Stop
+            });
+            search_entry.add_controller(key);
+        }
 
         {
             let weak_thumb = Rc::downgrade(&viewer);
@@ -463,6 +521,7 @@ impl Viewer {
         Self::install_ctrl_scroll(&viewer);
         Self::install_page_sync(&viewer);
         Self::install_copy_shortcut(&viewer);
+        Self::install_escape(&viewer);
         Self::install_hand_pan(&viewer);
         Self::install_drop_target(&viewer);
 
@@ -488,7 +547,7 @@ impl Viewer {
         viewer.ui.scroller.vadjustment().connect_changed(move |_| {
             if let Some(viewer) = weak.upgrade() {
                 viewer.refresh_visible();
-                // A restored session waits here for the first real layout.
+                // A document reopened at its saved page waits here for the first real layout.
                 viewer.apply_pending_restore();
             }
         });
@@ -561,8 +620,8 @@ impl Viewer {
         });
         Self::install_action(viewer, "print", |viewer| viewer.print_document());
         Self::install_action(viewer, "export-text", |viewer| viewer.export_text());
-        Self::install_action(viewer, "export-page", |viewer| viewer.export_page_png());
-        Self::install_action(viewer, "export-pages", |viewer| viewer.export_all_pages());
+        Self::install_action(viewer, "export-page", |viewer| viewer.export_page());
+        Self::install_action(viewer, "export-pages", |viewer| viewer.export_pages());
         Self::install_action(viewer, "thumbnails", |viewer| viewer.toggle_sidebar());
         Self::install_action(viewer, "spread", |viewer| viewer.toggle_spread());
         Self::install_action(viewer, "ui-scale-up", |viewer| {
@@ -577,7 +636,6 @@ impl Viewer {
         Self::install_action(viewer, "copy-selection", |viewer| viewer.copy_selection());
         Self::install_action(viewer, "copy-page-text", |viewer| viewer.copy_page_text());
         Self::install_action(viewer, "cover-alone", |viewer| viewer.toggle_cover_alone());
-        Self::install_action(viewer, "export-page-jpeg", |viewer| viewer.export_page_jpeg());
         Self::install_action(viewer, "print-booklet", |viewer| viewer.print_booklet());
         Self::install_action(viewer, "print-options", |viewer| viewer.print_with_options());
         Self::install_action(viewer, "recent", |viewer| viewer.show_recent());
@@ -746,9 +804,19 @@ impl Viewer {
     }
 
     /// Opens the document, asking for a password when it is encrypted.
+    ///
+    /// The saved reading position is applied here, so reopening the document
+    /// the session remembers (from the command line, the recent list, the file
+    /// dialog or a drop) resumes where the reader left it.
     pub(crate) fn open_reporting(self: &Rc<Self>, path: &Path) {
+        // The position of the remembered document is offered to this open, but
+        // only when the session already points at the same file.
+        let saved = load_session();
         match self.open(path) {
-            Ok(()) => self.install_file_monitor(),
+            Ok(()) => {
+                self.install_file_monitor();
+                self.apply_saved_position(&saved, path);
+            }
             Err(message) if looks_encrypted(&message) => self.prompt_password(path),
             Err(message) => show_error(&self.ui.window, "No se pudo abrir el archivo.", &message),
         }
@@ -801,12 +869,13 @@ impl Viewer {
             };
             let password = entry_ref.text().to_string();
             window_ref.close();
-            if let Err(message) = viewer.open_with_password(&path_owned, Some(&password)) {
-                show_error(
+            match viewer.open_with_password(&path_owned, Some(&password)) {
+                Ok(()) => viewer.restore_saved_position(&path_owned),
+                Err(message) => show_error(
                     &viewer.ui.window,
                     "No se pudo abrir el documento.",
                     &message,
-                );
+                ),
             }
         });
 
@@ -816,23 +885,131 @@ impl Viewer {
     }
 
     pub(crate) fn zoom_in(&self) {
-        self.set_zoom(next_zoom(self.view.zoom.get()));
+        self.set_zoom(next_zoom(self.zoom_target()));
     }
 
     pub(crate) fn zoom_out(&self) {
-        self.set_zoom(previous_zoom(self.view.zoom.get()));
+        self.set_zoom(previous_zoom(self.zoom_target()));
     }
 
+    /// Zoom the view is heading to: the running transition's target, or the
+    /// current value when the view is still. Using it keeps a quick second click
+    /// advancing one full step instead of landing on the same destination.
+    fn zoom_target(&self) -> f64 {
+        self.input
+            .zoom_animation
+            .get()
+            .map_or(self.view.zoom.get(), |animation| animation.to)
+    }
+
+    /// User zoom (buttons, Ctrl+wheel, steps): eases to `zoom` instead of
+    /// snapping, so the change reads as a transition.
     pub(crate) fn set_zoom(&self, zoom: f64) {
         let clamped = zoom.clamp(ZOOM_STEPS[0], ZOOM_STEPS[ZOOM_STEPS.len() - 1]);
-        if (clamped - self.view.zoom.get()).abs() < f64::EPSILON {
+        if (clamped - self.zoom_target()).abs() < f64::EPSILON {
             return;
         }
-        self.apply_zoom(clamped);
+        self.animate_zoom(clamped);
     }
 
-    /// Applies a zoom and re-renders even when the value does not change, which
-    /// is what a layout change (spread, cover, rotation) needs.
+    /// Starts the eased transition to `target`. Frames reuse the textures that
+    /// are already painted and only the last one rasterizes at the new scale.
+    fn animate_zoom(&self, target: f64) {
+        // Respect the toolkit switch behind "reduce motion": with animations
+        // off the zoom is applied at once, exactly as before.
+        if gtk::Settings::default().is_some_and(|settings| !settings.is_gtk_enable_animations()) {
+            self.apply_zoom(target);
+            return;
+        }
+        let generation = self.input.zoom_generation.get().wrapping_add(1);
+        self.input.zoom_generation.set(generation);
+        self.input.zoom_animation.set(Some(ZoomAnimation {
+            from: self.view.zoom.get(),
+            to: target,
+            anchor: self.current_page(),
+            started: std::time::Instant::now(),
+            generation,
+        }));
+        // The counter announces the destination while the view catches up.
+        self.ui.zoom_label.set_label(&zoom_text(target));
+
+        let weak = self.me.borrow().clone();
+        glib::timeout_add_local(
+            std::time::Duration::from_millis(ZOOM_FRAME_MS),
+            move || {
+                let Some(viewer) = weak.upgrade() else {
+                    return glib::ControlFlow::Break;
+                };
+                viewer.zoom_animation_frame(generation)
+            },
+        );
+    }
+
+    fn zoom_animation_frame(&self, generation: u64) -> glib::ControlFlow {
+        let Some(animation) = self.input.zoom_animation.get() else {
+            return glib::ControlFlow::Break;
+        };
+        if animation.generation != generation {
+            return glib::ControlFlow::Break;
+        }
+
+        let elapsed = animation.started.elapsed().as_millis() as f64;
+        let progress = elapsed / ZOOM_ANIMATION_MS as f64;
+        let finished = progress >= 1.0;
+        if finished {
+            self.input.zoom_animation.set(None);
+        }
+        let zoom = zoom_at_progress(animation.from, animation.to, progress);
+        self.show_zoom_step(zoom, animation.anchor, finished);
+
+        if finished {
+            glib::ControlFlow::Break
+        } else {
+            glib::ControlFlow::Continue
+        }
+    }
+
+    /// Applies one frame: geometry at `zoom` with the anchored page held in
+    /// place; textures are rasterized only on the final frame.
+    fn show_zoom_step(&self, zoom: f64, anchor: usize, final_frame: bool) {
+        self.view.zoom.set(zoom);
+        self.relayout_for_zoom(zoom);
+        self.jump_to_page(anchor);
+        if final_frame {
+            self.refresh_visible();
+        }
+    }
+
+    /// Rebuilds the page geometry for `zoom` without dropping the textures that
+    /// are already painted, which is what makes the animation cheap: the
+    /// pictures stretch with their widget until the last frame rasterizes.
+    fn relayout_for_zoom(&self, zoom: f64) {
+        let oriented = self.oriented_sizes();
+        if oriented.is_empty() {
+            return;
+        }
+        {
+            let slots = self.doc.slots.borrow();
+            if slots.len() != oriented.len() {
+                return;
+            }
+            for (index, (width, height)) in oriented.iter().enumerate() {
+                let logical = ((width * zoom).ceil() as i32, (height * zoom).ceil() as i32);
+                slots[index].picture.set_size_request(logical.0, logical.1);
+                slots[index].overlay.set_size_request(logical.0, logical.1);
+            }
+        }
+        *self.doc.layout.borrow_mut() = PageLayout::build(
+            &oriented,
+            zoom,
+            self.view.spread.get(),
+            self.view.cover_alone.get(),
+        );
+    }
+
+    /// Applies a zoom and re-renders immediately, even when the value does not
+    /// change, which is what a layout change (spread, cover, rotation) needs.
+    /// User zoom goes through [`Self::set_zoom`], which eases instead.
     pub(crate) fn apply_zoom(&self, zoom: f64) {
         let clamped = zoom.clamp(ZOOM_STEPS[0], ZOOM_STEPS[ZOOM_STEPS.len() - 1]);
         let anchor = self.current_page();
@@ -865,6 +1042,11 @@ impl Viewer {
     /// Rebuilds the page geometry for the current zoom and rasterizes only the
     /// pages near the viewport.
     pub(crate) fn render(&self) -> Result<(), String> {
+        // An immediate relayout wins over a running smooth zoom.
+        self.input.zoom_animation.set(None);
+        self.input.zoom_generation
+            .set(self.input.zoom_generation.get().wrapping_add(1));
+
         let document = self.doc.document.borrow();
         let Some(document) = document.as_ref() else {
             return Ok(());
@@ -988,6 +1170,9 @@ impl Viewer {
 
         self.apply_page_background();
         self.refresh_visible();
+        if self.input.hand_mode.get() {
+            self.apply_hand_cursor(Some("grab"));
+        }
         Ok(())
     }
 
@@ -1008,6 +1193,11 @@ impl Viewer {
     /// Rasterizes the pages that intersect the viewport (plus one page of margin
     /// on each side) and releases the textures that are far away.
     pub(crate) fn refresh_visible(&self) {
+        // Frames of the smooth zoom reuse the current textures; rasterizing at
+        // every intermediate scale would stall the animation.
+        if self.input.zoom_animation.get().is_some() {
+            return;
+        }
         let layout = self.doc.layout.borrow();
         if layout.page_count() == 0 {
             return;
@@ -1037,7 +1227,6 @@ impl Viewer {
         let Some((first, last)) = range else {
             return;
         };
-
         for index in first..=last {
             self.ensure_rendered(index);
         }
@@ -1126,10 +1315,77 @@ impl Viewer {
         {
             return;
         }
-        let active = !self.input.hand_mode.get();
+        self.set_hand_mode(!self.input.hand_mode.get());
+    }
+
+    /// Turns the hand tool on or off and keeps the cursor consistent.
+    pub(crate) fn set_hand_mode(&self, active: bool) {
         self.input.hand_mode.set(active);
-        self.ui.scroller
-            .set_cursor_from_name(if active { Some("grab") } else { None });
+        if !active {
+            // A drag interrupted by Escape can leave the window cursor behind.
+            self.ui.window.set_cursor(None::<&gdk::Cursor>);
+        }
+        self.apply_hand_cursor(active.then_some("grab"));
+    }
+
+    /// Closes one of our modal dialogs in the order that leaves the parent
+    /// window undimmed: modality is cleared first, so the window manager starts
+    /// removing the dim while the window still exists.
+    fn close_modal(window: &gtk::Window) {
+        window.set_modal(false);
+        window.close();
+    }
+
+    /// Runs `action` once the dialog that just closed is gone. Presenting a new
+    /// modal inside the closing handler makes the window manager stack the dim
+    /// and it can stay on the parent window.
+    fn after_modal(action: impl FnOnce() + 'static) {
+        glib::timeout_add_local_once(std::time::Duration::from_millis(200), action);
+    }
+
+    /// Sets `name`, or the inherited cursor with `None`, on every widget that can
+    /// be under the pointer over a page. GTK resolves the cursor of the picked
+    /// widget (here the selection canvas inside the page overlay), so the cursor
+    /// is set on all of them: the scrolled window alone does not survive a drag
+    /// that slides other pages under the pointer.
+    pub(crate) fn apply_hand_cursor(&self, name: Option<&str>) {
+        let cursor = name.and_then(|name| gdk::Cursor::from_name(name, None));
+        self.ui.scroller.set_cursor(cursor.as_ref());
+        self.ui.pages.set_cursor(cursor.as_ref());
+        for slot in self.doc.slots.borrow().iter() {
+            slot.overlay.set_cursor(cursor.as_ref());
+            slot.picture.set_cursor(cursor.as_ref());
+            slot.canvas.set_cursor(cursor.as_ref());
+        }
+    }
+
+    /// Escape leaves presentation and the hand tool, in that order. The page and
+    /// search fields consume their own Escape first, so this only sees the rest.
+    pub(crate) fn install_escape(viewer: &Rc<Self>) {
+        let keys = gtk::EventControllerKey::new();
+        let weak = Rc::downgrade(viewer);
+        keys.connect_key_pressed(move |_, keyval, _, _| {
+            if keyval != gdk::Key::Escape {
+                return glib::Propagation::Proceed;
+            }
+            let Some(viewer) = weak.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
+            viewer.escape_pressed()
+        });
+        viewer.ui.window.add_controller(keys);
+    }
+
+    pub(crate) fn escape_pressed(&self) -> glib::Propagation {
+        if self.view.presentation.get() {
+            self.toggle_presentation();
+            return glib::Propagation::Stop;
+        }
+        if self.input.hand_mode.get() {
+            self.set_hand_mode(false);
+            return glib::Propagation::Stop;
+        }
+        glib::Propagation::Proceed
     }
 
     /// While the hand tool is on, dragging pans the view. Offsets are captured
@@ -1149,7 +1405,13 @@ impl Viewer {
             let horizontal = viewer.ui.scroller.hadjustment().value();
             let vertical = viewer.ui.scroller.vadjustment().value();
             viewer.input.drag_origin.set((horizontal, vertical));
-            viewer.ui.scroller.set_cursor_from_name(Some("grabbing"));
+            // While a page is being dragged the hand owns the whole window, so no
+            // widget picked on the way can fall back to the arrow.
+            viewer.apply_hand_cursor(Some("grabbing"));
+            viewer
+                .ui
+                .window
+                .set_cursor(gdk::Cursor::from_name("grabbing", None).as_ref());
         });
 
         let weak = Rc::downgrade(viewer);
@@ -1178,8 +1440,9 @@ impl Viewer {
             let Some(viewer) = weak.upgrade() else {
                 return;
             };
+            viewer.ui.window.set_cursor(None::<&gdk::Cursor>);
             if viewer.input.hand_mode.get() {
-                viewer.ui.scroller.set_cursor_from_name(Some("grab"));
+                viewer.apply_hand_cursor(Some("grab"));
             }
         });
 
@@ -1322,6 +1585,9 @@ impl Viewer {
                 return glib::Propagation::Proceed;
             }
             if let Some(viewer) = weak.upgrade() {
+                if viewer.view.presentation.get() {
+                    return viewer.escape_pressed();
+                }
                 viewer.cancel_page_edit(index);
             }
             glib::Propagation::Stop
@@ -1444,6 +1710,7 @@ impl Viewer {
         let query = query.trim().to_string();
         let run = self.search.search_epoch.get().wrapping_add(1);
         self.search.search_epoch.set(run);
+        *self.search.search_query.borrow_mut() = query.clone();
 
         if query.is_empty() {
             self.search.search_hits.borrow_mut().clear();
@@ -1499,7 +1766,7 @@ impl Viewer {
                 let Some(page) = document.page(index) else {
                     continue;
                 };
-                let rects = page.find_text(&query);
+                let rects = crate::engine::search::find_page_matches(&page, &query);
                 if rects.is_empty() {
                     continue;
                 }
@@ -1508,13 +1775,7 @@ impl Viewer {
                 }
                 found.set(found.get() + rects.len());
                 pages_hit.borrow_mut().push(index as usize);
-                hits.borrow_mut().insert(
-                    index,
-                    rects
-                        .iter()
-                        .map(|rect| (rect.x1(), rect.y1(), rect.x2(), rect.y2()))
-                        .collect(),
-                );
+                hits.borrow_mut().insert(index, rects);
             }
 
             let done = scanned.get() >= total || found.get() >= SEARCH_HIT_LIMIT;
@@ -1547,6 +1808,15 @@ impl Viewer {
             }
             glib::ControlFlow::Break
         });
+    }
+
+    /// True when `text` is the query whose results are already loaded, so Enter
+    /// can move to the next match instead of starting the search again.
+    pub(crate) fn search_already_done(&self, text: &str) -> bool {
+        let text = text.trim();
+        !text.is_empty()
+            && *self.search.search_query.borrow() == text
+            && !self.search.search_hit_pages.borrow().is_empty()
     }
 
     pub(crate) fn update_search_status(&self) {
@@ -1891,47 +2161,255 @@ impl Viewer {
         Ok(out)
     }
 
-    pub(crate) fn export_page_png(self: &Rc<Self>) {
+    /// Asks for the format of the single-page export.
+    pub(crate) fn export_page(self: &Rc<Self>) {
         let index = self.current_page();
-        let name = format!("pagina-{}.png", index + 1);
-        Self::ask_save_path(self, "Exportar página", Some(name), move |viewer, path| {
-            match viewer.render_page_texture(index) {
-                Ok(texture) => {
-                    if let Err(error) = texture.save_to_png(path) {
-                        show_error(
-                            &viewer.ui.window,
-                            "No se pudo guardar la imagen.",
-                            &error.to_string(),
-                        );
-                    }
-                }
-                Err(message) => {
-                    show_error(&viewer.ui.window, "No se pudo renderizar la página.", &message)
-                }
+        let window = gtk::Window::builder()
+            .title("Exportar página")
+            .modal(true)
+            .transient_for(&self.ui.window)
+            .default_width(360)
+            .build();
+
+        let format = gtk::DropDown::from_strings(&["PDF", "PNG", "JPEG"]);
+        format.set_selected(0);
+        let hint = gtk::Label::new(Some(&format!(
+            "Página {} de {}.",
+            index + 1,
+            self.page_count()
+        )));
+        hint.set_xalign(0.0);
+        hint.add_css_class("dim-label");
+
+        let cancel = gtk::Button::with_label("Cancelar");
+        let accept = gtk::Button::with_label("Exportar");
+        accept.add_css_class("suggested-action");
+        let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        buttons.set_halign(gtk::Align::End);
+        buttons.append(&cancel);
+        buttons.append(&accept);
+
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        content.set_margin_top(14);
+        content.set_margin_bottom(14);
+        content.set_margin_start(14);
+        content.set_margin_end(14);
+        content.append(&gtk::Label::new(Some("Formato")));
+        content.append(&format);
+        content.append(&hint);
+        content.append(&buttons);
+
+        let window_ref = window.clone();
+        cancel.connect_clicked(move |_| Self::close_modal(&window_ref));
+
+        let weak = Rc::downgrade(self);
+        let format_ref = format.clone();
+        let window_ref = window.clone();
+        accept.connect_clicked(move |_| {
+            let choice = format_ref.selected();
+            Self::close_modal(&window_ref);
+            if let Some(viewer) = weak.upgrade() {
+                Self::after_modal(move || viewer.export_page_as(index, choice));
             }
         });
+
+        window.set_child(Some(&content));
+        window.set_default_widget(Some(&accept));
+        window.present();
     }
 
-    /// Saves one page as JPEG.
-    pub(crate) fn export_page_jpeg(self: &Rc<Self>) {
-        let index = self.current_page();
-        let name = format!("pagina-{}.jpg", index + 1);
-        Self::ask_save_path(self, "Exportar página como JPEG", Some(name), move |viewer, path| {
-            match viewer.render_page_texture(index) {
-                Ok(texture) => {
-                    if let Err(message) = save_texture_as_jpeg(&texture, path) {
-                        show_error(&viewer.ui.window, "No se pudo guardar la imagen.", &message);
+    /// Exports page `index` in the chosen format: 0 PDF, 1 PNG, 2 JPEG.
+    fn export_page_as(self: &Rc<Self>, index: usize, choice: u32) {
+        let number = index + 1;
+        match choice {
+            0 => Self::ask_save_path(
+                self,
+                "Exportar página como PDF",
+                Some(format!("pagina-{number}.pdf")),
+                move |viewer, path| {
+                    let saved = {
+                        let document = viewer.doc.document.borrow();
+                        match document.as_ref() {
+                            Some(document) => document
+                                .page(index as i32)
+                                .ok_or_else(|| "La página no existe.".to_string())
+                                .and_then(|page| save_page_as_pdf(&page, path)),
+                            None => Err("No hay ningún documento abierto.".to_string()),
+                        }
+                    };
+                    if let Err(message) = saved {
+                        show_error(&viewer.ui.window, "No se pudo exportar la página.", &message);
+                    }
+                },
+            ),
+            2 => Self::ask_save_path(
+                self,
+                "Exportar página como JPEG",
+                Some(format!("pagina-{number}.jpg")),
+                move |viewer, path| match viewer.render_page_texture(index) {
+                    Ok(texture) => {
+                        if let Err(message) = save_texture_as_jpeg(&texture, path) {
+                            show_error(&viewer.ui.window, "No se pudo guardar la imagen.", &message);
+                        }
+                    }
+                    Err(message) => show_error(
+                        &viewer.ui.window,
+                        "No se pudo renderizar la página.",
+                        &message,
+                    ),
+                },
+            ),
+            _ => Self::ask_save_path(
+                self,
+                "Exportar página como PNG",
+                Some(format!("pagina-{number}.png")),
+                move |viewer, path| match viewer.render_page_texture(index) {
+                    Ok(texture) => {
+                        if let Err(error) = texture.save_to_png(path) {
+                            show_error(
+                                &viewer.ui.window,
+                                "No se pudo guardar la imagen.",
+                                &error.to_string(),
+                            );
+                        }
+                    }
+                    Err(message) => show_error(
+                        &viewer.ui.window,
+                        "No se pudo renderizar la página.",
+                        &message,
+                    ),
+                },
+            ),
+        }
+    }
+
+    /// Asks which pages to export, then where.
+    pub(crate) fn export_pages(self: &Rc<Self>) {
+        let total = self.page_count();
+        if total == 0 {
+            show_error(&self.ui.window, "No hay ningún documento abierto.", "");
+            return;
+        }
+
+        let window = gtk::Window::builder()
+            .title("Exportar páginas")
+            .modal(true)
+            .transient_for(&self.ui.window)
+            .default_width(430)
+            .build();
+
+        let format = gtk::DropDown::from_strings(&["PDF", "PNG", "JPEG"]);
+        format.set_selected(0);
+        let entry = gtk::Entry::builder()
+            .text(format!("1-{total}"))
+            .placeholder_text("1-55")
+            .activates_default(true)
+            .build();
+        let hint = gtk::Label::new(Some(
+            "Números, rangos (1-55), pares, impares, última o todas; separá con comas.",
+        ));
+        hint.set_wrap(true);
+        hint.set_xalign(0.0);
+        hint.add_css_class("dim-label");
+        let error = gtk::Label::new(None);
+        error.set_wrap(true);
+        error.set_xalign(0.0);
+
+        let cancel = gtk::Button::with_label("Cancelar");
+        let accept = gtk::Button::with_label("Exportar");
+        accept.add_css_class("suggested-action");
+        let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        buttons.set_halign(gtk::Align::End);
+        buttons.append(&cancel);
+        buttons.append(&accept);
+
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        content.set_margin_top(14);
+        content.set_margin_bottom(14);
+        content.set_margin_start(14);
+        content.set_margin_end(14);
+        content.append(&gtk::Label::new(Some("Formato")));
+        content.append(&format);
+        content.append(&gtk::Label::new(Some("Páginas a exportar")));
+        content.append(&entry);
+        content.append(&hint);
+        content.append(&error);
+        content.append(&buttons);
+
+        let window_ref = window.clone();
+        cancel.connect_clicked(move |_| Self::close_modal(&window_ref));
+
+        let submit = Self::export_pages_submit(
+            window.clone(),
+            entry.clone(),
+            error.clone(),
+            format.clone(),
+            Rc::downgrade(self),
+            total,
+        );
+        accept.connect_clicked(move |_| submit());
+        let submit = Self::export_pages_submit(
+            window.clone(),
+            entry.clone(),
+            error.clone(),
+            format.clone(),
+            Rc::downgrade(self),
+            total,
+        );
+        entry.connect_activate(move |_| submit());
+
+        window.set_child(Some(&content));
+        window.set_default_widget(Some(&accept));
+        window.present();
+    }
+
+    /// Validates the written expression and closes the dialog only when it parses.
+    fn export_pages_submit(
+        window: gtk::Window,
+        entry: gtk::Entry,
+        error: gtk::Label,
+        format: gtk::DropDown,
+        weak: std::rc::Weak<Self>,
+        total: usize,
+    ) -> impl Fn() + 'static {
+        move || {
+            let expression = entry.text().to_string();
+            match crate::engine::page_range::parse_pages(&expression, total) {
+                Ok(pages) => {
+                    let format = match format.selected() {
+                        0 => ExportFormat::Pdf,
+                        2 => ExportFormat::Jpeg,
+                        _ => ExportFormat::Png,
+                    };
+                    Self::close_modal(&window);
+                    if let Some(viewer) = weak.upgrade() {
+                        Self::after_modal(move || viewer.choose_export_destination(pages, format));
                     }
                 }
-                Err(message) => {
-                    show_error(&viewer.ui.window, "No se pudo renderizar la página.", &message)
-                }
+                Err(message) => error.set_label(&message),
             }
-        });
+        }
     }
 
-    /// Exports every page as PNG into `dir`, at 100 % (device pixels).
-    pub(crate) fn export_all_pages(self: &Rc<Self>) {
+    /// Picks where the chosen pages go: one PDF file, or a folder of images.
+    pub(crate) fn choose_export_destination(self: &Rc<Self>, pages: Vec<usize>, format: ExportFormat) {
+        if format == ExportFormat::Pdf {
+            Self::ask_save_path(
+                self,
+                "Exportar páginas como PDF",
+                Some("paginas.pdf".to_string()),
+                move |viewer, path| {
+                    let viewer = Rc::clone(viewer);
+                    let destination = path.to_path_buf();
+                    let pages = pages.clone();
+                    Self::after_modal(move || {
+                        Self::export_pages_with_progress(&viewer, destination, pages, format);
+                    });
+                },
+            );
+            return;
+        }
+
         let dialog = gtk::FileDialog::builder()
             .title("Elegir carpeta de destino")
             .modal(true)
@@ -1961,17 +2439,28 @@ impl Viewer {
                     show_error(&viewer.ui.window, "La carpeta elegida no es local.", "");
                     return;
                 };
-                Self::export_pages_with_progress(&viewer, dir);
+                let pages = pages.clone();
+                Self::after_modal(move || {
+                    Self::export_pages_with_progress(&viewer, dir, pages, format);
+                });
             },
         );
     }
 
-    /// Exports page by page from an idle callback: the window stays responsive
-    /// and the progress bar advances, which matters for 666-page documents.
-    pub(crate) fn export_pages_with_progress(viewer: &Rc<Self>, dir: PathBuf) {
-        let total = viewer.page_count();
+    /// Exports the chosen pages one by one from an idle callback: the window
+    /// stays responsive and the progress bar advances on long selections.
+    ///
+    /// `destination` is the PDF file for [`ExportFormat::Pdf`] and the output
+    /// folder for the image formats.
+    pub(crate) fn export_pages_with_progress(
+        viewer: &Rc<Self>,
+        destination: PathBuf,
+        pages: Vec<usize>,
+        format: ExportFormat,
+    ) {
+        let total = pages.len();
         if total == 0 {
-            show_error(&viewer.ui.window, "No hay ningún documento abierto.", "");
+            show_error(&viewer.ui.window, "No hay páginas para exportar.", "");
             return;
         }
 
@@ -1991,7 +2480,7 @@ impl Viewer {
         content.set_margin_end(14);
         content.append(&gtk::Label::new(Some(&format!(
             "Exportando {total} páginas a {}",
-            dir.display()
+            destination.display()
         ))));
         content.append(&bar);
         window.set_child(Some(&content));
@@ -2001,37 +2490,73 @@ impl Viewer {
         let state = Cell::new(0usize);
         let window_ref = window.clone();
         let bar_ref = bar.clone();
+        let mut pdf: Option<PdfWriter> = None;
         glib::timeout_add_local(std::time::Duration::from_millis(1), move || {
-            let index = state.get();
-            if index >= total {
-                window_ref.close();
+            let position = state.get();
+            if position >= total {
+                Self::close_modal(&window_ref);
+                if let Some(writer) = pdf.take() {
+                    writer.finish();
+                }
                 viewer.notify(
                     "Exportación terminada",
-                    &format!("{total} páginas exportadas en {}", dir.display()),
+                    &format!("{total} páginas exportadas en {}", destination.display()),
                 );
                 return glib::ControlFlow::Break;
             }
 
-            let path = dir.join(format!("pagina-{:04}.png", index + 1));
-            let saved = viewer
-                .render_page_texture_at(index, 1.0)
-                .and_then(|texture| {
-                    texture
-                        .save_to_png(&path)
-                        .map_err(|error| format!("página {}: {error}", index + 1))
-                });
-
+            let saved =
+                Self::export_one_page(&viewer, pages[position], &destination, format, &mut pdf);
             if let Err(message) = saved {
-                window_ref.close();
+                Self::close_modal(&window_ref);
                 show_error(&viewer.ui.window, "No se pudo exportar las páginas.", &message);
                 return glib::ControlFlow::Break;
             }
 
-            state.set(index + 1);
-            bar_ref.set_fraction((index + 1) as f64 / total as f64);
-            bar_ref.set_text(Some(&format!("{}/{}", index + 1, total)));
+            state.set(position + 1);
+            bar_ref.set_fraction((position + 1) as f64 / total as f64);
+            bar_ref.set_text(Some(&format!("{}/{}", position + 1, total)));
             glib::ControlFlow::Continue
         });
+    }
+
+    /// Writes page `page` to `destination` in `format`; a PDF is accumulated in
+    /// `pdf` across calls so every requested page lands in the same file.
+    fn export_one_page(
+        viewer: &Rc<Self>,
+        page: usize,
+        destination: &Path,
+        format: ExportFormat,
+        pdf: &mut Option<PdfWriter>,
+    ) -> Result<(), String> {
+        if format == ExportFormat::Pdf {
+            let document = viewer.doc.document.borrow();
+            let Some(document) = document.as_ref() else {
+                return Err("No hay ningún documento abierto.".to_string());
+            };
+            let page = document
+                .page(page as i32)
+                .ok_or_else(|| format!("página {}: no existe", page + 1))?;
+            if pdf.is_none() {
+                *pdf = Some(PdfWriter::create(destination, page.size())?);
+            }
+            pdf.as_mut().expect("recién creado").add_page(&page)?;
+            return Ok(());
+        }
+
+        let target = destination.join(format!(
+            "pagina-{:04}.{}",
+            page + 1,
+            format.extension()
+        ));
+        let texture = viewer.render_page_texture_at(page, 1.0)?;
+        if format == ExportFormat::Jpeg {
+            save_texture_as_jpeg(&texture, &target)
+        } else {
+            texture
+                .save_to_png(&target)
+                .map_err(|error| error.to_string())
+        }
     }
 
     pub(crate) fn render_page_texture(&self, index: usize) -> Result<gdk::Texture, String> {
@@ -2117,24 +2642,46 @@ impl Viewer {
         }
     }
 
+    /// Adds `path` to the in-memory recent list. Nothing is persisted here: the
+    /// session, including the reading position, is written when the window
+    /// closes, so opening a document can never erase the page being restored.
     pub(crate) fn remember_recent(&self, path: &Path) {
-        {
-            let mut recent = self.doc.recent.borrow_mut();
-            recent.retain(|known| known != path);
-            recent.insert(0, path.to_path_buf());
-            recent.truncate(RECENT_LIMIT);
-        }
-        self.save_state();
+        let mut recent = self.doc.recent.borrow_mut();
+        recent.retain(|known| known != path);
+        recent.insert(0, path.to_path_buf());
+        recent.truncate(RECENT_LIMIT);
     }
 
     pub(crate) fn save_state(&self) {
         let session = Session {
             last: self.doc.current_path.borrow().clone(),
             page: self.current_page(),
-            zoom: self.view.zoom.get(),
+            // The destination: closing the window mid-transition must remember
+            // the step the reader asked for, not an intermediate scale.
+            zoom: self.zoom_target(),
             recent: self.doc.recent.borrow().clone(),
         };
         save_session(&session);
+    }
+
+    /// Applies the page and zoom saved for `path`, when `session` remembers that
+    /// document. On startup the viewport has no size yet, so the page jump is
+    /// deferred until the adjustment reports a real extent.
+    fn apply_saved_position(&self, session: &Session, path: &Path) {
+        let Some((page, zoom)) = saved_position_for(session, path) else {
+            return;
+        };
+        if let Err(message) = self.set_zoom_checked(zoom) {
+            eprintln!("[sesión] zoom no restaurado: {message}");
+        }
+        self.input.pending_restore.set(Some(page));
+        self.apply_pending_restore();
+    }
+
+    /// Same as [`Self::apply_saved_position`], reading the session from disk:
+    /// the password prompt opens the document outside `open_reporting`.
+    pub(crate) fn restore_saved_position(&self, path: &Path) {
+        self.apply_saved_position(&load_session(), path);
     }
 
     /// Applies a zoom coming from the session file, ignoring nonsense values.
@@ -2142,7 +2689,11 @@ impl Viewer {
         if !(ZOOM_STEPS[0]..=ZOOM_STEPS[ZOOM_STEPS.len() - 1]).contains(&zoom) {
             return Err(format!("zoom fuera de rango: {zoom}"));
         }
-        self.set_zoom(zoom);
+        // Restoring must show the saved scale at once, not animate to it; an
+        // unchanged zoom needs no relayout at all.
+        if (zoom - self.view.zoom.get()).abs() > f64::EPSILON {
+            self.apply_zoom(zoom);
+        }
         Ok(())
     }
 
@@ -2157,7 +2708,25 @@ impl Viewer {
             return false;
         }
         self.input.pending_restore.set(None);
-        self.jump_to_page(page);
+
+        // Changing the value from inside the adjustment's own `changed` signal
+        // leaves the scrolled window composing the previous position: the
+        // restored page holds a texture but paints blank until something
+        // scrolls again. The jump therefore runs on an idle, once the layout
+        // that announced the extent has finished.
+        let weak = self.me.borrow().clone();
+        glib::idle_add_local_once(move || {
+            let Some(viewer) = weak.upgrade() else {
+                return;
+            };
+            // The panel's own minimal scroll would override the centring below.
+            viewer.input.centering_thumbnails.set(true);
+            viewer.jump_to_page(page);
+            viewer.input.centering_thumbnails.set(false);
+            if !viewer.center_thumbnail(page) {
+                viewer.reveal_thumbnail(page);
+            }
+        });
         true
     }
 
@@ -2248,12 +2817,86 @@ impl Viewer {
         let document = self.doc.document.borrow();
         let document = document.as_ref()?;
         let page = document.page(index as i32)?;
-        let (width, height) = oriented_size(page.size(), 0);
-        if width <= 0.0 || height <= 0.0 {
+        thumbnail_dimensions(page.size())
+    }
+
+    /// Brings the thumbnail panel so `index` sits in the vertical middle.
+    ///
+    /// Used when a session is restored: landing on the right page with the panel
+    /// at the top hides which page is selected. The row geometry is measured
+    /// from the rows the list already laid out, so theme margins and the
+    /// interface scale are honoured instead of guessed.
+    pub(crate) fn center_thumbnail(&self, index: usize) -> bool {
+        let Some((first_row_top, chrome)) = self.thumbnail_row_geometry() else {
+            return false;
+        };
+        let sizes = self.doc.page_sizes.borrow();
+        if index >= sizes.len() {
+            return false;
+        }
+        let heights: Option<Vec<f64>> = sizes
+            .iter()
+            .map(|size| thumbnail_dimensions(*size).map(|(_, height)| f64::from(height)))
+            .collect();
+        let Some(heights) = heights else {
+            return false;
+        };
+
+        let adjustment = self.ui.sidebar.vadjustment();
+        let before: f64 = heights[..index]
+            .iter()
+            .map(|height| height + chrome)
+            .sum::<f64>()
+            + first_row_top;
+        let middle = before + (heights[index] + chrome) / 2.0;
+        let maximum = (adjustment.upper() - adjustment.page_size()).max(0.0);
+        adjustment.set_value((middle - adjustment.page_size() / 2.0).clamp(0.0, maximum));
+        true
+    }
+
+    /// Where the list puts its first row and how much every row adds on top of
+    /// its bitmap. Both are theme- and scale-dependent, so they are read from
+    /// the laid-out rows; that only works while the list is still at the top,
+    /// which is exactly the state a fresh session starts in.
+    fn thumbnail_row_geometry(&self) -> Option<(f64, f64)> {
+        let adjustment = self.ui.sidebar.vadjustment();
+        if adjustment.upper() <= adjustment.page_size() + 0.5 || adjustment.value() > 0.5 {
             return None;
         }
-        let scale = f64::from(THUMB_WIDTH) / width;
-        Some((THUMB_WIDTH, (height * scale).round().max(1.0) as i32))
+        let rows = self.laid_out_thumbnail_rows();
+        let (&first, rest) = rows.split_first()?;
+        if first.0 != 0 {
+            return None;
+        }
+        let bitmap = f64::from(thumbnail_dimensions(*self.doc.page_sizes.borrow().get(first.0)?)?.1);
+        // Two rows give the full row pitch, margins included; with only one row
+        // its own height is the best available measurement.
+        let pitch = match rest.first() {
+            Some(next) if next.0 == first.0 + 1 => next.1 - first.1,
+            _ => first.2,
+        };
+        Some((first.1, (pitch - bitmap).max(0.0)))
+    }
+
+    /// Page index of the first rows the thumbnail list has laid out, with their
+    /// position and height in the list's coordinates.
+    fn laid_out_thumbnail_rows(&self) -> Vec<(usize, f64, f64)> {
+        let mut rows = Vec::new();
+        let mut child = self.ui.thumbs_view.first_child();
+        while let Some(row) = child {
+            child = row.next_sibling();
+            let Some(index) = thumbnail_row_page(&row) else {
+                continue;
+            };
+            let Some(bounds) = row.compute_bounds(&self.ui.thumbs_view) else {
+                continue;
+            };
+            rows.push((index, f64::from(bounds.y()), f64::from(bounds.height())));
+            if rows.len() == 2 {
+                break;
+            }
+        }
+        rows
     }
 
     /// Paints a page thumbnail directly into the row's cairo context.
@@ -2295,10 +2938,27 @@ impl Viewer {
     }
 
     pub(crate) fn toggle_sidebar(&self) {
-        self.ui.sidebar.set_visible(!self.ui.sidebar.is_visible());
+        let visible = !self.ui.sidebar.is_visible();
+        self.ui.sidebar.set_visible(visible);
+        if visible {
+            // A hidden list does not move; bring the current page into view so
+            // showing the panel does not start again at the first thumbnail.
+            self.reveal_thumbnail(self.current_page());
+        }
         // The viewport width is only known after the next layout pass, so the
         // refit is deferred to the horizontal adjustment change below.
         self.input.refit_pending.set(true);
+    }
+
+    /// Brings `index` into view in the thumbnail panel. The request is applied
+    /// on the next layout, so it also works while the panel is still hidden.
+    pub(crate) fn reveal_thumbnail(&self, index: usize) {
+        if self.input.centering_thumbnails.get() {
+            return;
+        }
+        self.ui
+            .thumbs_view
+            .scroll_to(index as u32, gtk::ListScrollFlags::NONE, None);
     }
 
     /// Rebuilds the thumbnail model for the current document. Only called when
@@ -2804,9 +3464,14 @@ impl Viewer {
 
         let index = index.min(total - 1);
         self.nav.current.set(index);
-        self.input.thumb_sync.set(true);
-        self.ui.thumbs_selection.set_selected(index as u32);
-        self.input.thumb_sync.set(false);
+        if self.ui.thumbs_selection.selected() != index as u32 {
+            self.input.thumb_sync.set(true);
+            self.ui.thumbs_selection.set_selected(index as u32);
+            self.input.thumb_sync.set(false);
+            // Selecting in the model does not move the list, so the row of the
+            // current page would stay out of sight, leaving the panel at the top.
+            self.reveal_thumbnail(index);
+        }
 
         for nav in &self.ui.navs {
             // Never clobber what the reader is typing.
@@ -2823,6 +3488,24 @@ impl Viewer {
     pub(crate) fn device_scale(&self) -> f64 {
         f64::from(self.ui.window.scale_factor().max(1))
     }
+}
+
+/// Logical size of a thumbnail for a page of `size` points.
+fn thumbnail_dimensions(size: (f64, f64)) -> Option<(i32, i32)> {
+    let (width, height) = size;
+    if width <= 0.0 || height <= 0.0 {
+        return None;
+    }
+    let scale = f64::from(THUMB_WIDTH) / width;
+    Some((THUMB_WIDTH, (height * scale).round().max(1.0) as i32))
+}
+
+/// Page index a thumbnail row shows, read back from the number label the bind
+/// step writes into that row.
+fn thumbnail_row_page(row: &gtk::Widget) -> Option<usize> {
+    let canvas = row.first_child()?.first_child()?;
+    let number = canvas.next_sibling()?.downcast::<gtk::Label>().ok()?.text();
+    number.parse::<usize>().ok()?.checked_sub(1)
 }
 
 /// Renders one page at `pixel_scale` device pixels per point.

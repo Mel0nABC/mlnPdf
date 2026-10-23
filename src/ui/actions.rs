@@ -41,7 +41,7 @@ pub const SHORTCUTS: [(&str, &str); 31] = [
 ];
 
 /// Human-readable shortcut list shown by Help > Atajos de teclado.
-pub const SHORTCUT_HELP: [(&str, &str); 19] = [
+pub const SHORTCUT_HELP: [(&str, &str); 20] = [
     ("Ctrl+O", "Abrir un PDF"),
     ("Ctrl+P", "Imprimir"),
     ("Ctrl+F", "Buscar en el documento"),
@@ -61,6 +61,7 @@ pub const SHORTCUT_HELP: [(&str, &str); 19] = [
     ("Ctrl+Inicio / Fin", "Primera / última página"),
     ("Alt+← / →", "Historial atrás / adelante"),
     ("Espacio + arrastrar", "Herramienta mano"),
+    ("Esc", "Salir de presentación o del modo mano; limpia la búsqueda"),
 ];
 
 /// Classic menu bar. Only File > Abrir is wired for now; the rest are empty
@@ -109,8 +110,7 @@ pub fn build_menu_bar() -> gtk::PopoverMenuBar {
     tools_menu.append(Some("Propiedades"), Some("win.properties"));
     tools_menu.append(Some("Exportar texto…"), Some("win.export-text"));
     tools_menu.append(Some("Exportar página…"), Some("win.export-page"));
-    tools_menu.append(Some("Exportar página como JPEG…"), Some("win.export-page-jpeg"));
-    tools_menu.append(Some("Exportar todas las páginas…"), Some("win.export-pages"));
+    tools_menu.append(Some("Exportar páginas…"), Some("win.export-pages"));
     model.append_submenu(Some("Tools"), &tools_menu);
 
     let settings_menu = gio::Menu::new();

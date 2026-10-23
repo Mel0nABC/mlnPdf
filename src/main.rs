@@ -218,15 +218,31 @@ trailer\n<< /Root 1 0 R /Size 5 >>\n%%EOF\n";
 
         gtk::prelude::WidgetExt::activate_action(&viewer.ui.window, "win.zoom-in", None)
             .expect("zoom-in action must run");
+        // The zoom is animated: the counter announces the destination at once and
+        // the geometry follows frame by frame, so the size needs the loop to run.
         assert_eq!(viewer.ui.zoom_label.label(), "150 %");
-        assert_eq!(size_request_at(&viewer.ui.pages, 0), (300, 150));
+        pump_until(|| size_request_at(&viewer.ui.pages, 0) == (300, 150));
 
         // Ctrl+scroll feeds the same steps through the accumulator.
         viewer.zoom_by_scroll(1.0);
         assert_eq!(viewer.ui.zoom_label.label(), "100 %");
-        assert_eq!(size_request_at(&viewer.ui.pages, 0), (200, 100));
+        pump_until(|| size_request_at(&viewer.ui.pages, 0) == (200, 100));
 
         std::fs::remove_file(&path).ok();
+    }
+
+    /// Runs the main loop until `done` holds, so an animated change can settle.
+    fn pump_until(mut done: impl FnMut() -> bool) {
+        let context = gtk::glib::MainContext::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !done() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the animation never reached its destination"
+            );
+            context.iteration(false);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 
     fn size_request_at(pages: &gtk::Box, index: i32) -> (i32, i32) {
