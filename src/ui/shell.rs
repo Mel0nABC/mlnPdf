@@ -33,6 +33,16 @@ const SEARCH_HIT_LIMIT: usize = 300;
 /// How much of the paper size the preview shows, in logical pixels per point.
 const PREVIEW_SCALE: f64 = 0.9;
 
+/// Trace of the print flow, off unless `MLNPDF_DEBUG` is set in the environment.
+///
+/// The dialog's preview goes through GTK internals that cannot be reached from a
+/// test, so the only way to see which path ran is to look at these lines.
+pub(crate) fn print_debug(message: &str) {
+    if std::env::var_os("MLNPDF_DEBUG").is_some() {
+        eprintln!("[imprimir] {message}");
+    }
+}
+
 /// Carries the settings and the page setup a previous dialog round produced, so
 /// the dialog that comes back after a preview keeps what the reader chose.
 fn apply_print_settings(
@@ -2824,7 +2834,8 @@ impl Viewer {
         let mut settings: Option<gtk::PrintSettings> = None;
         let mut setup: Option<gtk::PageSetup> = None;
 
-        for _ in 0..MAX_ROUNDS {
+        for round in 1..=MAX_ROUNDS {
+            print_debug(&format!("ronda {round} de {MAX_ROUNDS}"));
             let operation = build(settings.as_ref(), setup.as_ref());
             let previewed = Self::install_print_preview(self, &operation);
             let result = operation.run(
@@ -2837,6 +2848,10 @@ impl Viewer {
             settings = operation.print_settings();
             setup = Some(operation.default_page_setup());
 
+            print_debug(&format!(
+                "run devolvió {result:?}, preview atendida: {}",
+                previewed.get()
+            ));
             match result {
                 Ok(_) if previewed.get() => continue,
                 Ok(_) => return,
@@ -2860,6 +2875,7 @@ impl Viewer {
         let parent = self.ui.window.clone();
 
         operation.connect_preview(move |_, preview, context, _dialog| {
+            print_debug("señal preview: se abre la vista previa de la app");
             flag.set(true);
             let (window, area) =
                 Viewer::print_preview_window(preview, context, parent.upcast_ref(), pages);
@@ -2868,13 +2884,17 @@ impl Viewer {
             // to wait for that, so the window redraws when the signal arrives.
             {
                 let area = area.clone();
-                preview.connect_ready(move |_, _| area.queue_draw());
+                preview.connect_ready(move |_, _| {
+                    print_debug("ready: GTK lista para dibujar páginas");
+                    area.queue_draw();
+                });
             }
             {
                 let preview = preview.clone();
                 window.connect_close_request(move |_| {
                     // Ending the preview is what lets run() return, and with it
                     // the print dialog come back.
+                    print_debug("cierre de la vista previa: end_preview");
                     preview.end_preview();
                     glib::Propagation::Proceed
                 });
