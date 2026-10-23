@@ -316,8 +316,9 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
             dialog.close();
         }
 
-        // Underline: a selection can be marked from the dialog button, and with
-        // the tool armed the next drag marks it without asking again.
+        // Subrayar y resaltar: al pulsar la herramienta se abre el selector de
+        // color de GTK; si ya había texto seleccionado se marca en el acto y, si
+        // no, la herramienta queda armada para el siguiente arrastre.
         let text_path = dir.join("text-page-ui.pdf");
         std::fs::write(&text_path, TEXT_PAGE_PDF).expect("write scratch text PDF");
         viewer.open(&text_path).expect("open the text page");
@@ -325,75 +326,64 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
             viewer.ui.tools[0].button.is_sensitive(),
             "con un documento abierto la herramienta está disponible"
         );
-        assert!(
-            viewer.ui.tools[0].popover.child().is_some(),
-            "el botón abre un diálogo con sus opciones"
-        );
-        let chosen = viewer.ui.tools[0].color_button.rgba();
-        assert!(
-            (f64::from(chosen.red()) - UNDERLINE_COLOR.0).abs() < 0.01
-                && (f64::from(chosen.green()) - UNDERLINE_COLOR.1).abs() < 0.01,
-            "el selector de color de GTK arranca con el color por omisión"
-        );
+        for (index, title) in [(0, "Color del subrayado"), (1, "Color del resaltado")] {
+            assert_eq!(
+                viewer.ui.tools[index].dialog.title(),
+                title,
+                "cada herramienta abre el selector de color de GTK"
+            );
+            assert!(
+                viewer.ui.tools[index].dialog.is_modal(),
+                "el selector de color se abre como diálogo modal"
+            );
+        }
 
+        // Con texto ya seleccionado: al cerrar el color, la marca está hecha.
         viewer.begin_selection(0, 20.0, 10.0);
         viewer.update_selection(0, 180.0, 35.0);
         viewer.finish_selection();
-        viewer.refresh_mark_actions(MarkKind::Underline);
         assert!(
-            viewer.ui.tools[0].apply.is_sensitive(),
-            "con texto seleccionado el botón del diálogo se habilita"
+            viewer.sel.selection.borrow().is_some(),
+            "hay texto seleccionado antes de pulsar la herramienta"
         );
-        assert!(
-            viewer.apply_mark(MarkKind::Underline),
-            "la selección se subraya al instante"
-        );
-        assert_eq!(viewer.annot.marks.borrow().len(), 1, "un subrayado");
-        assert!(
-            viewer.has_pending_marks(),
-            "el subrayado queda pendiente de guardar"
-        );
+        viewer.accept_mark_color(MarkKind::Underline, (0.15, 0.45, 0.85));
         assert_eq!(
-            viewer.annot.marks.borrow()[0].color,
-            [UNDERLINE_COLOR.0, UNDERLINE_COLOR.1, UNDERLINE_COLOR.2],
-            "el subrayado toma el color elegido"
+            viewer.annot.marks.borrow().len(),
+            1,
+            "con texto seleccionado se subraya sin pedir otro gesto"
         );
+        let first = viewer.annot.marks.borrow()[0].clone();
+        assert_eq!(first.kind, MarkKind::Underline);
+        assert_eq!(first.color, [0.15, 0.45, 0.85], "con el color elegido");
         assert!(
             viewer.sel.selection.borrow().is_none(),
-            "la selección se limpia para no tapar el subrayado"
+            "la selección se limpia para no tapar el marcado"
         );
-
-        gtk::prelude::WidgetExt::activate_action(&viewer.ui.window, "win.underline", None)
-            .expect("la acción de subrayar tiene que existir");
-        assert!(viewer.mark_tool(MarkKind::Underline).active, "la herramienta queda armada");
-        pump_until(|| viewer.ui.tools[0].popover.is_visible());
-
-        // El diálogo de color de GTK es otra ventana: al abrirlo, el popover se
-        // cierra por el foco. Eso no puede apagar la herramienta, y el diálogo no
-        // tiene por qué reabrirse: se elige el color y se sigue con el arrastre.
-        viewer.ui.tools[0].popover.popdown();
-        viewer.ui.tools[0].color_button.set_rgba(&gtk::gdk::RGBA::new(0.15, 0.45, 0.85, 1.0));
         assert!(
             viewer.mark_tool(MarkKind::Underline).active,
-            "elegir el color no apaga la herramienta"
-        );
-        let chosen_color = viewer.mark_tool(MarkKind::Underline).color;
-        assert!(
-            chosen_color.0 < 0.5 && chosen_color.2 > 0.5,
-            "el color elegido queda guardado para el próximo subrayado"
+            "la herramienta queda armada para seguir marcando"
         );
 
+        // Sin selección: la herramienta espera al arrastre y usa el mismo color.
+        viewer.set_mark_mode(MarkKind::Underline, false);
         viewer.begin_selection(0, 20.0, 155.0);
         viewer.update_selection(0, 160.0, 40.0);
         viewer.finish_selection();
-        assert!(
-            viewer.annot.marks.borrow()[1].color[2] > 0.5,
-            "el subrayado se crea con el color elegido"
+        assert_eq!(
+            viewer.annot.marks.borrow().len(),
+            1,
+            "sin herramienta armada el arrastre solo selecciona"
         );
+        viewer.accept_mark_color(MarkKind::Underline, (0.15, 0.45, 0.85));
         assert_eq!(
             viewer.annot.marks.borrow().len(),
             2,
-            "con la herramienta armada el arrastre subraya solo"
+            "el color sobre la selección pendiente la marca en el acto"
+        );
+        assert_eq!(
+            viewer.annot.marks.borrow()[1].color,
+            [0.15, 0.45, 0.85],
+            "el subrayado se crea con el color elegido"
         );
         assert!(
             viewer.escape_pressed() == gtk::glib::Propagation::Stop
@@ -401,24 +391,18 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
             "Esc sale del modo subrayar"
         );
 
-        // Resaltar: mismo gesto que subrayar, con fondo translúcido. Armar una
-        // herramienta apaga la otra y el color es independiente.
+        // Resaltar: mismo gesto, con fondo translúcido y su propio color. Armar
+        // una herramienta apaga la otra.
         gtk::prelude::WidgetExt::activate_action(&viewer.ui.window, "win.highlight", None)
             .expect("la acción de resaltar tiene que existir");
         assert!(
             viewer.mark_tool(MarkKind::Highlight).active,
-            "la herramienta de resaltar queda armada"
+            "la acción de resaltar arma la herramienta"
         );
         assert!(
             !viewer.mark_tool(MarkKind::Underline).active,
             "subrayar y resaltar no pueden estar armadas a la vez"
         );
-        pump_until(|| viewer.ui.tools[1].popover.is_visible());
-        assert!(
-            viewer.ui.tools[1].popover.child().is_some(),
-            "el resaltado también abre su diálogo con el selector de color"
-        );
-
         viewer.begin_selection(0, 20.0, 60.0);
         viewer.update_selection(0, 120.0, 20.0);
         viewer.finish_selection();
@@ -428,32 +412,32 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
             "con la herramienta de resaltar el arrastre marca solo"
         );
         let highlight = viewer.annot.marks.borrow()[2].clone();
-        assert_eq!(highlight.kind, MarkKind::Highlight, "el marcado es un resaltado");
+        assert_eq!(
+            highlight.kind,
+            MarkKind::Highlight,
+            "el marcado es un resaltado"
+        );
         assert_eq!(
             highlight.color,
             [HIGHLIGHT_COLOR.0, HIGHLIGHT_COLOR.1, HIGHLIGHT_COLOR.2],
             "el resaltado arranca con su propio color"
         );
         assert!(
-            viewer.mark_tool(MarkKind::Underline).color != viewer.mark_tool(MarkKind::Highlight).color,
+            viewer.mark_tool(MarkKind::Underline).color
+                != viewer.mark_tool(MarkKind::Highlight).color,
             "cada herramienta recuerda su color"
         );
 
-        // Resaltar también se aplica a una selección ya hecha, como subrayar.
+        // Resaltar una selección ya hecha, sin arrastrar de nuevo.
         viewer.set_mark_mode(MarkKind::Highlight, false);
         viewer.begin_selection(0, 20.0, 155.0);
         viewer.update_selection(0, 160.0, 40.0);
-        viewer.refresh_mark_actions(MarkKind::Highlight);
-        assert!(
-            viewer.ui.tools[1].apply.is_sensitive(),
-            "con texto seleccionado el botón de resaltar se habilita"
-        );
-        assert!(
-            viewer.apply_mark(MarkKind::Highlight),
-            "el resaltado se aplica al instante sobre la selección"
-        );
+        viewer.finish_selection();
+        viewer.accept_mark_color(MarkKind::Highlight, (1.0, 0.5, 0.0));
         assert_eq!(viewer.annot.marks.borrow().len(), 4);
         assert_eq!(viewer.annot.marks.borrow()[3].kind, MarkKind::Highlight);
+        assert_eq!(viewer.annot.marks.borrow()[3].color, [1.0, 0.5, 0.0]);
+        viewer.set_mark_mode(MarkKind::Highlight, false);
 
         // Guardar: los marcados entran en el archivo abierto y dejan de estar
         // pendientes. Descartar tira sólo lo que todavía no se escribió.
@@ -475,7 +459,6 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
         viewer.begin_selection(0, 20.0, 10.0);
         viewer.update_selection(0, 180.0, 35.0);
         viewer.finish_selection();
-        viewer.refresh_mark_actions(MarkKind::Underline);
         assert!(viewer.apply_mark(MarkKind::Underline), "otro subrayado");
         assert!(viewer.has_pending_marks());
         viewer.discard_marks();
@@ -505,7 +488,6 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
         viewer.begin_selection(0, 20.0, 10.0);
         viewer.update_selection(0, 180.0, 35.0);
         viewer.finish_selection();
-        viewer.refresh_mark_actions(MarkKind::Underline);
         assert!(viewer.apply_mark(MarkKind::Underline), "un marcado pendiente");
 
         let ran = std::rc::Rc::new(std::cell::Cell::new(0));
@@ -533,7 +515,6 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
         viewer.begin_selection(0, 20.0, 155.0);
         viewer.update_selection(0, 160.0, 40.0);
         viewer.finish_selection();
-        viewer.refresh_mark_actions(MarkKind::Underline);
         assert!(viewer.apply_mark(MarkKind::Underline), "un pendiente más");
 
         let ran = std::rc::Rc::new(std::cell::Cell::new(0));
@@ -560,7 +541,6 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
         viewer.begin_selection(0, 20.0, 10.0);
         viewer.update_selection(0, 180.0, 35.0);
         viewer.finish_selection();
-        viewer.refresh_mark_actions(MarkKind::Underline);
         assert!(viewer.apply_mark(MarkKind::Underline), "un marcado más");
         let copy = dir.join("copy-ui.pdf");
         std::fs::remove_file(&copy).ok();

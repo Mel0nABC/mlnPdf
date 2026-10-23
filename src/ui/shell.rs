@@ -112,14 +112,11 @@ pub(crate) struct UiHandles {
     pub(crate)     tools: [MarkToolUi; 2],
 }
 
-/// Widgets de una herramienta de marcado.
+/// Widgets de una herramienta de marcado: el botón y el selector de color de
+/// GTK que se abre al pulsarlo.
 pub(crate) struct MarkToolUi {
     pub(crate) button: gtk::ToggleButton,
-    pub(crate) popover: gtk::Popover,
-    pub(crate) apply: gtk::Button,
-    /// Sólo lo leen las pruebas: la elección se guarda en `AnnotationState`.
-    #[allow(dead_code)]
-    pub(crate) color_button: gtk::ColorDialogButton,
+    pub(crate) dialog: gtk::ColorDialog,
 }
 
 /// The open document and everything derived from it.
@@ -506,37 +503,17 @@ impl Viewer {
         for kind in [MarkKind::Underline, MarkKind::Highlight] {
             let ui = &viewer.ui.tools[kind.index()];
 
+            // `clicked` y no `toggled`: al pulsar la herramienta se abre el
+            // selector de color, y los cambios de estado que hace el visor por
+            // su cuenta (Esc, modo mano, la otra herramienta) no lo abren.
             let weak = Rc::downgrade(&viewer);
-            ui.button.connect_toggled(move |button| {
+            ui.button.connect_clicked(move |button| {
                 if let Some(viewer) = weak.upgrade() {
-                    viewer.set_mark_mode(kind, button.is_active());
-                }
-            });
-
-            // The apply button only works with a live selection, and the
-            // selection may have changed while the popover was closed.
-            let weak = Rc::downgrade(&viewer);
-            ui.popover.connect_map(move |_| {
-                if let Some(viewer) = weak.upgrade() {
-                    viewer.refresh_mark_actions(kind);
-                }
-            });
-
-            Self::connect_click(&viewer, &ui.apply, move |viewer| {
-                viewer.apply_mark(kind);
-            });
-
-            // Elegir el color no reabre el diálogo ni apaga la herramienta: el
-            // diálogo de color es otra ventana de GTK y el popover se cierra al
-            // cambiar el foco, que es lo esperado.
-            let weak = Rc::downgrade(&viewer);
-            ui.color_button.connect_rgba_notify(move |button| {
-                if let Some(viewer) = weak.upgrade() {
-                    let rgba = button.rgba();
-                    viewer.set_mark_color(
-                        kind,
-                        (rgba.red().into(), rgba.green().into(), rgba.blue().into()),
-                    );
+                    if button.is_active() {
+                        viewer.start_mark_tool(kind);
+                    } else {
+                        viewer.set_mark_mode(kind, false);
+                    }
                 }
             });
         }
@@ -1575,13 +1552,8 @@ impl Viewer {
         self.set_mark_tool(kind, tool);
     }
 
-    /// Guarda el color elegido en el selector de GTK para la próxima marca.
-    pub(crate) fn set_mark_color(&self, kind: MarkKind, color: (f64, f64, f64)) {
-        self.keep_color(kind, color);
-    }
-
-    /// Arms or disarms one marking tool and keeps the button, the dialog and the
-    /// cursor telling the same story.
+    /// Arma o desarma una herramienta de marcado: el botón, el cursor y el
+    /// estado tienen que contar lo mismo.
     pub(crate) fn set_mark_mode(&self, kind: MarkKind, active: bool) {
         let active = active && self.doc.document.borrow().is_some();
         if active {
@@ -1602,24 +1574,63 @@ impl Viewer {
         if ui.button.is_active() != active {
             ui.button.set_active(active);
         }
-        if active {
-            self.refresh_mark_actions(kind);
-            ui.popover.popup();
-        } else {
-            ui.popover.popdown();
-        }
         self.refresh_page_cursor();
     }
 
-    pub(crate) fn toggle_mark_mode(&self, kind: MarkKind) {
-        self.set_mark_mode(kind, !self.mark_tool(kind).active);
+    /// Arma la herramienta y abre el selector de color de GTK.
+    pub(crate) fn start_mark_tool(self: &Rc<Self>, kind: MarkKind) {
+        self.set_mark_mode(kind, true);
+        if self.mark_tool(kind).active {
+            self.choose_mark_color(kind);
+        }
     }
 
-    /// The apply button only makes sense with text selected.
-    pub(crate) fn refresh_mark_actions(&self, kind: MarkKind) {
-        let ready = self.sel.selection.borrow().is_some()
-            && !self.sel.selection_rects.borrow().is_empty();
-        self.ui.tools[kind.index()].apply.set_sensitive(ready);
+    /// Atajo y menú: el mismo camino que el botón.
+    pub(crate) fn toggle_mark_mode(self: &Rc<Self>, kind: MarkKind) {
+        if self.mark_tool(kind).active {
+            self.set_mark_mode(kind, false);
+        } else {
+            self.start_mark_tool(kind);
+        }
+    }
+
+    /// Abre el selector de color del sistema con el color que ya tiene la
+    /// herramienta como punto de partida.
+    pub(crate) fn choose_mark_color(self: &Rc<Self>, kind: MarkKind) {
+        let dialog = self.ui.tools[kind.index()].dialog.clone();
+        let color = self.mark_tool(kind).color;
+        let initial = gdk::RGBA::new(color.0 as f32, color.1 as f32, color.2 as f32, 1.0);
+
+        let weak = Rc::downgrade(self);
+        dialog.choose_rgba(
+            Some(&self.ui.window),
+            Some(&initial),
+            None::<&gio::Cancellable>,
+            move |result| {
+                let Some(viewer) = weak.upgrade() else {
+                    return;
+                };
+                match result {
+                    Ok(rgba) => viewer.accept_mark_color(
+                        kind,
+                        (rgba.red().into(), rgba.green().into(), rgba.blue().into()),
+                    ),
+                    // Cancelar el color cancela la herramienta.
+                    Err(_) => viewer.set_mark_mode(kind, false),
+                }
+            },
+        );
+    }
+
+    /// Cierra la elección de color: la guarda y, si ya había texto
+    /// seleccionado, marca en el acto. La herramienta queda armada para el
+    /// siguiente arrastre.
+    pub(crate) fn accept_mark_color(&self, kind: MarkKind, color: (f64, f64, f64)) {
+        self.keep_color(kind, color);
+        self.set_mark_mode(kind, true);
+        if self.sel.selection.borrow().is_some() && !self.sel.selection_rects.borrow().is_empty() {
+            self.apply_mark(kind);
+        }
     }
 
     /// Marca lo que esté seleccionado en este momento. Devuelve `false` cuando
@@ -1644,9 +1655,6 @@ impl Viewer {
         *self.sel.selection.borrow_mut() = None;
         self.sel.selection_rects.borrow_mut().clear();
         self.queue_page_draw(selection.page);
-        for kind in [MarkKind::Underline, MarkKind::Highlight] {
-            self.refresh_mark_actions(kind);
-        }
         true
     }
 
@@ -2679,15 +2687,8 @@ impl Viewer {
         self.queue_page_draw(selection.page);
 
         // Con una herramienta armada, el arrastre termina en un marcado.
-        match self.active_mark_tool() {
-            Some(kind) => {
-                self.apply_mark(kind);
-            }
-            None => {
-                for kind in [MarkKind::Underline, MarkKind::Highlight] {
-                    self.refresh_mark_actions(kind);
-                }
-            }
+        if let Some(kind) = self.active_mark_tool() {
+            self.apply_mark(kind);
         }
     }
 
@@ -4347,11 +4348,8 @@ fn thumbnail_row_page(row: &gtk::Widget) -> Option<usize> {
 struct MarkToolSpec {
     glyph_markup: &'static str,
     tooltip: &'static str,
-    title: &'static str,
-    apply_label: &'static str,
     accessible: &'static str,
     color_title: &'static str,
-    default_color: (f64, f64, f64),
 }
 
 fn mark_spec(kind: MarkKind) -> MarkToolSpec {
@@ -4360,26 +4358,20 @@ fn mark_spec(kind: MarkKind) -> MarkToolSpec {
             // Una "U" subrayada: Adwaita no trae glifo de subrayado.
             glyph_markup: "<u>U</u>",
             tooltip: "Subrayar (Ctrl+U)",
-            title: "Subrayar",
-            apply_label: "Subrayar la selección",
             accessible: "Subrayar el texto seleccionado",
             color_title: "Color del subrayado",
-            default_color: UNDERLINE_COLOR,
         },
         MarkKind::Highlight => MarkToolSpec {
             // Una "A" con fondo de rotulador.
             glyph_markup: "<span background=\"#FFE082\">A</span>",
             tooltip: "Resaltar (Ctrl+Shift+U)",
-            title: "Resaltar",
-            apply_label: "Resaltar la selección",
             accessible: "Resaltar el texto seleccionado",
             color_title: "Color del resaltado",
-            default_color: HIGHLIGHT_COLOR,
         },
     }
 }
 
-/// Botón, diálogo y selector de color de una herramienta de marcado.
+/// Botón y selector de color de una herramienta de marcado.
 fn build_mark_tool(spec: &MarkToolSpec) -> MarkToolUi {
     let glyph = gtk::Label::new(None);
     glyph.set_markup(spec.glyph_markup);
@@ -4390,62 +4382,14 @@ fn build_mark_tool(spec: &MarkToolSpec) -> MarkToolUi {
         .build();
     accessible_label(&button, spec.accessible);
 
-    let color_button = gtk::ColorDialogButton::new(Some(
-        gtk::ColorDialog::builder()
-            .title(spec.color_title)
-            .with_alpha(false)
-            .build(),
-    ));
-    color_button.set_rgba(&gdk::RGBA::new(
-        spec.default_color.0 as f32,
-        spec.default_color.1 as f32,
-        spec.default_color.2 as f32,
-        1.0,
-    ));
-    color_button.set_tooltip_text(Some(spec.color_title));
-    accessible_label(&color_button, spec.color_title);
+    // El selector de color de GTK, el mismo que ofrece el sistema.
+    let dialog = gtk::ColorDialog::builder()
+        .title(spec.color_title)
+        .with_alpha(false)
+        .modal(true)
+        .build();
 
-    let apply = gtk::Button::with_label(spec.apply_label);
-    apply.add_css_class("suggested-action");
-    apply.set_sensitive(false);
-    accessible_label(&apply, spec.accessible);
-
-    let title = gtk::Label::new(None);
-    title.set_markup(&format!("<b>{}</b>", spec.title));
-    title.set_xalign(0.0);
-    let hint = gtk::Label::new(Some(
-        "Elegí el color y arrastrá sobre el texto. Esc sale del modo.",
-    ));
-    hint.add_css_class("dim-label");
-    hint.set_wrap(true);
-    hint.set_max_width_chars(28);
-    hint.set_xalign(0.0);
-
-    let color_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    color_row.append(&gtk::Label::new(Some("Color")));
-    color_row.append(&color_button);
-
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    content.set_margin_top(10);
-    content.set_margin_bottom(10);
-    content.set_margin_start(10);
-    content.set_margin_end(10);
-    content.append(&title);
-    content.append(&color_row);
-    content.append(&hint);
-    content.append(&apply);
-
-    let popover = gtk::Popover::new();
-    popover.set_child(Some(&content));
-    popover.set_has_arrow(true);
-    popover.set_parent(&button);
-
-    MarkToolUi {
-        button,
-        popover,
-        apply,
-        color_button,
-    }
+    MarkToolUi { button, dialog }
 }
 
 fn toolbar_gap(width: i32) -> gtk::Box {

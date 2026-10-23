@@ -65,8 +65,8 @@ ventana.
 | Salto entre coincidencias con contador `n/m` | `Ctrl+G` / `Ctrl+Shift+G` |
 | Copiar el texto de la página actual | `Ctrl+Shift+C` |
 | Selección con el ratón y copiar solo lo seleccionado | Arrastrar y `Ctrl+C` |
-| Subrayar el texto como anotación real del PDF, en el color elegido | Botón al lado del zoom, `Ctrl+U`; se aplica a la selección o al siguiente arrastre |
-| Resaltar el texto como rotulador, en su propio color | Botón al lado del zoom, `Ctrl+Shift+U`; se aplica a la selección o al siguiente arrastre |
+| Subrayar el texto como anotación real del PDF, en el color elegido | Botón al lado del zoom, `Ctrl+U`: abre el selector de color y aplica a la selección o al siguiente arrastre |
+| Resaltar el texto como rotulador, en su propio color | Botón al lado del zoom, `Ctrl+Shift+U`: abre el selector de color y aplica a la selección o al siguiente arrastre |
 | Metadatos del documento | `Ctrl+D` |
 
 ### Apariencia y lectura nocturna

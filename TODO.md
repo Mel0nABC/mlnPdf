@@ -37,8 +37,8 @@ Una línea por capacidad, sin agrupar cosas distintas en una sola casilla.
 
 ## 2. Anotaciones y edición
 
-- [x] Subrayado del texto seleccionado en el color a elección (selector de color de GTK, ámbar por omisión), escrito en el PDF como anotación `/Underline` con `/QuadPoints` y `/C`: botón al lado del zoom, `Ctrl+U`, y `Esc` sale del modo
-- [x] Resaltado del texto (rotulador) en el color a elección (selector de color de GTK, amarillo de rotulador por omisión), escrito en el PDF como anotación `/Highlight` con `/CA 0.4` para que el texto se siga leyendo: botón al lado del zoom, `Ctrl+Shift+U`, `Esc` sale del modo, y se aplica a la selección o al siguiente arrastre
+- [x] Subrayado del texto seleccionado en el color a elección (selector de color de GTK, ámbar por omisión), escrito en el PDF como anotación `/Underline` con `/QuadPoints` y `/C`: al pulsar el botón al lado del zoom se abre el selector de color de GTK y, si ya había texto seleccionado, se subraya en el acto; si no, la herramienta queda armada para el siguiente arrastre (`Ctrl+U`, `Esc` sale del modo)
+- [x] Resaltado del texto (rotulador) en el color a elección (selector de color de GTK, amarillo de rotulador por omisión), escrito en el PDF como anotación `/Highlight` con `/CA 0.4` para que el texto se siga leyendo: al pulsar el botón al lado del zoom se abre el selector de color de GTK y, si ya había texto seleccionado, se resalta en el acto; si no, la herramienta queda armada para el siguiente arrastre (`Ctrl+Shift+U`, `Esc` sale del modo)
 - [x] Guardar los marcados (subrayados y resaltados) en el PDF abierto (`Ctrl+S`) o en una copia (`Ctrl+Shift+S`), con escritura atómica y pregunta de Descartar / Guardar / Guardar una copia al cerrar el documento, recargarlo, abrir otro o cerrar la ventana
 - [ ] [BLOQUEADA: escritura de PDF] Tachado de texto
 - [ ] [BLOQUEADA: escritura de PDF] Notas adhesivas (sticky notes) y comentarios con hilos de respuesta
