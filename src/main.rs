@@ -360,9 +360,30 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
             .expect("la acción de subrayar tiene que existir");
         assert!(viewer.annot.active.get(), "la herramienta queda armada");
         pump_until(|| viewer.ui.underline_popover.is_visible());
+
+        // El diálogo de color de GTK es otra ventana: al abrirlo, el popover se
+        // cierra por el foco. Eso no puede apagar la herramienta, y al elegir el
+        // color el diálogo tiene que volver a estar a la vista.
+        viewer.ui.underline_popover.popdown();
+        viewer.ui.underline_color.set_rgba(&gtk::gdk::RGBA::new(0.15, 0.45, 0.85, 1.0));
+        assert!(
+            viewer.annot.active.get(),
+            "elegir el color no cierra el diálogo de subrayar"
+        );
+        let chosen_color = viewer.annot.color.get();
+        assert!(
+            chosen_color.0 < 0.5 && chosen_color.2 > 0.5,
+            "el color elegido queda guardado para el próximo subrayado"
+        );
+        pump_until(|| viewer.ui.underline_popover.is_visible());
+
         viewer.begin_selection(0, 20.0, 155.0);
         viewer.update_selection(0, 160.0, 40.0);
         viewer.finish_selection();
+        assert!(
+            viewer.annot.marks.borrow()[1].color[2] > 0.5,
+            "el subrayado se crea con el color elegido"
+        );
         assert_eq!(
             viewer.annot.marks.borrow().len(),
             2,

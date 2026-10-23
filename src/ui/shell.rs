@@ -539,13 +539,6 @@ impl Viewer {
             }
         });
 
-        let weak = Rc::downgrade(&viewer);
-        underline_popover.connect_closed(move |_| {
-            if let Some(viewer) = weak.upgrade() {
-                viewer.set_underline_mode(false);
-            }
-        });
-
         // The apply button only works with a live selection, and the selection
         // may have changed while the popover was closed.
         let weak = Rc::downgrade(&viewer);
@@ -559,6 +552,10 @@ impl Viewer {
             viewer.apply_underline_to_selection();
         });
 
+        // El diálogo de color es otra ventana de GTK: al abrirlo, el popover
+        // pierde el foco y se cierra solo. Eso no puede apagar la herramienta,
+        // porque el lector todavía está eligiendo cómo subrayar; el estado vive
+        // en el botón y en Esc, no en la visibilidad del popover.
         let weak = Rc::downgrade(&viewer);
         underline_color.connect_rgba_notify(move |button| {
             if let Some(viewer) = weak.upgrade() {
@@ -567,6 +564,20 @@ impl Viewer {
                     .annot
                     .color
                     .set((rgba.red().into(), rgba.green().into(), rgba.blue().into()));
+                if viewer.annot.active.get() {
+                    viewer.refresh_underline_actions();
+                    // Se vuelve a abrir cuando el diálogo de color ya se fue:
+                    // presentar una ventana desde el cierre de otra deja el
+                    // oscurecido colgado.
+                    let weak = Rc::downgrade(&viewer);
+                    Self::after_modal(move || {
+                        if let Some(viewer) = weak.upgrade()
+                            && viewer.annot.active.get()
+                        {
+                            viewer.ui.underline_popover.popup();
+                        }
+                    });
+                }
             }
         });
         for index in 0..viewer.ui.navs.len() {
