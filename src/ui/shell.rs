@@ -9,6 +9,7 @@ use gtk::gdk;
 use gtk::prelude::*;
 use gtk::{gio, glib};
 
+use crate::engine::annotation::*;
 use crate::engine::geometry::*;
 use crate::engine::inertia::*;
 use crate::engine::render::*;
@@ -29,6 +30,14 @@ const HISTORY_LIMIT: usize = 100;
 /// Upper bound on highlighted search hits, so one common word cannot make the
 /// search or the highlight rendering explode.
 const SEARCH_HIT_LIMIT: usize = 300;
+
+/// Thickness of the underline on screen, in points. The PDF keeps its own:
+/// each reader chooses how thick it draws a `/Underline`.
+const UNDERLINE_WIDTH: f64 = 2.0;
+
+/// Color with which a new underline starts: a warm amber that reads as a
+/// highlight over white paper and as a line over dark paper.
+pub(crate) const UNDERLINE_COLOR: (f64, f64, f64) = (0.93, 0.67, 0.0);
 
 /// Width of the thumbnails in the side panel, in logical pixels.
 const THUMB_WIDTH: i32 = 120;
@@ -65,6 +74,7 @@ pub(crate) struct Viewer {
     pub(crate)     nav: NavigationState,
     pub(crate)     search: SearchState,
     pub(crate)     sel: SelectionState,
+    pub(crate)     annot: AnnotationState,
     pub(crate)     input: InteractionState,
     /// Weak handle to self, so methods can build long-lived closures.
     pub(crate)     me: RefCell<std::rc::Weak<Viewer>>,
@@ -89,6 +99,10 @@ pub(crate) struct UiHandles {
     pub(crate)     thumbs_store: gio::ListStore,
     pub(crate)     thumbs_selection: gtk::SingleSelection,
     pub(crate)     scale_provider: gtk::CssProvider,
+    pub(crate)     underline_button: gtk::ToggleButton,
+    pub(crate)     underline_popover: gtk::Popover,
+    pub(crate)     underline_apply: gtk::Button,
+    pub(crate)     underline_color: gtk::ColorDialogButton,
 }
 
 /// The open document and everything derived from it.
@@ -148,6 +162,18 @@ pub(crate) struct SelectionState {
     pub(crate)     selection: RefCell<Option<Selection>>,
     pub(crate)     selection_rects: RefCell<Vec<(f64, f64, f64, f64)>>,
     pub(crate)     selection_start: Cell<Option<(f64, f64)>>,
+}
+
+/// Subrayados y el estado de la herramienta que los crea.
+pub(crate) struct AnnotationState {
+    /// Subrayados en memoria, en orden de creación. Los primeros `saved` ya
+    /// están escritos en el archivo; el resto son los cambios pendientes.
+    pub(crate)     marks: RefCell<Vec<Underline>>,
+    pub(crate)     saved: Cell<usize>,
+    /// Color elegido en el selector de GTK, con componentes en `0..=1`.
+    pub(crate)     color: Cell<(f64, f64, f64)>,
+    /// Modo subrayar: el próximo arrastre sobre el texto crea un subrayado.
+    pub(crate)     active: Cell<bool>,
 }
 
 /// Transient interaction state.
@@ -225,6 +251,68 @@ impl Viewer {
         zoom_box.append(&zoom_label);
         zoom_box.append(&zoom_in_button);
 
+        // Underline tool, right next to the zoom. A button with an underlined
+        // "U" instead of an icon: Adwaita ships no underline glyph and a label
+        // keeps the meaning visible in every theme.
+        let underline_glyph = gtk::Label::new(None);
+        underline_glyph.set_markup("<u>U</u>");
+        let underline_button = gtk::ToggleButton::builder()
+            .child(&underline_glyph)
+            .tooltip_text("Subrayar (Ctrl+U)")
+            .margin_start(6)
+            .build();
+        accessible_label(&underline_button, "Subrayar el texto seleccionado");
+
+        let underline_color = gtk::ColorDialogButton::new(Some(
+            gtk::ColorDialog::builder()
+                .title("Color del subrayado")
+                .with_alpha(false)
+                .build(),
+        ));
+        underline_color.set_rgba(&gdk::RGBA::new(
+            UNDERLINE_COLOR.0 as f32,
+            UNDERLINE_COLOR.1 as f32,
+            UNDERLINE_COLOR.2 as f32,
+            1.0,
+        ));
+        underline_color.set_tooltip_text(Some("Color del subrayado"));
+        accessible_label(&underline_color, "Color del subrayado");
+
+        let underline_apply = gtk::Button::with_label("Subrayar la selección");
+        underline_apply.add_css_class("suggested-action");
+        underline_apply.set_sensitive(false);
+        accessible_label(&underline_apply, "Subrayar el texto seleccionado");
+
+        let underline_title = gtk::Label::new(None);
+        underline_title.set_markup("<b>Subrayar</b>");
+        underline_title.set_xalign(0.0);
+        let underline_hint = gtk::Label::new(Some(
+            "Elegí el color y arrastrá sobre el texto. Esc sale del modo.",
+        ));
+        underline_hint.add_css_class("dim-label");
+        underline_hint.set_wrap(true);
+        underline_hint.set_max_width_chars(28);
+        underline_hint.set_xalign(0.0);
+
+        let color_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        color_row.append(&gtk::Label::new(Some("Color")));
+        color_row.append(&underline_color);
+
+        let underline_content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        underline_content.set_margin_top(10);
+        underline_content.set_margin_bottom(10);
+        underline_content.set_margin_start(10);
+        underline_content.set_margin_end(10);
+        underline_content.append(&underline_title);
+        underline_content.append(&color_row);
+        underline_content.append(&underline_hint);
+        underline_content.append(&underline_apply);
+
+        let underline_popover = gtk::Popover::new();
+        underline_popover.set_child(Some(&underline_content));
+        underline_popover.set_has_arrow(true);
+        underline_popover.set_parent(&underline_button);
+
         let title = gtk::Label::new(Some(WINDOW_TITLE));
 
         let header = gtk::HeaderBar::new();
@@ -284,6 +372,7 @@ impl Viewer {
         controls.append(&toolbar_nav.root);
         controls.append(&toolbar_gap(TOOLBAR_GAP));
         controls.append(&zoom_box);
+        controls.append(&underline_button);
 
         // Secondary toolbar: the group stays centred, whatever the window width.
         let toolbar = gtk::Box::builder()
@@ -369,6 +458,10 @@ impl Viewer {
                 thumbs_store: thumbs_store.clone(),
                 thumbs_selection: thumbs_selection.clone(),
                 scale_provider: scale_provider.clone(),
+                underline_button: underline_button.clone(),
+                underline_popover: underline_popover.clone(),
+                underline_apply: underline_apply.clone(),
+                underline_color: underline_color.clone(),
             },
             doc: DocumentState {
                 document: RefCell::new(None),
@@ -407,6 +500,12 @@ impl Viewer {
                 selection_rects: RefCell::new(Vec::new()),
                 selection_start: Cell::new(None),
             },
+            annot: AnnotationState {
+                marks: RefCell::new(Vec::new()),
+                saved: Cell::new(0),
+                color: Cell::new(UNDERLINE_COLOR),
+                active: Cell::new(false),
+            },
             input: InteractionState {
                 hand_mode: Cell::new(false),
                 drag_origin: Cell::new((0.0, 0.0)),
@@ -429,6 +528,44 @@ impl Viewer {
         *viewer.me.borrow_mut() = Rc::downgrade(&viewer);
         Self::connect_click(&viewer, &zoom_in_button, |viewer| viewer.zoom_in());
         Self::connect_click(&viewer, &zoom_out_button, |viewer| viewer.zoom_out());
+
+        let weak = Rc::downgrade(&viewer);
+        underline_button.connect_toggled(move |button| {
+            if let Some(viewer) = weak.upgrade() {
+                viewer.set_underline_mode(button.is_active());
+            }
+        });
+
+        let weak = Rc::downgrade(&viewer);
+        underline_popover.connect_closed(move |_| {
+            if let Some(viewer) = weak.upgrade() {
+                viewer.set_underline_mode(false);
+            }
+        });
+
+        // The apply button only works with a live selection, and the selection
+        // may have changed while the popover was closed.
+        let weak = Rc::downgrade(&viewer);
+        underline_popover.connect_map(move |_| {
+            if let Some(viewer) = weak.upgrade() {
+                viewer.refresh_underline_actions();
+            }
+        });
+
+        Self::connect_click(&viewer, &underline_apply, |viewer| {
+            viewer.apply_underline_to_selection();
+        });
+
+        let weak = Rc::downgrade(&viewer);
+        underline_color.connect_rgba_notify(move |button| {
+            if let Some(viewer) = weak.upgrade() {
+                let rgba = button.rgba();
+                viewer
+                    .annot
+                    .color
+                    .set((rgba.red().into(), rgba.green().into(), rgba.blue().into()));
+            }
+        });
         for index in 0..viewer.ui.navs.len() {
             Self::install_nav(&viewer, index);
         }
@@ -688,6 +825,7 @@ impl Viewer {
         Self::install_action(viewer, "shortcuts", |viewer| viewer.show_shortcuts());
         Self::install_action(viewer, "open", |viewer| viewer.choose_file());
         Self::install_action(viewer, "hand-mode", |viewer| viewer.toggle_hand_mode());
+        Self::install_action(viewer, "underline", |viewer| viewer.toggle_underline_mode());
 
         let controller = gtk::ShortcutController::new();
         for (trigger, action) in SHORTCUTS {
@@ -1183,7 +1321,7 @@ impl Viewer {
             let weak_draw = self.me.borrow().clone();
             canvas.set_draw_func(move |area, context, w, h| {
                 if let Some(viewer) = weak_draw.upgrade() {
-                    viewer.draw_selection(index, area, context, w, h);
+                    viewer.draw_page_overlay(index, area, context, w, h);
                 }
             });
 
@@ -1383,13 +1521,134 @@ impl Viewer {
 
     /// Turns the hand tool on or off and keeps the cursor consistent.
     pub(crate) fn set_hand_mode(&self, active: bool) {
+        if active {
+            // Las dos herramientas no pueden estar activas a la vez.
+            self.set_underline_mode(false);
+        }
         self.input.hand_mode.set(active);
         if !active {
             // A drag interrupted by Escape can leave the window cursor behind.
             self.stop_fling();
+        }
+        self.refresh_page_cursor();
+    }
+
+    /// Cursor of the page area, derived from the active tool, so the two never
+    /// disagree about which one owns the next drag.
+    pub(crate) fn refresh_page_cursor(&self) {
+        if self.input.hand_mode.get() {
+            self.apply_hand_cursor(Some("grab"));
+        } else if self.annot.active.get() {
+            self.apply_hand_cursor(Some("text"));
+        } else {
+            self.apply_hand_cursor(None);
+            // A drag interrupted by Escape can leave the window cursor behind.
             self.ui.window.set_cursor(None::<&gdk::Cursor>);
         }
-        self.apply_hand_cursor(active.then_some("grab"));
+    }
+
+    /// Arms or disarms the underline tool and keeps the button, the dialog and
+    /// the cursor telling the same story.
+    pub(crate) fn set_underline_mode(&self, active: bool) {
+        let active = active && self.doc.document.borrow().is_some();
+        if active {
+            self.set_hand_mode(false);
+        }
+        self.annot.active.set(active);
+
+        if self.ui.underline_button.is_active() != active {
+            self.ui.underline_button.set_active(active);
+        }
+        if active {
+            self.refresh_underline_actions();
+            self.ui.underline_popover.popup();
+        } else {
+            self.ui.underline_popover.popdown();
+        }
+        self.refresh_page_cursor();
+    }
+
+    pub(crate) fn toggle_underline_mode(&self) {
+        self.set_underline_mode(!self.annot.active.get());
+    }
+
+    /// The apply button only makes sense with text selected.
+    pub(crate) fn refresh_underline_actions(&self) {
+        let ready = self.sel.selection.borrow().is_some()
+            && !self.sel.selection_rects.borrow().is_empty();
+        self.ui.underline_apply.set_sensitive(ready);
+    }
+
+    /// Subraya lo que esté seleccionado en este momento. Devuelve `false`
+    /// cuando no hay selección o no cubre texto.
+    pub(crate) fn apply_underline_to_selection(&self) -> bool {
+        let Some(selection) = *self.sel.selection.borrow() else {
+            return false;
+        };
+        let rects = self.sel.selection_rects.borrow().clone();
+        if rects.is_empty() {
+            return false;
+        }
+
+        let color = self.annot.color.get();
+        self.annot
+            .marks
+            .borrow_mut()
+            .push(Underline::new(selection.page, rects, color));
+
+        // La selección azul taparía el subrayado que se acaba de poner.
+        *self.sel.selection.borrow_mut() = None;
+        self.sel.selection_rects.borrow_mut().clear();
+        self.queue_page_draw(selection.page);
+        self.refresh_underline_actions();
+        true
+    }
+
+    /// True when there are underlines that are not in the file yet.
+    pub(crate) fn has_pending_underlines(&self) -> bool {
+        self.annot.saved.get() < self.annot.marks.borrow().len()
+    }
+
+    /// Dibuja la capa de la página: primero los subrayados, que son parte del
+    /// documento, y encima la selección que se está arrastrando.
+    pub(crate) fn draw_page_overlay(
+        &self,
+        page: usize,
+        area: &gtk::DrawingArea,
+        context: &cairo::Context,
+        width: i32,
+        height: i32,
+    ) {
+        self.draw_underlines(page, context);
+        self.draw_selection(page, area, context, width, height);
+    }
+
+    /// Pinta el borde inferior de cada rectángulo de línea: eso es, justo por
+    /// debajo del texto.
+    pub(crate) fn draw_underlines(&self, page: usize, context: &cairo::Context) {
+        let marks = self.annot.marks.borrow();
+        if marks.iter().all(|mark| mark.page != page) {
+            return;
+        }
+        let Some(size) = self.doc.page_sizes.borrow().get(page).copied() else {
+            return;
+        };
+
+        let zoom = self.view.zoom.get();
+        let rotation = self.view.rotation.get();
+        context.set_line_cap(cairo::LineCap::Butt);
+        context.set_line_width((UNDERLINE_WIDTH * zoom).max(1.0));
+
+        for mark in marks.iter().filter(|mark| mark.page == page) {
+            context.set_source_rgba(mark.color[0], mark.color[1], mark.color[2], 1.0);
+            for (x1, _, x2, y2) in mark.rects.iter() {
+                let (px1, py1) = forward_rotation((*x1, *y2), size, rotation);
+                let (px2, py2) = forward_rotation((*x2, *y2), size, rotation);
+                context.move_to(px1 * zoom, py1 * zoom);
+                context.line_to(px2 * zoom, py2 * zoom);
+            }
+            let _ = context.stroke();
+        }
     }
 
     /// Closes one of our modal dialogs in the order that leaves the parent
@@ -1443,6 +1702,10 @@ impl Viewer {
     pub(crate) fn escape_pressed(&self) -> glib::Propagation {
         if self.view.presentation.get() {
             self.toggle_presentation();
+            return glib::Propagation::Stop;
+        }
+        if self.annot.active.get() {
+            self.set_underline_mode(false);
             return glib::Propagation::Stop;
         }
         if self.input.hand_mode.get() {
@@ -2153,6 +2416,13 @@ impl Viewer {
             self.recompute_selection_rects();
         }
         self.queue_page_draw(selection.page);
+
+        // Con la herramienta armada, el arrastre termina en un subrayado.
+        if self.annot.active.get() {
+            self.apply_underline_to_selection();
+        } else {
+            self.refresh_underline_actions();
+        }
     }
 
     pub(crate) fn recompute_selection_rects(&self) {
@@ -3732,6 +4002,8 @@ impl Viewer {
     pub(crate) fn set_indicator(&self, index: usize) {
         let total = self.page_count();
         if total == 0 {
+            self.ui.underline_button.set_active(false);
+            self.ui.underline_button.set_sensitive(false);
             for nav in &self.ui.navs {
                 nav.entry.set_text("");
                 nav.entry.set_sensitive(false);
@@ -3743,6 +4015,7 @@ impl Viewer {
         }
 
         let index = index.min(total - 1);
+        self.ui.underline_button.set_sensitive(true);
         self.nav.current.set(index);
         if self.ui.thumbs_selection.selected() != index as u32 {
             self.input.thumb_sync.set(true);

@@ -36,6 +36,15 @@ mod tests {
 4 0 obj\n<< /Length 26 >>\nstream\n1 0 0 rg\n0 0 200 100 re\nf\nendstream\nendobj\n\
 trailer\n<< /Root 1 0 R /Size 5 >>\n%%EOF\n";
 
+    /// One page with two words, so the selection finds real text.
+    const TEXT_PAGE_PDF: &[u8] = b"%PDF-1.4\n\
+1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\
+2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n\
+3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n\
+4 0 obj\n<< /Length 72 >>\nstream\nBT /F1 36 Tf 20 150 Td (Arriba) Tj ET\nBT /F1 36 Tf 20 30 Td (Abajo) Tj ET\nendstream\nendobj\n\
+5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n\
+trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
+
     fn red_page() -> (poppler::Document, poppler::Page) {
         let document =
             poppler::Document::from_data(RED_PAGE_PDF, None).expect("minimal PDF should parse");
@@ -187,7 +196,7 @@ trailer\n<< /Root 1 0 R /Size 5 >>\n%%EOF\n";
             }
             children
         };
-        assert_eq!(children.len(), 5, "search, gap, pages, gap, zoom");
+        assert_eq!(children.len(), 6, "búsqueda, hueco, páginas, hueco, zoom, subrayar");
         for gap in [&children[1], &children[3]] {
             assert_eq!(
                 gap.size_request().0,
@@ -199,6 +208,10 @@ trailer\n<< /Root 1 0 R /Size 5 >>\n%%EOF\n";
             children[2].size_request().0,
             TOOLBAR_GAP,
             "el bloque de páginas no es una separación"
+        );
+        assert!(
+            children[5].is::<gtk::ToggleButton>(),
+            "el subrayado va justo al lado del zoom"
         );
 
         // Every declared shortcut must be a valid trigger, and every action it
@@ -296,6 +309,74 @@ trailer\n<< /Root 1 0 R /Size 5 >>\n%%EOF\n";
             dialog.close();
         }
 
+        // Underline: a selection can be marked from the dialog button, and with
+        // the tool armed the next drag marks it without asking again.
+        let text_path = dir.join("text-page-ui.pdf");
+        std::fs::write(&text_path, TEXT_PAGE_PDF).expect("write scratch text PDF");
+        viewer.open(&text_path).expect("open the text page");
+        assert!(
+            viewer.ui.underline_button.is_sensitive(),
+            "con un documento abierto la herramienta está disponible"
+        );
+        assert!(
+            viewer.ui.underline_popover.child().is_some(),
+            "el botón abre un diálogo con sus opciones"
+        );
+        let chosen = viewer.ui.underline_color.rgba();
+        assert!(
+            (f64::from(chosen.red()) - UNDERLINE_COLOR.0).abs() < 0.01
+                && (f64::from(chosen.green()) - UNDERLINE_COLOR.1).abs() < 0.01,
+            "el selector de color de GTK arranca con el color por omisión"
+        );
+
+        viewer.begin_selection(0, 20.0, 10.0);
+        viewer.update_selection(0, 180.0, 35.0);
+        viewer.finish_selection();
+        viewer.refresh_underline_actions();
+        assert!(
+            viewer.ui.underline_apply.is_sensitive(),
+            "con texto seleccionado el botón del diálogo se habilita"
+        );
+        assert!(
+            viewer.apply_underline_to_selection(),
+            "la selección se subraya al instante"
+        );
+        assert_eq!(viewer.annot.marks.borrow().len(), 1, "un subrayado");
+        assert!(
+            viewer.has_pending_underlines(),
+            "el subrayado queda pendiente de guardar"
+        );
+        assert_eq!(
+            viewer.annot.marks.borrow()[0].color,
+            [UNDERLINE_COLOR.0, UNDERLINE_COLOR.1, UNDERLINE_COLOR.2],
+            "el subrayado toma el color elegido"
+        );
+        assert!(
+            viewer.sel.selection.borrow().is_none(),
+            "la selección se limpia para no tapar el subrayado"
+        );
+
+        gtk::prelude::WidgetExt::activate_action(&viewer.ui.window, "win.underline", None)
+            .expect("la acción de subrayar tiene que existir");
+        assert!(viewer.annot.active.get(), "la herramienta queda armada");
+        pump_until(|| viewer.ui.underline_popover.is_visible());
+        viewer.begin_selection(0, 20.0, 155.0);
+        viewer.update_selection(0, 160.0, 40.0);
+        viewer.finish_selection();
+        assert_eq!(
+            viewer.annot.marks.borrow().len(),
+            2,
+            "con la herramienta armada el arrastre subraya solo"
+        );
+        assert!(
+            viewer.escape_pressed() == gtk::glib::Propagation::Stop
+                && !viewer.annot.active.get(),
+            "Esc sale del modo subrayar"
+        );
+        viewer.annot.marks.borrow_mut().clear();
+        viewer.annot.saved.set(0);
+
+        std::fs::remove_file(&text_path).ok();
         std::fs::remove_file(&path).ok();
     }
 
