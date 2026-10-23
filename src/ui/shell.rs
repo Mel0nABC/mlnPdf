@@ -30,6 +30,24 @@ const HISTORY_LIMIT: usize = 100;
 /// search or the highlight rendering explode.
 const SEARCH_HIT_LIMIT: usize = 300;
 
+/// How much of the paper size the preview shows, in logical pixels per point.
+const PREVIEW_SCALE: f64 = 0.9;
+
+/// Carries the settings and the page setup a previous dialog round produced, so
+/// the dialog that comes back after a preview keeps what the reader chose.
+fn apply_print_settings(
+    operation: &gtk::PrintOperation,
+    settings: Option<&gtk::PrintSettings>,
+    setup: Option<&gtk::PageSetup>,
+) {
+    if let Some(settings) = settings {
+        operation.set_print_settings(Some(settings));
+    }
+    if let Some(setup) = setup {
+        operation.set_default_page_setup(Some(setup));
+    }
+}
+
 /// Width of the thumbnails in the side panel, in logical pixels.
 const THUMB_WIDTH: i32 = 120;
 
@@ -2790,43 +2808,204 @@ impl Viewer {
 
     /// Runs the native print dialog until the reader prints or cancels.
     ///
-    /// GTK can hand the preview off to another application; when that preview
-    /// closes, the dialog goes with it and the operation ends as cancelled, so
-    /// the reader is left with no dialog. The `preview` signal marks that case
-    /// and the dialog is shown again, which is also what makes closing the
-    /// preview land back in it.
-    fn run_print_dialog(
-        operation: &gtk::PrintOperation,
-        parent: &impl IsA<gtk::Window>,
-        error_title: &str,
-    ) {
-        // Bounded: a preview that keeps closing the dialog must not loop forever.
-        const MAX_ATTEMPTS: usize = 3;
+    /// GTK treats the dialog's Preview button as the end of the dialog: it
+    /// destroys it, switches the operation to preview mode and hands the pages
+    /// to another application. The preview is answered here instead, so it opens
+    /// as a window of this application, and when it closes the dialog is shown
+    /// again with the settings the reader had chosen. A finished operation
+    /// cannot run twice, which is why `build` produces a new one per round.
+    fn run_print_dialog<F>(self: &Rc<Self>, build: F, error_title: &str)
+    where
+        F: Fn(Option<&gtk::PrintSettings>, Option<&gtk::PageSetup>) -> gtk::PrintOperation,
+    {
+        // Bounded: a preview closed over and over must not spin forever.
+        const MAX_ROUNDS: usize = 5;
 
-        let previewed = std::cell::Cell::new(false);
-        {
-            let previewed = previewed.clone();
-            operation.connect_preview(move |_, _, _, _| {
-                previewed.set(true);
-                // `false`: GTK keeps its own preview and its own hand-off.
-                false
-            });
-        }
+        let mut settings: Option<gtk::PrintSettings> = None;
+        let mut setup: Option<gtk::PageSetup> = None;
 
-        for _ in 0..MAX_ATTEMPTS {
-            match operation.run(gtk::PrintOperationAction::PrintDialog, Some(parent)) {
-                Ok(result) => {
-                    if reopen_after_preview(&result, &previewed) {
-                        continue;
-                    }
-                    return;
-                }
+        for _ in 0..MAX_ROUNDS {
+            let operation = build(settings.as_ref(), setup.as_ref());
+            let previewed = Self::install_print_preview(self, &operation);
+            let result = operation.run(
+                gtk::PrintOperationAction::PrintDialog,
+                Some(&self.ui.window),
+            );
+
+            // What the reader chose is worth keeping for the dialog that comes
+            // back after a preview.
+            settings = operation.print_settings();
+            setup = Some(operation.default_page_setup());
+
+            match result {
+                Ok(_) if previewed.get() => continue,
+                Ok(_) => return,
                 Err(error) => {
-                    show_error(parent, error_title, &error.to_string());
+                    show_error(&self.ui.window, error_title, &error.to_string());
                     return;
                 }
             }
         }
+    }
+
+    /// Answers the operation's `preview` signal with a window of this app.
+    ///
+    /// Returns the flag that says the dialog ended because of a preview: GTK
+    /// destroys it at that point, and [`Self::run_print_dialog`] rebuilds it
+    /// when the preview window closes.
+    fn install_print_preview(self: &Rc<Self>, operation: &gtk::PrintOperation) -> Rc<Cell<bool>> {
+        let previewed = Rc::new(Cell::new(false));
+        let flag = Rc::clone(&previewed);
+        let pages = operation.n_pages();
+        let parent = self.ui.window.clone();
+
+        operation.connect_preview(move |_, preview, context, _dialog| {
+            flag.set(true);
+            let (window, area) =
+                Viewer::print_preview_window(preview, context, parent.upcast_ref(), pages);
+
+            // GTK readies the page pipeline on its own idle: the first draw has
+            // to wait for that, so the window redraws when the signal arrives.
+            {
+                let area = area.clone();
+                preview.connect_ready(move |_, _| area.queue_draw());
+            }
+            {
+                let preview = preview.clone();
+                window.connect_close_request(move |_| {
+                    // Ending the preview is what lets run() return, and with it
+                    // the print dialog come back.
+                    preview.end_preview();
+                    glib::Propagation::Proceed
+                });
+            }
+
+            window.present();
+            true
+        });
+
+        previewed
+    }
+
+    /// One page of paper, shown as the print preview sees it.
+    ///
+    /// The window is transient for the main window and modal, so it opens on top
+    /// and closing it returns the focus there. Pages render through the print
+    /// context: the draw callback hands GTK the cairo context and the dpi of the
+    /// area, and the operation's draw-page handler paints the page into it with
+    /// the same code that prints, so what you see is what comes out.
+    pub(crate) fn print_preview_window(
+        preview: &gtk::PrintOperationPreview,
+        context: &gtk::PrintContext,
+        parent: &gtk::Window,
+        pages: i32,
+    ) -> (gtk::Window, gtk::DrawingArea) {
+        let setup = context.page_setup();
+        let paper_width = setup.paper_width(gtk::Unit::Points).max(1.0);
+        let paper_height = setup.paper_height(gtk::Unit::Points).max(1.0);
+        let area_width = (paper_width * PREVIEW_SCALE).round().max(1.0) as i32;
+        let area_height = (paper_height * PREVIEW_SCALE).round().max(1.0) as i32;
+
+        let window = gtk::Window::builder()
+            .title("Vista previa")
+            .modal(true)
+            .default_width(area_width + 60)
+            .default_height(area_height + 120)
+            .build();
+        window.set_transient_for(Some(parent));
+
+        let page = Rc::new(Cell::new(0_i32));
+        let area = gtk::DrawingArea::builder()
+            .content_width(area_width)
+            .content_height(area_height)
+            .build();
+
+        // GTK drives the preview through the print context and aborts the process
+        // when the handler leaves it without a cairo context, so it gets one of
+        // its own. It only keeps the context valid: every draw replaces it with
+        // the surface being painted. Both live as long as the area does, because
+        // a context whose surface is gone stops counting as set.
+        let placeholder = cairo::ImageSurface::create(cairo::Format::ARgb32, 1, 1)
+            .ok()
+            .and_then(|surface| cairo::Context::new(&surface).ok().map(|cr| (surface, cr)));
+        if let Some((_, cr)) = placeholder.as_ref() {
+            context.set_cairo_context(cr, 72.0, 72.0);
+        }
+
+        {
+            let preview = preview.clone();
+            let context = context.clone();
+            let page = Rc::clone(&page);
+            let placeholder = placeholder;
+            area.set_draw_func(move |_, cr, width, _height| {
+                let _keep_placeholder_alive = &placeholder;
+                // White first: a page outside the printed range still reads as a
+                // sheet instead of a transparent hole.
+                cr.set_source_rgb(1.0, 1.0, 1.0);
+                let _ = cr.paint();
+
+                // The dpi is what tells GTK how the page maps onto these pixels;
+                // the draw-page handler then fills the context exactly.
+                let dpi = preview_dpi(f64::from(width), paper_width);
+                context.set_cairo_context(cr, dpi, dpi);
+                let current = page.get();
+                if preview.is_selected(current) {
+                    preview.render_page(current);
+                }
+            });
+        }
+
+        let status = gtk::Label::new(Some(&format!("1 / {pages}")));
+        status.add_css_class("dim-label");
+        let previous = gtk::Button::with_label("Anterior");
+        let next = gtk::Button::with_label("Siguiente");
+        let close = gtk::Button::with_label("Cerrar");
+
+        for step in [-1_i32, 1] {
+            let button = if step < 0 { &previous } else { &next };
+            let page = Rc::clone(&page);
+            let area = area.clone();
+            let status = status.clone();
+            button.connect_clicked(move |_| {
+                let total = pages.max(1);
+                let target = (page.get() + step).rem_euclid(total);
+                page.set(target);
+                status.set_label(&format!("{} / {total}", target + 1));
+                area.queue_draw();
+            });
+        }
+
+        {
+            let weak = window.downgrade();
+            close.connect_clicked(move |_| {
+                if let Some(window) = weak.upgrade() {
+                    window.close();
+                }
+            });
+        }
+
+        let controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        controls.set_margin_top(6);
+        controls.set_margin_bottom(6);
+        controls.set_margin_start(6);
+        controls.set_margin_end(6);
+        controls.append(&previous);
+        controls.append(&status);
+        controls.append(&next);
+        let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        spacer.set_hexpand(true);
+        controls.append(&spacer);
+        controls.append(&close);
+
+        let scroller = gtk::ScrolledWindow::builder()
+            .child(&area)
+            .vexpand(true)
+            .build();
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        content.append(&scroller);
+        content.append(&controls);
+        window.set_child(Some(&content));
+        (window, area)
     }
 
     pub(crate) fn print_document(self: &Rc<Self>) {
@@ -2839,10 +3018,28 @@ impl Viewer {
             (document.n_pages(), self.ui.title.label().to_string())
         };
 
+        let this = Rc::clone(self);
+        Self::run_print_dialog(
+            self,
+            move |settings, setup| this.print_document_operation(pages, &job, settings, setup),
+            "No se pudo imprimir.",
+        );
+    }
+
+    /// Builds the operation behind [`Self::print_document`]: one page per sheet,
+    /// scaled to the printable area.
+    fn print_document_operation(
+        self: &Rc<Self>,
+        pages: i32,
+        job: &str,
+        settings: Option<&gtk::PrintSettings>,
+        setup: Option<&gtk::PageSetup>,
+    ) -> gtk::PrintOperation {
         let operation = gtk::PrintOperation::new();
         operation.set_unit(gtk::Unit::Points);
         operation.set_n_pages(pages);
-        operation.set_job_name(&job);
+        operation.set_job_name(job);
+        apply_print_settings(&operation, settings, setup);
 
         let weak = Rc::downgrade(self);
         operation.connect_draw_page(move |_, context, page_number| {
@@ -2881,7 +3078,7 @@ impl Viewer {
             let _ = cairo.restore();
         });
 
-        Self::run_print_dialog(&operation, &self.ui.window, "No se pudo imprimir.");
+        operation
     }
 
     /// Adds `path` to the in-memory recent list. Nothing is persisted here: the
@@ -3358,10 +3555,34 @@ impl Viewer {
         margin: f64,
         invert: bool,
     ) {
+        let job = job.to_string();
+        let this = Rc::clone(self);
+        Self::run_print_dialog(
+            self,
+            move |settings, setup| {
+                this.print_options_operation(pages, &job, fit, margin, invert, settings, setup)
+            },
+            "No se pudo imprimir.",
+        );
+    }
+
+    /// Builds the operation behind [`Self::run_print`]: the chosen scale, margins
+    /// and colour inversion, applied to every page.
+    fn print_options_operation(
+        self: &Rc<Self>,
+        pages: i32,
+        job: &str,
+        fit: bool,
+        margin: f64,
+        invert: bool,
+        settings: Option<&gtk::PrintSettings>,
+        setup: Option<&gtk::PageSetup>,
+    ) -> gtk::PrintOperation {
         let operation = gtk::PrintOperation::new();
         operation.set_unit(gtk::Unit::Points);
         operation.set_n_pages(pages);
         operation.set_job_name(job);
+        apply_print_settings(&operation, settings, setup);
 
         let weak = Rc::downgrade(self);
         operation.connect_draw_page(move |_, context, page_number| {
@@ -3428,7 +3649,7 @@ impl Viewer {
             }
         });
 
-        Self::run_print_dialog(&operation, &self.ui.window, "No se pudo imprimir.");
+        operation
     }
 
     /// Prints two pages per sheet in booklet imposition.
@@ -3445,12 +3666,30 @@ impl Viewer {
             return;
         }
 
+        let this = Rc::clone(self);
+        Self::run_print_dialog(
+            self,
+            move |settings, setup| this.print_booklet_operation(pages, &job, settings, setup),
+            "No se pudo imprimir el folleto.",
+        );
+    }
+
+    /// Builds the operation behind [`Self::print_booklet`]: two pages per side,
+    /// four per sheet.
+    fn print_booklet_operation(
+        self: &Rc<Self>,
+        pages: i32,
+        job: &str,
+        settings: Option<&gtk::PrintSettings>,
+        setup: Option<&gtk::PageSetup>,
+    ) -> gtk::PrintOperation {
         // Four pages per sheet (two sides of two pages each).
         let sheets = ((pages + 3) / 4) * 2;
         let operation = gtk::PrintOperation::new();
         operation.set_unit(gtk::Unit::Points);
         operation.set_n_pages(sheets);
         operation.set_job_name(&format!("{job} (folleto)"));
+        apply_print_settings(&operation, settings, setup);
 
         let weak = Rc::downgrade(self);
         operation.connect_draw_page(move |_, context, sheet| {
@@ -3505,7 +3744,7 @@ impl Viewer {
             }
         });
 
-        Self::run_print_dialog(&operation, &self.ui.window, "No se pudo imprimir el folleto.");
+        operation
     }
 
     pub(crate) fn rotate_view(&self) {
@@ -3751,20 +3990,16 @@ fn toolbar_gap(width: i32) -> gtk::Box {
     gap
 }
 
-/// Whether a finished print dialog has to be shown again.
+/// Device pixels per inch the preview draws at.
 ///
-/// GTK can hand the preview to another application: when that preview closes,
-/// the dialog goes with it and the operation reports a cancel. The flag is
-/// consumed here, so a genuine cancel after coming back closes the dialog for
-/// good instead of reopening it.
-pub(crate) fn reopen_after_preview(
-    result: &gtk::PrintOperationResult,
-    previewed: &std::cell::Cell<bool>,
-) -> bool {
-    if !previewed.replace(false) {
-        return false;
+/// `area_width` is the width of the drawing area and `paper_width` the width of
+/// the sheet in points: with this dpi, GTK maps the page onto exactly that
+/// width, so the page fills the preview instead of floating in it.
+pub(crate) fn preview_dpi(area_width: f64, paper_width: f64) -> f64 {
+    if area_width <= 0.0 || paper_width <= 0.0 {
+        return 72.0;
     }
-    matches!(result, gtk::PrintOperationResult::Cancel)
+    72.0 * area_width / paper_width
 }
 
 /// Renders one page at `pixel_scale` device pixels per point.

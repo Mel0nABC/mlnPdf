@@ -196,11 +196,17 @@ necesita una decisión o una dependencia nueva.
   que una palabra común no dispare tiempo y memoria. Antes bloqueaba el bucle
   principal ~1,4 s en un PDF de 666 páginas.
 - Impresión: el diálogo lo pone GTK (incluye imprimir a PDF); el dibujado escala
-  la página al área imprimible y respeta la rotación actual. La vista previa la
-  delega GTK a otra aplicación y, al cerrarla, el diálogo se iba con ella: la
-  señal `preview` marca ese caso y el diálogo se vuelve a mostrar (hasta tres
-  intentos), así cerrar la vista previa devuelve al lector a imprimir. Vale para
-  imprimir, imprimir con opciones y folleto.
+  la página al área imprimible y respeta la rotación actual. El botón Preview del
+  diálogo no es un botón que podamos conservar: GTK lo trata como el final del
+  diálogo (lo destruye, pasa la operación a modo vista previa y manda las páginas
+  a otra aplicación). Por eso la señal `preview` se atiende acá: abre una ventana
+  propia que dibuja la página con el mismo código que imprime (`set_cairo_context`
+  con el dpi del área; en modo vista previa GTK no renderiza nada por su cuenta,
+  solo emite `ready` y espera), y al cerrarla `end_preview` termina la operación y
+  se vuelve a abrir el diálogo con la impresora y las opciones elegidas. Una
+  operación terminada no se puede volver a correr, así que cada vuelta construye
+  una nueva con `print_settings` y `default_page_setup` de la anterior, con un
+  tope de cinco vueltas. Vale para imprimir, imprimir con opciones y folleto.
 - Exportación: la página suelta se puede guardar en PDF (cairo `PdfSurface` con
   el contenido vectorial de poppler, sin la rotación ni la inversión de la vista),
   PNG o JPEG. La exportación por lotes pide una expresión de páginas

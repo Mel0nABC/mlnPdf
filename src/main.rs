@@ -256,6 +256,66 @@ trailer\n<< /Root 1 0 R /Size 5 >>\n%%EOF\n";
         assert_eq!(viewer.ui.zoom_label.label(), "100 %");
         pump_until(|| size_request_at(&viewer.ui.pages, 0) == (200, 100));
 
+        // Print preview: the window is ours, so the print dialog underneath is
+        // never closed by GTK's hand-off, and pages render through the print
+        // context exactly like they print.
+        {
+            let operation = gtk::PrintOperation::new();
+            operation.set_unit(gtk::Unit::Points);
+            operation.set_n_pages(2);
+
+            let drawn = Rc::new(std::cell::Cell::new(0_u32));
+            let painted = Rc::clone(&drawn);
+            operation.connect_draw_page(move |_, context, _page| {
+                painted.set(painted.get() + 1);
+                let cr = context.cairo_context();
+                let _ = cr.set_source_rgb(1.0, 0.0, 0.0);
+                let _ = cr.paint();
+            });
+
+            let seen: Rc<std::cell::RefCell<Option<gtk::Window>>> =
+                Rc::new(std::cell::RefCell::new(None));
+            let captured = Rc::clone(&seen);
+            let parent: gtk::Window = viewer.ui.window.clone().upcast();
+            operation.connect_preview(move |_, preview, context, _dialog| {
+                let (window, _area) = Viewer::print_preview_window(preview, context, &parent, 2);
+                window.present();
+                *captured.borrow_mut() = Some(window.clone());
+                // Closing the preview ends the operation, which is what lets the
+                // print dialog come back afterwards.
+                let ended = preview.clone();
+                window.connect_close_request(move |_| {
+                    ended.end_preview();
+                    gtk::glib::Propagation::Proceed
+                });
+                gtk::glib::timeout_add_local_once(
+                    std::time::Duration::from_millis(300),
+                    move || window.close(),
+                );
+                true
+            });
+
+            let result =
+                operation.run(gtk::PrintOperationAction::Preview, Some(&viewer.ui.window));
+            assert!(result.is_ok(), "la vista previa debe completarse: {:?}", result.err());
+
+            let mut waited = 0;
+            while seen.borrow().is_none() && waited < 200 {
+                gtk::glib::MainContext::default().iteration(false);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                waited += 1;
+            }
+            let window = seen
+                .borrow()
+                .clone()
+                .expect("la vista previa debe abrir su propia ventana");
+            assert_eq!(window.title().unwrap_or_default(), "Vista previa");
+            assert!(
+                drawn.get() > 0,
+                "la página se dibuja a través del contexto de impresión"
+            );
+        }
+
         std::fs::remove_file(&path).ok();
     }
 
@@ -273,32 +333,20 @@ trailer\n<< /Root 1 0 R /Size 5 >>\n%%EOF\n";
         }
     }
 
-    /// Guards the print-dialog reopening rule: only a cancel that came after a
-    /// preview means the dialog went away with it, and the flag is consumed so a
-    /// real cancel closes for good.
+    /// The preview maps the page onto the whole drawing area, whatever size the
+    /// window ends up with.
     #[test]
-    fn a_cancel_after_a_preview_reopens_the_print_dialog_once() {
-        use crate::ui::shell::reopen_after_preview;
-        use gtk::PrintOperationResult;
+    fn preview_dpi_maps_the_paper_onto_the_area_width() {
+        use crate::ui::shell::preview_dpi;
 
-        let previewed = std::cell::Cell::new(true);
-        assert!(reopen_after_preview(&PrintOperationResult::Cancel, &previewed));
-        assert!(!previewed.get(), "la marca se consume al reabrir");
+        let dpi = preview_dpi(535.5, 595.0);
+        assert!((dpi - 64.8).abs() < 1e-9, "90 % de una A4: {dpi}");
         assert!(
-            !reopen_after_preview(&PrintOperationResult::Cancel, &previewed),
-            "un segundo cancelar cierra el diálogo"
+            (595.0 * dpi / 72.0 - 535.5).abs() < 1e-9,
+            "la página mide exactamente el ancho del área"
         );
-
-        let printed = std::cell::Cell::new(true);
-        assert!(
-            !reopen_after_preview(&PrintOperationResult::Apply, &printed),
-            "imprimir después de la vista previa no reabre nada"
-        );
-        assert!(!printed.get(), "la marca también se consume");
-
-        let untouched = std::cell::Cell::new(false);
-        assert!(!reopen_after_preview(&PrintOperationResult::Cancel, &untouched));
-        assert!(!reopen_after_preview(&PrintOperationResult::InProgress, &untouched));
+        assert_eq!(preview_dpi(0.0, 595.0), 72.0, "sin área, dpi nominal");
+        assert_eq!(preview_dpi(535.5, 0.0), 72.0, "sin papel, dpi nominal");
     }
 
     fn size_request_at(pages: &gtk::Box, index: i32) -> (i32, i32) {
