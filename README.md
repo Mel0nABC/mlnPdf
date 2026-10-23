@@ -68,7 +68,8 @@ ventana.
 | Subrayar el texto como anotación real del PDF, en el color elegido (el botón muestra ese color) | Botón al lado del zoom, `Ctrl+U`: abre el selector de color y aplica a la selección o al siguiente arrastre |
 | Resaltar el texto como rotulador, en su propio color (el botón lo muestra de fondo) | Botón al lado del zoom, `Ctrl+Shift+U`: abre el selector de color y aplica a la selección o al siguiente arrastre |
 | Insertar texto libre sobre la página, con la fuente elegida en el selector de fuente de GTK (familia aproximada a una de las 14 estándar del PDF) | Botón `T` al lado de las otras herramientas, `Ctrl+T` o `Edit > Insertar texto…`: el diálogo pide texto y fuente, y el siguiente clic fija la esquina de la nota |
-| Deshacer y rehacer los marcados que todavía no están en el PDF, de a uno | `Ctrl+Z` / `Ctrl+Shift+Z` (o `Ctrl+Y`), `Edit > Deshacer` / `Rehacer` |
+| Mover, borrar o cambiar el texto de una nota ya creada, también después de guardarla | Arrastrar la nota para moverla, `Supr` (o `Retroceso`) para borrarla, doble clic o `Edit > Editar texto de la nota` para reescribirla, y clic derecho para el menú con `Editar texto` y `Borrar` |
+| Deshacer y rehacer con instantáneas, de a un cambio | `Ctrl+Z` / `Ctrl+Shift+Z` (o `Ctrl+Y`), `Edit > Deshacer` / `Rehacer` |
 | Metadatos del documento | `Ctrl+D` |
 
 ### Apariencia y lectura nocturna
@@ -109,8 +110,8 @@ ventana.
 | `Ctrl` + rueda | Zoom con la rueda | `Espacio` + arrastrar | Herramienta mano, con inercia al soltar |
 | `Ctrl+C` / `Ctrl+Shift+C` | Copiar la selección / la página | `Esc` | Sale de presentación, del modo mano o de una herramienta de anotación; limpia la búsqueda |
 | `Ctrl+U` / `Ctrl+Shift+U` | Subrayar / resaltar | `Ctrl+T` | Insertar una nota de texto en la página |
-| `Ctrl+Z` | Deshacer el último cambio sin guardar | `Ctrl+Shift+Z` / `Ctrl+Y` | Rehacer el cambio deshecho |
-| `Ctrl+S` / `Ctrl+Shift+S` | Guardar / guardar como | | |
+| `Ctrl+Z` | Deshacer el último cambio | `Ctrl+Shift+Z` / `Ctrl+Y` | Rehacer el cambio deshecho |
+| `Supr` | Borrar la nota seleccionada | `Ctrl+S` / `Ctrl+Shift+S` | Guardar / guardar como |
 
 La lista completa está en `Help > Atajos de teclado…` dentro de la aplicación.
 
@@ -127,7 +128,7 @@ src/
 ├── ui/         shell GTK: ventana, barras, menús, miniaturas, estilos
 └── services/   exportación del documento y escritura del PDF
     ├── export.rs        exportación a JPEG y PDF vectorial
-    └── annotations.rs   escritura de /Underline, /Highlight y /FreeText con lopdf
+    └── annotations.rs   escritura de /Underline, /Highlight y /FreeText con lopdf, con /NM propio para poder reemplazarlas
 ```
 
 | Decisión | Por qué |
@@ -139,6 +140,8 @@ src/
 | FFI propio para lo que `poppler-rs` no expone | `poppler_page_get_text_layout` y `poppler_page_get_selection_region` |
 | Motor sin dependencia de GTK | Geometría, búsqueda y sesión se prueban sin display |
 | Las anotaciones de marcado y de texto se escriben con lopdf, en un temporal que después reemplaza al original | poppler-glib es de solo lectura, así que el subrayado (`/Underline`), el resaltado (`/Highlight` con `/CA`) y la nota (`/FreeText` con `/DA`) solo pueden quedar como anotación real escribiendo el archivo; el reemplazo al final evita dejar el PDF roto si el guardado falla |
+| Cada anotación propia lleva un `/NM` con un identificador de la sesión | Es lo que permite reemplazarla o quitarla en un guardado posterior: el visor borra de `/Annots` solo los `/NM` que reconoce, así que mover, borrar o editar una nota no toca las anotaciones de otros programas |
+| Deshacer y rehacer trabajan sobre instantáneas de la lista de anotaciones | Con un tope de 20 cambios: cualquier mutación (crear, mover, borrar, editar el texto) puede deshacerse y rehacerse, y una instantánea cubre lo que antes necesitaba una cola por tipo de cambio |
 | Las familias del sistema se aproximan a una de las 14 fuentes estándar del PDF | Incrustar el archivo de fuente elegido en el PDF está fuera de alcance: sin `/FontFile` la única opción portable es `/Helv`, `/TiRo` o `/Cour` con su estilo |
 
 ## Requisitos
@@ -162,7 +165,7 @@ Probado con GTK 4.24 y poppler-glib 26.10.
 
 ```bash
 cargo build --release
-cargo test                 # 81 pruebas: motor, render, selección, búsqueda, páginas, sesión, anotaciones
+cargo test                 # 85 pruebas: motor, render, selección, búsqueda, páginas, sesión, anotaciones
 cargo test -- --ignored    # prueba de display: atajos, zoom y propiedad del viewer
 ```
 
@@ -198,11 +201,13 @@ las pruebas automatizadas cubren el motor y el arranque, no cada comando de la
 interfaz. Los marcados (subrayado y resaltado) y las notas de texto se guardan
 reescribiendo el PDF completo (no es un guardado incremental) y se escriben sin
 *appearance stream* (`/AP`), así que el aspecto exacto lo decide cada lector; la
-nota usa una fuente estándar aproximada (`/Helv`, `/TiRo`, `/Cour`), el texto va
-en una sola línea (sin ajuste automático ni edición posterior) y su posición no
-se puede arrastrar después de insertarla. Tampoco hay todavía borrado de
-anotaciones, y deshacer/rehacer (`Ctrl+Z` / `Ctrl+Shift+Z`) alcanza solo a lo que
-no se guardó: una anotación ya escrita en el PDF no se quita desde el visor.
+nota usa una fuente estándar aproximada (`/Helv`, `/TiRo`, `/Cour`) y su texto va
+en una sola línea (sin ajuste automático). Las anotaciones creadas en la sesión se
+pueden mover, borrar y reescribir incluso después de guardarlas, porque cada una
+lleva su `/NM`; al volver a abrir el archivo, en cambio, el visor no reconstruye
+sus anotaciones desde el PDF, así que las anteriores quedan como anotaciones de
+solo lectura de cualquier otro programa. `Ctrl+Z` alcanza a los últimos 20
+cambios de la sesión, no a lo que se hizo antes de cerrar el documento.
 
 **Licencia:** todavía sin definir.
 

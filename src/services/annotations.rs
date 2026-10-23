@@ -10,8 +10,17 @@ use crate::engine::annotation::{
     Annotation, FontChoice, MarkKind, PageBox, TextNote, bounds_rect, mark_quads, note_rect,
 };
 
-/// Agrega las anotaciones al PDF y lo escribe en `target`; devuelve cuántas
-/// anotaciones quedaron escritas.
+/// Escribe en el PDF las anotaciones propias y lo guarda en `target`; devuelve
+/// cuántas anotaciones propias quedaron escritas (las que se quitaron y las que
+/// se agregaron o reemplazaron).
+///
+/// `current` son las anotaciones del visor con su identificador, e `persisted` la
+/// copia exacta de lo que el archivo tiene escrito, en el mismo orden. Con las dos
+/// listas se calcula qué anotaciones propias hay que quitar (las de `persisted`
+/// que no están en `current` o cuyo valor cambió) y cuáles hay que escribir (las
+/// de `current` que el archivo no tiene o que cambiaron). Una anotación del
+/// archivo sin `/NM`, o con un `/NM` que no está en `persisted`, es de otro
+/// programa: no se toca.
 ///
 /// `source` es el archivo que hay que editar y no se toca hasta que el nuevo
 /// documento está completo en el disco. Cuando `target` es el mismo archivo que
@@ -19,7 +28,8 @@ use crate::engine::annotation::{
 pub fn write_annotations(
     source: &Path,
     target: &Path,
-    annotations: &[Annotation],
+    current: &[(String, Annotation)],
+    persisted: &[(String, Annotation)],
 ) -> Result<u32, String> {
     let mut document = Document::load(source)
         .map_err(|error| format!("no se pudo abrir el PDF para editarlo: {error}"))?;
@@ -33,10 +43,29 @@ pub fn write_annotations(
         );
     }
 
-    let pages = document.get_pages();
-    let mut written = 0;
+    // Lo que el archivo ya no tiene que mostrar: la anotación se borró en el
+    // visor o cambió de valor (de texto, de posición o de color).
+    let unchanged = |left: &(String, Annotation), right: &(String, Annotation)| {
+        left.0 == right.0 && left.1 == right.1
+    };
+    let removals: Vec<String> = persisted
+        .iter()
+        .filter(|entry| !current.iter().any(|other| unchanged(entry, other)))
+        .map(|(id, _)| id.clone())
+        .collect();
+    // Y lo que hay que escribir: lo nuevo y lo que cambió.
+    let upserts: Vec<&(String, Annotation)> = current
+        .iter()
+        .filter(|entry| !persisted.iter().any(|other| unchanged(entry, other)))
+        .collect();
 
-    for annotation in annotations.iter().filter(|annotation| !annotation.is_empty()) {
+    let mut written = drop_annotations(&mut document, &removals);
+
+    let pages = document.get_pages();
+    for (id, annotation) in upserts {
+        if annotation.is_empty() {
+            continue;
+        }
         let Some(page_id) = pages.get(&(annotation.page() as u32 + 1)).copied() else {
             continue;
         };
@@ -47,9 +76,9 @@ pub fn write_annotations(
                 if quads.is_empty() {
                     continue;
                 }
-                mark_dictionary(&quads, mark.color, mark.kind)
+                mark_dictionary(&quads, mark.color, mark.kind, id)
             }
-            Annotation::Note(note) => note_dictionary(note, page_box),
+            Annotation::Note(note) => note_dictionary(note, page_box, id),
         };
         push_annotation(&mut document, page_id, object)?;
         written += 1;
@@ -60,7 +89,7 @@ pub fn write_annotations(
 }
 
 /// Diccionario de la anotación de marcado, listo para colgar de `/Annots`.
-fn mark_dictionary(quads: &[[f64; 8]], color: [f64; 3], kind: MarkKind) -> Object {
+fn mark_dictionary(quads: &[[f64; 8]], color: [f64; 3], kind: MarkKind, id: &str) -> Object {
     let rect = bounds_rect(quads);
 
     let mut dictionary = Dictionary::new();
@@ -79,6 +108,7 @@ fn mark_dictionary(quads: &[[f64; 8]], color: [f64; 3], kind: MarkKind) -> Objec
                 .collect(),
         ),
     );
+    set_identifier(&mut dictionary, id);
     dictionary.set(
         "C",
         Object::Array(vec![real(color[0]), real(color[1]), real(color[2])]),
@@ -104,15 +134,25 @@ fn real(value: f64) -> Object {
     Object::Real(value as f32)
 }
 
+/// `/NM`: el nombre con el que el visor reconoce su propia anotación en un
+/// guardado posterior, para reemplazarla o quitarla sin tocar las demás.
+fn set_identifier(dictionary: &mut Dictionary, id: &str) {
+    dictionary.set(
+        "NM",
+        Object::String(id.as_bytes().to_vec(), lopdf::StringFormat::Literal),
+    );
+}
+
 /// Diccionario de una nota de texto, listo para colgar de `/Annots`: un
 /// `/FreeText` con el texto en `/Contents`, su recuadro y la fuente en `/DA`.
 /// No lleva `/QuadPoints`: no está atada a ningún texto de la página.
-fn note_dictionary(note: &TextNote, page: PageBox) -> Object {
+fn note_dictionary(note: &TextNote, page: PageBox, id: &str) -> Object {
     let rect = note_rect(note, page);
 
     let mut dictionary = Dictionary::new();
     dictionary.set("Type", Object::Name(b"Annot".to_vec()));
     dictionary.set("Subtype", Object::Name(b"FreeText".to_vec()));
+    set_identifier(&mut dictionary, id);
     dictionary.set(
         "Rect",
         Object::Array(vec![real(rect.0), real(rect.1), real(rect.2), real(rect.3)]),
@@ -281,6 +321,91 @@ fn push_annotation(
     Ok(())
 }
 
+/// Quita de `/Annots` las anotaciones cuyo `/NM` está en `removals` y devuelve
+/// cuántas quitó. Las anotaciones sin `/NM`, o con otro `/NM`, no se tocan: son de
+/// otro programa.
+///
+/// La lista puede estar escrita dentro de la página o ser una referencia a un
+/// objeto aparte. Cuando la lista referenciada queda vacía se quita la clave de la
+/// página y el objeto de la lista queda huérfano en el archivo: borrarlo exigiría
+/// saber si otro objeto lo referencia, y un objeto de más no rompe nada.
+fn drop_annotations(document: &mut Document, removals: &[String]) -> u32 {
+    if removals.is_empty() {
+        return 0;
+    }
+    let page_ids: Vec<ObjectId> = document.get_pages().values().copied().collect();
+    let mut dropped = 0;
+
+    for page_id in page_ids {
+        // Se lee primero y se escribe después: `document` no se puede pedir
+        // prestado inmutable y mutable a la vez.
+        let mut kept: Vec<Object> = Vec::new();
+        let mut removed = 0;
+        let mut inline = false;
+        let mut referenced = None;
+        {
+            let Ok(page) = document.get_dictionary(page_id) else {
+                continue;
+            };
+            let items = match page.get(b"Annots") {
+                Ok(Object::Array(items)) => {
+                    inline = true;
+                    items.clone()
+                }
+                Ok(Object::Reference(id)) => {
+                    let Ok(Object::Array(items)) = document.get_object(*id) else {
+                        continue;
+                    };
+                    referenced = Some(*id);
+                    items.clone()
+                }
+                _ => continue,
+            };
+            for item in items {
+                match annotation_name(document, &item) {
+                    Some(name) if removals.iter().any(|removal| *removal == name) => removed += 1,
+                    _ => kept.push(item),
+                }
+            }
+        }
+        if removed == 0 {
+            continue;
+        }
+        dropped += removed;
+
+        if kept.is_empty() {
+            // Una lista vacía se quita de la página: `/Annots []` es legal, pero no
+            // dice nada y alarga el archivo.
+            if let Ok(page) = document.get_dictionary_mut(page_id) {
+                page.remove(b"Annots");
+            }
+        } else if inline {
+            if let Ok(page) = document.get_dictionary_mut(page_id) {
+                page.set("Annots", Object::Array(kept));
+            }
+        } else if let Some(id) = referenced {
+            match document.get_object_mut(id) {
+                Ok(Object::Array(items)) => *items = kept,
+                _ => {}
+            }
+        }
+    }
+    dropped
+}
+
+/// `/NM` de una anotación colgada de `/Annots`, sea un diccionario escrito en la
+/// lista o una referencia a otro objeto. `None` cuando no hay nombre: esa
+/// anotación es de otro programa y no se puede reemplazar.
+fn annotation_name(document: &Document, object: &Object) -> Option<String> {
+    let dictionary = match object {
+        Object::Dictionary(dictionary) => dictionary,
+        Object::Reference(id) => document.get_dictionary(*id).ok()?,
+        _ => return None,
+    };
+    let bytes = dictionary.get(b"NM").ok()?.as_str().ok()?;
+    String::from_utf8(bytes.to_vec()).ok()
+}
+
 /// Escribe el documento completo en un temporal y sólo después lo pone en su
 /// lugar. El archivo existente no se toca hasta que el nuevo está entero.
 fn save_atomically(document: &mut Document, target: &Path) -> Result<(), String> {
@@ -399,6 +524,22 @@ mod tests {
         Annotation::Mark(TextMark::underline(0, rects, (1.0, 0.0, 0.0)))
     }
 
+    /// Guardado de anotaciones que el archivo todavía no tiene, con un
+    /// identificador por posición: es lo que hacen las pruebas que sólo miran lo
+    /// que se escribe.
+    fn write_fresh(
+        source: &Path,
+        target: &Path,
+        annotations: &[Annotation],
+    ) -> Result<u32, String> {
+        let current: Vec<(String, Annotation)> = annotations
+            .iter()
+            .enumerate()
+            .map(|(index, annotation)| (format!("mlnpdf-prueba-{index}"), annotation.clone()))
+            .collect();
+        write_annotations(source, target, &current, &[])
+    }
+
     /// Texto de `/Contents`, sea literal ASCII o hexadecimal UTF-16BE.
     fn contents_text(annotation: &Dictionary) -> String {
         match annotation.get(b"Contents").expect("la nota lleva su texto") {
@@ -435,7 +576,7 @@ mod tests {
         let target = scratch("plain-out.pdf");
         std::fs::write(&source, fixture([0.0, 0.0, 200.0, 200.0], 0)).expect("escribir el PDF");
 
-        let written = write_annotations(&source, &target, &[mark(vec![(20.0, 20.0, 120.0, 40.0)])])
+        let written = write_fresh(&source, &target, &[mark(vec![(20.0, 20.0, 120.0, 40.0)])])
             .expect("el subrayado tiene que escribirse");
         assert_eq!(written, 1);
 
@@ -483,7 +624,7 @@ mod tests {
         let original = fixture([0.0, 0.0, 200.0, 100.0], 0);
         std::fs::write(&source, &original).expect("escribir el PDF");
 
-        write_annotations(&source, &target, &[mark(vec![(10.0, 10.0, 60.0, 20.0)])])
+        write_fresh(&source, &target, &[mark(vec![(10.0, 10.0, 60.0, 20.0)])])
             .expect("guardar como");
 
         assert_eq!(
@@ -498,7 +639,7 @@ mod tests {
         let path = scratch("same.pdf");
         std::fs::write(&path, fixture([0.0, 0.0, 200.0, 100.0], 0)).expect("escribir el PDF");
 
-        write_annotations(&path, &path, &[mark(vec![(10.0, 10.0, 60.0, 20.0)])])
+        write_fresh(&path, &path, &[mark(vec![(10.0, 10.0, 60.0, 20.0)])])
             .expect("guardar encima");
 
         let bytes = std::fs::read(&path).expect("leer el resultado");
@@ -551,7 +692,7 @@ mod tests {
                 "rotación {rotation}: sin anotación no hay nada rojo"
             );
 
-            write_annotations(
+            write_fresh(
                 &source,
                 &target,
                 &[Annotation::Mark(TextMark::underline(
@@ -689,7 +830,7 @@ mod tests {
         );
         assert!(!rects.is_empty(), "el texto tiene que estar");
 
-        write_annotations(
+        write_fresh(
             &source,
             &target,
             &[Annotation::Mark(TextMark::highlight(
@@ -791,7 +932,7 @@ mod tests {
             },
         };
 
-        write_annotations(&source, &target, &[Annotation::Note(note)]).expect("escribir la nota");
+        write_fresh(&source, &target, &[Annotation::Note(note)]).expect("escribir la nota");
 
         let size = (300.0, 200.0);
         assert_eq!(
@@ -873,7 +1014,7 @@ mod tests {
             "el fixture tiene que venir cifrado"
         );
 
-        let result = write_annotations(&source, &target, &[mark(vec![(10.0, 10.0, 60.0, 20.0)])]);
+        let result = write_fresh(&source, &target, &[mark(vec![(10.0, 10.0, 60.0, 20.0)])]);
 
         assert!(result.is_err(), "un PDF protegido no se puede reescribir");
         assert_eq!(
@@ -892,7 +1033,7 @@ mod tests {
         std::fs::write(&path, fixture([0.0, 0.0, 200.0, 200.0], 0)).expect("escribir el PDF");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
 
-        write_annotations(&path, &path, &[mark(vec![(10.0, 10.0, 60.0, 20.0)])])
+        write_fresh(&path, &path, &[mark(vec![(10.0, 10.0, 60.0, 20.0)])])
             .expect("guardar encima");
 
         assert_eq!(
@@ -908,7 +1049,7 @@ mod tests {
         let target = scratch("inherited-out.pdf");
         std::fs::write(&source, inherited_fixture()).expect("escribir el PDF");
 
-        write_annotations(&source, &target, &[mark(vec![(0.0, 0.0, 50.0, 10.0)])])
+        write_fresh(&source, &target, &[mark(vec![(0.0, 0.0, 50.0, 10.0)])])
             .expect("escribir el subrayado");
 
         let document = Document::load(&target).expect("cargar el resultado");
@@ -929,7 +1070,7 @@ mod tests {
 
         let mut out_of_range = TextMark::underline(0, vec![(10.0, 10.0, 60.0, 20.0)], (1.0, 0.0, 0.0));
         out_of_range.page = 7;
-        let written = write_annotations(&source, &target, &[Annotation::Mark(out_of_range)])
+        let written = write_fresh(&source, &target, &[Annotation::Mark(out_of_range)])
             .expect("guardar sin subrayados");
         assert_eq!(written, 0);
 
@@ -950,10 +1091,22 @@ mod tests {
         let path = scratch("twice-same.pdf");
         std::fs::write(&source, fixture([0.0, 0.0, 200.0, 200.0], 0)).expect("escribir el PDF");
 
-        write_annotations(&source, &path, &[mark(vec![(10.0, 10.0, 60.0, 20.0)])])
-            .expect("primer subrayado");
-        write_annotations(&path, &path, &[mark(vec![(10.0, 50.0, 60.0, 60.0)])])
-            .expect("segundo subrayado");
+        write_annotations(
+            &source,
+            &path,
+            &[owned("mlnpdf-prueba-a", mark(vec![(10.0, 10.0, 60.0, 20.0)]))],
+            &[],
+        )
+        .expect("primer subrayado");
+        // El segundo guardado no conoce el primero, como el de un programa que
+        // agrega su anotación: se suma al lado en vez de reemplazarlo.
+        write_annotations(
+            &path,
+            &path,
+            &[owned("mlnpdf-prueba-b", mark(vec![(10.0, 50.0, 60.0, 60.0)]))],
+            &[],
+        )
+        .expect("segundo subrayado");
 
         let document = Document::load(&path).expect("cargar el resultado");
         let page_id = *document.get_pages().get(&1).expect("página 1");
@@ -1011,7 +1164,7 @@ mod tests {
             },
         };
 
-        let written = write_annotations(
+        let written = write_fresh(
             &source,
             &target,
             &[
@@ -1072,5 +1225,205 @@ mod tests {
         let bytes = std::fs::read(&target).expect("leer el resultado");
         let document = poppler::Document::from_data(&bytes, None).expect("poppler abre el PDF");
         assert_eq!(document.n_pages(), 1, "el PDF sigue siendo válido para poppler");
+    }
+
+    /// Anotación propia con su identificador, como la escribe el visor: el `/NM`
+    /// es lo que permite reemplazarla o quitarla en un guardado posterior.
+    fn owned(id: &str, value: Annotation) -> (String, Annotation) {
+        (id.to_string(), value)
+    }
+
+    /// Nota de texto con un recuadro conocido, para las pruebas de edición.
+    fn note_with(text: &str) -> Annotation {
+        Annotation::Note(TextNote {
+            page: 0,
+            at: (20.0, 10.0),
+            width: 60.0,
+            height: 15.0,
+            text: text.to_string(),
+            font: FontChoice {
+                family: "Sans".to_string(),
+                size: 12.0,
+                bold: false,
+                italic: false,
+            },
+        })
+    }
+
+    /// Resumen de las anotaciones de la página 1: `(subtype, /NM, texto)`.
+    /// `/Contents` se lee con `contents_text`, que entiende el literal ASCII y el
+    /// hexadecimal UTF-16BE; las anotaciones sin texto dejan la tercera vacía.
+    fn written_annotations(path: &Path) -> Vec<(String, String, String)> {
+        let document = Document::load(path).expect("lopdf abre el archivo");
+        let page_id = *document.get_pages().get(&1).expect("página 1");
+        document
+            .get_page_annotations(page_id)
+            .expect("anotaciones")
+            .iter()
+            .map(|annotation| {
+                let bytes = |value: Option<&[u8]>| {
+                    value
+                        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+                        .unwrap_or_default()
+                };
+                // `/Subtype` es un nombre y `/NM` una cadena.
+                let subtype = bytes(annotation.get(b"Subtype").ok().and_then(|value| value.as_name().ok()));
+                let name = bytes(annotation.get(b"NM").ok().and_then(|value| value.as_str().ok()));
+                let contents = if annotation.get(b"Contents").is_ok() {
+                    contents_text(annotation)
+                } else {
+                    String::new()
+                };
+                (subtype, name, contents)
+            })
+            .collect()
+    }
+
+    /// PDF con una `/Underline` sin `/NM`, como la que deja otro programa.
+    fn foreign_fixture() -> Vec<u8> {
+        let mut document = Document::load_mem(&fixture([0.0, 0.0, 200.0, 100.0], 0))
+            .expect("cargar el fixture");
+        let page_id = *document.get_pages().get(&1).expect("página 1");
+        let foreign = Object::Dictionary(dictionary! {
+            "Type" => "Annot",
+            "Subtype" => "Underline",
+            "Rect" => Object::Array(vec![10.into(), 10.into(), 60.into(), 20.into()]),
+            "QuadPoints" => Object::Array(vec![
+                10.into(), 90.into(), 60.into(), 90.into(),
+                10.into(), 80.into(), 60.into(), 80.into(),
+            ]),
+        });
+        document
+            .get_dictionary_mut(page_id)
+            .expect("página")
+            .set("Annots", Object::Array(vec![foreign]));
+
+        let mut bytes = Vec::new();
+        document.save_to(&mut bytes).expect("serializar el fixture");
+        bytes
+    }
+
+    #[test]
+    fn saving_twice_with_the_same_annotations_leaves_one_of_each() {
+        let source = scratch("repeat.pdf");
+        let path = scratch("repeat-same.pdf");
+        std::fs::write(&source, fixture([0.0, 0.0, 200.0, 200.0], 0)).expect("escribir el PDF");
+        let current = vec![owned("mlnpdf-prueba-1", mark(vec![(10.0, 10.0, 60.0, 20.0)]))];
+
+        assert_eq!(
+            write_annotations(&source, &path, &current, &[]).expect("primer guardado"),
+            1,
+            "la primera vez se escribe la anotación"
+        );
+        assert_eq!(written_annotations(&path).len(), 1);
+
+        // El segundo guardado parte de lo que ya está escrito: la anotación no
+        // cambió, así que no se agrega otra.
+        assert_eq!(
+            write_annotations(&path, &path, &current, &current).expect("segundo guardado"),
+            0,
+            "sin cambios no hay nada que escribir"
+        );
+        assert_eq!(
+            written_annotations(&path).len(),
+            1,
+            "el segundo guardado no duplica la anotación"
+        );
+        assert_eq!(
+            written_annotations(&path)[0],
+            (
+                "Underline".to_string(),
+                "mlnpdf-prueba-1".to_string(),
+                String::new()
+            )
+        );
+    }
+
+    #[test]
+    fn changing_the_text_of_a_note_leaves_a_single_note_with_the_new_text() {
+        let source = scratch("edit-text.pdf");
+        let path = scratch("edit-text-same.pdf");
+        std::fs::write(&source, fixture([0.0, 0.0, 200.0, 100.0], 0)).expect("escribir el PDF");
+
+        let before = vec![owned("mlnpdf-prueba-2", note_with("Texto viejo"))];
+        let after = vec![owned("mlnpdf-prueba-2", note_with("Texto nuevo"))];
+
+        write_annotations(&source, &path, &before, &[]).expect("escribir la nota");
+        assert_eq!(written_annotations(&path).len(), 1);
+
+        assert_eq!(
+            write_annotations(&path, &path, &after, &before).expect("editar el texto"),
+            2,
+            "la vieja se quita y la nueva se escribe"
+        );
+        let annotations = written_annotations(&path);
+        assert_eq!(annotations.len(), 1, "la nota editada no se duplica");
+        assert_eq!(annotations[0].0, "FreeText");
+        assert_eq!(
+            annotations[0].1, "mlnpdf-prueba-2",
+            "la nota conserva su identificador"
+        );
+        assert_eq!(
+            annotations[0].2, "Texto nuevo",
+            "el archivo lleva el texto nuevo"
+        );
+    }
+
+    #[test]
+    fn deleting_a_note_removes_it_and_keeps_foreign_annotations() {
+        let source = scratch("delete.pdf");
+        let path = scratch("delete-same.pdf");
+        std::fs::write(&source, foreign_fixture()).expect("escribir el fixture");
+
+        let note = owned("mlnpdf-prueba-3", note_with("Se va"));
+        write_annotations(&source, &path, std::slice::from_ref(&note), &[])
+            .expect("escribir la nota");
+        assert_eq!(
+            written_annotations(&path).len(),
+            2,
+            "la nota propia y la anotación ajena"
+        );
+
+        assert_eq!(
+            write_annotations(&path, &path, &[], std::slice::from_ref(&note))
+                .expect("borrar la nota"),
+            1,
+            "se quita la anotación propia"
+        );
+
+        let annotations = written_annotations(&path);
+        assert_eq!(annotations.len(), 1, "la nota se fue del archivo");
+        assert_eq!(
+            annotations[0].0, "Underline",
+            "la anotación ajena queda intacta"
+        );
+        assert_eq!(annotations[0].1, "", "la ajena nunca tuvo /NM");
+        assert!(
+            poppler::Document::from_data(&std::fs::read(&path).expect("leer"), None).is_ok(),
+            "el PDF sigue abriéndose después de borrar"
+        );
+    }
+
+    #[test]
+    fn every_own_annotation_carries_its_identifier() {
+        let source = scratch("names.pdf");
+        let target = scratch("names-out.pdf");
+        std::fs::write(&source, fixture([0.0, 0.0, 200.0, 200.0], 0)).expect("escribir el PDF");
+
+        let current = vec![
+            owned("mlnpdf-prueba-4", mark(vec![(10.0, 10.0, 60.0, 20.0)])),
+            owned("mlnpdf-prueba-5", note_with("Con nombre")),
+        ];
+        write_annotations(&source, &target, &current, &[]).expect("escribir las dos");
+
+        let names: Vec<String> = written_annotations(&target)
+            .into_iter()
+            .map(|(_, name, _)| name)
+            .collect();
+        assert_eq!(
+            names,
+            vec!["mlnpdf-prueba-4".to_string(), "mlnpdf-prueba-5".to_string()],
+            "cada anotación propia lleva su /NM"
+        );
     }
 }

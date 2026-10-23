@@ -4,7 +4,7 @@ use gtk::gio;
 
 /// Keyboard shortcuts bound to the window actions. Declared as data so the
 /// display test can prove every trigger string actually parses.
-pub const SHORTCUTS: [(&str, &str); 39] = [
+pub const SHORTCUTS: [(&str, &str); 40] = [
     ("<Control>plus", "win.zoom-in"),
     ("<Control>equal", "win.zoom-in"),
     ("<Control>minus", "win.zoom-out"),
@@ -46,10 +46,13 @@ pub const SHORTCUTS: [(&str, &str); 39] = [
     ("<Control>t", "win.insert-text"),
     ("<Control>s", "win.save-annotations"),
     ("<Control><Shift>s", "win.save-annotations-as"),
+    // Sin `<Control>`: es la tecla de borrar la nota elegida. El visor la maneja
+    // en fase de burbuja para que los campos de texto conserven la suya.
+    ("Delete", "win.note-delete"),
 ];
 
 /// Human-readable shortcut list shown by Help > Atajos de teclado.
-pub const SHORTCUT_HELP: [(&str, &str); 26] = [
+pub const SHORTCUT_HELP: [(&str, &str); 27] = [
     ("Ctrl+O", "Abrir un PDF"),
     ("Ctrl+P", "Imprimir"),
     ("Ctrl+F", "Buscar en el documento"),
@@ -64,6 +67,7 @@ pub const SHORTCUT_HELP: [(&str, &str); 26] = [
     ("Ctrl+C", "Copiar el texto seleccionado"),
     ("Ctrl+Z", "Deshacer el último marcado sin guardar"),
     ("Ctrl+Shift+Z / Ctrl+Y", "Rehacer el marcado deshecho"),
+    ("Supr", "Borrar la nota seleccionada"),
     ("Ctrl+U", "Subrayar el texto seleccionado"),
     ("Ctrl+Shift+U", "Resaltar el texto seleccionado"),
     ("Ctrl+T", "Insertar una nota de texto en la página"),
@@ -98,6 +102,8 @@ pub fn build_menu_bar() -> gtk::PopoverMenuBar {
     let edit_menu = gio::Menu::new();
     edit_menu.append(Some("Deshacer"), Some("win.undo"));
     edit_menu.append(Some("Rehacer"), Some("win.redo"));
+    edit_menu.append(Some("Editar texto de la nota"), Some("win.note-edit"));
+    edit_menu.append(Some("Borrar la nota"), Some("win.note-delete"));
     edit_menu.append(Some("Buscar…"), Some("win.search"));
     edit_menu.append(Some("Subrayar"), Some("win.underline"));
     edit_menu.append(Some("Resaltar"), Some("win.highlight"));

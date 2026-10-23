@@ -26,7 +26,7 @@ mod tests {
     use crate::ui::actions::*;
     use std::rc::Rc;
     use crate::engine::geometry::*;
-    use crate::engine::annotation::{Annotation, FontChoice, MarkKind, TextMark};
+    use crate::engine::annotation::{Annotation, FontChoice, MarkKind, TextMark, TextNote};
     use crate::ui::shell::*;
 
     /// One page, 200x100 pt, fully filled with pure red, no xref table
@@ -278,6 +278,21 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
         assert!(
             edit_labels.iter().any(|label| label == "Insertar texto…"),
             "el menú Edit ofrece insertar texto: {edit_labels:?}"
+        );
+        // Las dos acciones que operan sobre la nota elegida van después de Rehacer.
+        let rehacer = edit_labels
+            .iter()
+            .position(|label| label == "Rehacer")
+            .expect("el menú Edit tiene Rehacer");
+        assert_eq!(
+            edit_labels.get(rehacer + 1).map(String::as_str),
+            Some("Editar texto de la nota"),
+            "el menú Edit edita la nota justo después de Rehacer: {edit_labels:?}"
+        );
+        assert_eq!(
+            edit_labels.get(rehacer + 2).map(String::as_str),
+            Some("Borrar la nota"),
+            "el menú Edit borra la nota justo después de editar: {edit_labels:?}"
         );
 
         // Every declared shortcut must be a valid trigger, and every action it
@@ -554,7 +569,7 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
             !viewer.text_tool_active(),
             "colocarla desarma la herramienta"
         );
-        let note = match viewer.annot.edits.borrow()[4].clone() {
+        let note = match viewer.annot.edits.borrow()[4].value.clone() {
             Annotation::Note(note) => note,
             other => panic!("la quinta anotación tiene que ser una nota: {other:?}"),
         };
@@ -581,11 +596,11 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
         );
 
         // Deshacer y rehacer también alcanzan a la nota.
-        assert!(viewer.undo_mark(), "deshacer alcanza a la nota");
+        assert!(viewer.undo(), "deshacer alcanza a la nota");
         assert_eq!(viewer.annot.edits.borrow().len(), 4);
-        assert!(viewer.redo_mark(), "rehacer la repone");
+        assert!(viewer.redo(), "rehacer la repone");
         assert!(
-            matches!(viewer.annot.edits.borrow()[4], Annotation::Note(_)),
+            matches!(&viewer.annot.edits.borrow()[4].value, Annotation::Note(_)),
             "rehacer repone la nota, no otra anotación"
         );
 
@@ -722,8 +737,9 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
         assert!(!viewer.has_pending_marks());
         std::fs::remove_file(&copy).ok();
 
-        // Ctrl+Z deshace los marcados que todavía no están en el PDF, de a uno.
-        // Lo que ya se escribió en el archivo no se puede deshacer desde acá.
+        // Ctrl+Z deshace de a un cambio, con instantáneas: también alcanza a lo
+        // que ya está escrito en el PDF, que se quita del archivo en el próximo
+        // guardado.
         viewer.begin_selection(0, 20.0, 10.0);
         viewer.update_selection(0, 180.0, 35.0);
         viewer.finish_selection();
@@ -744,7 +760,7 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
             "siete guardadas y dos más"
         );
 
-        assert!(viewer.undo_mark(), "se deshace la última anotación");
+        assert!(viewer.undo(), "se deshace el último cambio");
         assert_eq!(viewer.annot.edits.borrow().len(), 8);
         assert!(
             viewer.has_pending_marks(),
@@ -755,28 +771,33 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
             7,
             "deshacer no reescribe el archivo"
         );
-        assert!(viewer.undo_mark(), "se deshace la otra");
+        assert!(viewer.undo(), "se deshace el otro");
         assert!(!viewer.has_pending_marks());
-        assert!(
-            !viewer.undo_mark(),
-            "lo que ya está escrito en el PDF no se deshace"
-        );
         assert_eq!(
             viewer.annot.edits.borrow().len(),
             7,
             "vuelve al estado guardado"
         );
 
-        // Rehacer repone lo deshecho en orden y se agota.
-        assert!(viewer.redo_mark(), "se rehace el primero de los deshechos");
-        assert_eq!(viewer.annot.edits.borrow().len(), 8);
+        // Una instantánea más atrás sí toca lo ya escrito: la anotación
+        // desaparece de la página y queda pendiente de quitar del archivo.
+        assert!(viewer.undo(), "deshacer alcanza a lo que está en el PDF");
+        assert_eq!(viewer.annot.edits.borrow().len(), 6);
         assert!(
             viewer.has_pending_marks(),
-            "lo rehecho vuelve a estar pendiente"
+            "el archivo quedó desactualizado"
         );
-        assert!(viewer.redo_mark(), "se rehace el otro");
+
+        // Rehacer repone lo deshecho en orden y se agota.
+        assert!(viewer.redo(), "se rehace el primero de los deshechos");
+        assert_eq!(viewer.annot.edits.borrow().len(), 7);
+        assert!(
+            !viewer.has_pending_marks(),
+            "rehacer vuelve al estado guardado"
+        );
+        assert!(viewer.redo() && viewer.redo());
         assert_eq!(viewer.annot.edits.borrow().len(), 9);
-        assert!(!viewer.redo_mark(), "no hay más que rehacer");
+        assert!(!viewer.redo(), "no hay más que rehacer");
         assert_eq!(
             mark_at(&viewer, 7).kind,
             MarkKind::Underline,
@@ -785,24 +806,30 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
         assert_eq!(mark_at(&viewer, 8).kind, MarkKind::Highlight);
 
         // Deshacer y después marcar algo nuevo descarta lo que había para rehacer.
-        assert!(viewer.undo_mark() && viewer.undo_mark());
+        assert!(viewer.undo() && viewer.undo());
         assert_eq!(viewer.annot.edits.borrow().len(), 7);
         viewer.begin_selection(0, 20.0, 10.0);
         viewer.update_selection(0, 180.0, 35.0);
         viewer.finish_selection();
         assert!(viewer.apply_mark(MarkKind::Underline), "un marcado nuevo");
         assert!(
-            !viewer.redo_mark(),
+            !viewer.redo(),
             "lo nuevo corta la línea de tiempo de rehacer"
         );
         assert_eq!(viewer.annot.edits.borrow().len(), 8);
-        assert!(viewer.undo_mark(), "y ese marcado nuevo se puede deshacer");
+        assert!(viewer.undo(), "y ese marcado nuevo se puede deshacer");
         assert_eq!(viewer.annot.edits.borrow().len(), 7);
 
-        // El atajo y el menú usan la misma acción: sin pendientes no rompe nada.
+        // El atajo y el menú usan la misma acción: deshacer deja el cambio
+        // pendiente y rehacer lo devuelve al estado guardado.
         gtk::prelude::WidgetExt::activate_action(&viewer.ui.window, "win.undo", None)
             .expect("la acción de deshacer tiene que existir");
+        assert_eq!(viewer.annot.edits.borrow().len(), 6);
+        assert!(viewer.has_pending_marks());
+        gtk::prelude::WidgetExt::activate_action(&viewer.ui.window, "win.redo", None)
+            .expect("la acción de rehacer tiene que existir");
         assert_eq!(viewer.annot.edits.borrow().len(), 7);
+        assert!(!viewer.has_pending_marks());
 
         // Guardar como (Ctrl+Shift+S) tiene que dejar un archivo en el destino
         // aunque no haya nada pendiente: es una copia del documento abierto.
@@ -830,6 +857,126 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
             "el archivo abierto sobrevive a un guardar como sobre sí mismo"
         );
         std::fs::remove_file(&plain).ok();
+
+        // Editar una nota ya creada: elegirla, moverla, borrarla y cambiarle el
+        // texto, todo sobre la misma anotación que ya está en el archivo.
+        let note_id = edit_id(&viewer, 4);
+        let before = note_value(&viewer, 4);
+        assert_eq!(before.text, "Nota (insertada) ñandú");
+
+        // Un clic sobre la nota la elige y habilita sus acciones.
+        viewer.select_note(Some(note_id.clone()));
+        assert_eq!(
+            viewer.annot.selected.borrow().clone(),
+            Some(note_id.clone()),
+            "el clic sobre una nota la selecciona"
+        );
+        let delete_action = viewer
+            .ui
+            .window
+            .lookup_action("note-delete")
+            .and_then(|action| action.downcast::<gio::SimpleAction>().ok())
+            .expect("la acción de borrar la nota existe");
+        assert!(
+            delete_action.is_enabled(),
+            "con una nota elegida se puede borrar"
+        );
+
+        // Mover: el arrastre se mide en puntos de la página, así que a zoom 100 %
+        // el desplazamiento del puntero es el desplazamiento de la nota.
+        let grab = (before.at.0 + 2.0, before.at.1 + 2.0);
+        assert!(
+            viewer.note_drag_begin(0, grab.0, grab.1),
+            "el arrastre empieza dentro de la nota"
+        );
+        assert!(
+            viewer.note_drag_update(30.0, 25.0),
+            "el arrastre mueve la nota"
+        );
+        assert!(viewer.note_drag_end(), "el arrastre termina");
+        let moved = note_value(&viewer, 4);
+        assert_eq!(
+            moved.at,
+            (before.at.0 + 30.0, before.at.1 + 25.0),
+            "la nota se mueve el desplazamiento del puntero en puntos"
+        );
+        assert!(
+            viewer.has_pending_marks(),
+            "mover deja el cambio pendiente de guardar"
+        );
+
+        // Borrar: `Supr` y el menú llaman a esto mismo. Deshacer la recupera y
+        // rehacer la vuelve a borrar.
+        assert!(viewer.delete_selected_note(), "se borra la nota elegida");
+        assert_eq!(viewer.annot.edits.borrow().len(), 6);
+        assert!(
+            viewer.annot.selected.borrow().is_none(),
+            "borrar la nota la deselecciona"
+        );
+        assert!(viewer.undo(), "el borrado se deshace");
+        assert_eq!(viewer.annot.edits.borrow().len(), 7);
+        assert_eq!(
+            note_value(&viewer, 4).at,
+            moved.at,
+            "la nota vuelve en su posición nueva"
+        );
+        assert!(viewer.redo(), "rehacer la borra otra vez");
+        assert_eq!(viewer.annot.edits.borrow().len(), 6);
+        assert!(viewer.undo(), "y se recupera para seguir editando");
+        assert_eq!(viewer.annot.edits.borrow().len(), 7);
+
+        // Editar el texto: se vuelve a medir con Pango y la nota cambia de ancho.
+        let longer = "Una nota bastante más larga que la anterior".to_string();
+        assert!(
+            viewer.apply_note_text(&note_id, longer.clone(), note_font.clone()),
+            "el texto nuevo se aplica a la nota elegida"
+        );
+        let edited = note_value(&viewer, 4);
+        assert_eq!(edited.text, longer);
+        assert_eq!(edited.font, note_font, "la fuente se conserva");
+        assert!(
+            edited.width > moved.width,
+            "la nota se vuelve a medir: {} > {}",
+            edited.width,
+            moved.width
+        );
+        assert!(viewer.has_pending_marks());
+
+        // Guardar después de mover y de editar: el archivo mantiene una sola
+        // anotación por nota, con el texto nuevo, y poppler lo sigue abriendo.
+        viewer.save_annotations();
+        assert!(!viewer.has_pending_marks(), "lo movido y editado quedó guardado");
+        assert_eq!(
+            written_annotations(&text_path),
+            7,
+            "mover y editar reemplazan la nota, no la duplican"
+        );
+        assert_eq!(
+            written_subtypes(&text_path)
+                .iter()
+                .filter(|subtype| *subtype == "FreeText")
+                .count(),
+            1,
+            "sigue habiendo una sola nota de texto"
+        );
+        assert_eq!(
+            written_note_text(&text_path),
+            longer,
+            "el archivo lleva el texto editado"
+        );
+        assert!(
+            poppler::Document::from_data(&std::fs::read(&text_path).expect("leer"), None).is_ok(),
+            "poppler abre el PDF después de mover y editar"
+        );
+
+        // Esc deselecciona cuando no hay ninguna herramienta armada.
+        viewer.select_note(Some(note_id.clone()));
+        assert_eq!(
+            viewer.escape_pressed(),
+            gtk::glib::Propagation::Stop,
+            "Esc deselecciona la nota"
+        );
+        assert!(viewer.annot.selected.borrow().is_none());
 
         // Una sola herramienta armada: armar un marcado apaga insertar texto, y
         // Esc desarma la herramienta de texto.
@@ -933,10 +1080,57 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
 
     /// Marcado de la posición `index`, para las pruebas que comparan color y tipo.
     fn mark_at(viewer: &Viewer, index: usize) -> TextMark {
-        match viewer.annot.edits.borrow()[index].clone() {
+        match viewer.annot.edits.borrow()[index].value.clone() {
             Annotation::Mark(mark) => mark,
             other => panic!("la anotación {index} tenía que ser un marcado: {other:?}"),
         }
+    }
+
+    /// Nota de texto de la posición `index`.
+    fn note_value(viewer: &Viewer, index: usize) -> TextNote {
+        match viewer.annot.edits.borrow()[index].value.clone() {
+            Annotation::Note(note) => note,
+            other => panic!("la anotación {index} tenía que ser una nota: {other:?}"),
+        }
+    }
+
+    /// Identificador de la anotación de la posición `index`.
+    fn edit_id(viewer: &Viewer, index: usize) -> String {
+        viewer.annot.edits.borrow()[index].id.clone()
+    }
+
+    /// `/Contents` de la nota `/FreeText` del archivo: el texto que lee cualquier
+    /// otro visor, sea el literal ASCII o el hexadecimal UTF-16BE.
+    fn written_note_text(path: &Path) -> String {
+        let document = lopdf::Document::load(path).expect("lopdf abre el archivo");
+        let page_id = *document.get_pages().get(&1).expect("página 1");
+        for annotation in document.get_page_annotations(page_id).expect("anotaciones") {
+            let free_text = annotation
+                .get(b"Subtype")
+                .and_then(lopdf::Object::as_name)
+                .is_ok_and(|name| name == b"FreeText");
+            if !free_text {
+                continue;
+            }
+            return match annotation
+                .get(b"Contents")
+                .expect("la nota lleva su texto")
+            {
+                lopdf::Object::String(bytes, lopdf::StringFormat::Hexadecimal) => {
+                    assert_eq!(&bytes[..2], &[0xFE, 0xFF], "el hexadecimal lleva BOM");
+                    let units: Vec<u16> = bytes[2..]
+                        .chunks_exact(2)
+                        .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+                        .collect();
+                    String::from_utf16(&units).expect("UTF-16BE válido")
+                }
+                lopdf::Object::String(bytes, _) => {
+                    String::from_utf8(bytes.clone()).expect("un literal ASCII es UTF-8 válido")
+                }
+                other => panic!("Contents no es una cadena: {other:?}"),
+            };
+        }
+        panic!("el archivo no tiene ninguna nota de texto");
     }
 
     /// Subtipos (`/Underline`, `/Highlight`, `/FreeText`, ...) de las anotaciones

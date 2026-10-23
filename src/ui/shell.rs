@@ -28,6 +28,11 @@ pub(crate) const WINDOW_TITLE: &str = "MlnPdf";
 
 const HISTORY_LIMIT: usize = 100;
 
+/// Cuántos cambios se pueden deshacer. Cada entrada es una copia completa de las
+/// anotaciones, así que el tope evita que una sesión larga crezca sin límite: al
+/// pasarse se descarta la instantánea más vieja.
+const UNDO_LIMIT: usize = 20;
+
 /// Upper bound on highlighted search hits, so one common word cannot make the
 /// search or the highlight rendering explode.
 const SEARCH_HIT_LIMIT: usize = 300;
@@ -189,20 +194,43 @@ pub(crate) struct MarkTool {
     pub(crate) active: bool,
 }
 
+/// Una anotación del lector con su identificador estable, el que se escribe
+/// como /NM en el PDF para poder reemplazarla o quitarla en un guardado
+/// posterior.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Edit {
+    pub(crate) id: String,
+    pub(crate) value: Annotation,
+}
+
 /// Anotaciones y el estado de las herramientas que las crean.
 pub(crate) struct AnnotationState {
-    /// Anotaciones en memoria, en orden de creación. Las primeras `saved` ya
-    /// están escritas en el archivo; el resto son los cambios pendientes.
-    pub(crate)     edits: RefCell<Vec<Annotation>>,
-    pub(crate)     saved: Cell<usize>,
+    /// Anotaciones en memoria, en orden de creación: es lo que se dibuja sobre la
+    /// página y lo que se escribe al guardar.
+    pub(crate)     edits: RefCell<Vec<Edit>>,
+    /// Copia exacta de lo que el archivo tiene escrito, en el mismo orden. Es la
+    /// referencia para decidir qué está pendiente y qué hay que reemplazar.
+    pub(crate)     persisted: RefCell<Vec<Edit>>,
+    /// Identificador de la anotación elegida: la que responde a `Supr` y al menú.
+    pub(crate)     selected: RefCell<Option<String>>,
+    /// Instantáneas anteriores a cada cambio, de la más vieja a la más nueva.
+    pub(crate)     undo_stack: RefCell<Vec<Vec<Edit>>>,
+    pub(crate)     redo_stack: RefCell<Vec<Vec<Edit>>>,
+    /// Número de la próxima anotación nueva.
+    pub(crate)     next_id: Cell<u64>,
+    /// Prefijo único de la sesión: dos visores abiertos a la vez no pueden
+    /// generar el mismo identificador.
+    pub(crate)     id_prefix: String,
+    /// Arrastre de una nota en curso, si hay uno.
+    pub(crate)     note_drag: RefCell<Option<NoteDrag>>,
+    /// Nota bajo el puntero, para no reescribir el cursor en cada movimiento.
+    pub(crate)     hover: RefCell<Option<String>>,
     pub(crate)     underline: Cell<MarkTool>,
     pub(crate)     highlight: Cell<MarkTool>,
     /// Herramienta «insertar texto» armada: el próximo clic coloca la nota.
     pub(crate)     text_tool: Cell<bool>,
     /// Texto y fuente que dejó el diálogo, esperando ese clic.
     pub(crate)     draft: RefCell<Option<TextDraft>>,
-    /// Anotaciones deshechas, en orden de deshacer: `Ctrl+Shift+Z` las repone.
-    pub(crate)     redo: RefCell<Vec<Annotation>>,
 }
 
 /// Borrador de la herramienta «insertar texto»: lo que se escribió en el
@@ -211,6 +239,20 @@ pub(crate) struct AnnotationState {
 pub(crate) struct TextDraft {
     pub(crate) text: String,
     pub(crate) font: FontChoice,
+}
+
+/// Arrastre de una nota en curso: qué nota, desde dónde se agarró en la vista y
+/// dónde estaba su esquina superior izquierda en puntos PDF.
+#[derive(Clone, Debug)]
+pub(crate) struct NoteDrag {
+    pub(crate) id: String,
+    pub(crate) page: usize,
+    /// Punto de la vista donde empezó el arrastre, en píxeles lógicos.
+    pub(crate) grab: (f64, f64),
+    /// `at` de la nota cuando empezó el arrastre.
+    pub(crate) origin: (f64, f64),
+    /// True una vez que se empujó la instantánea y la nota se movió.
+    pub(crate) moved: bool,
 }
 
 /// Transient interaction state.
@@ -494,7 +536,17 @@ impl Viewer {
             },
             annot: AnnotationState {
                 edits: RefCell::new(Vec::new()),
-                saved: Cell::new(0),
+                persisted: RefCell::new(Vec::new()),
+                selected: RefCell::new(None),
+                undo_stack: RefCell::new(Vec::new()),
+                redo_stack: RefCell::new(Vec::new()),
+                next_id: Cell::new(0),
+                // Proceso y nanosegundos del arranque: dos sesiones no pueden
+                // generar el mismo identificador, así que el `/NM` de una no pisa
+                // el de la otra.
+                id_prefix: format!("mlnpdf-{}-{}", std::process::id(), session_nanos()),
+                note_drag: RefCell::new(None),
+                hover: RefCell::new(None),
                 underline: Cell::new(MarkTool {
                     color: UNDERLINE_COLOR,
                     active: false,
@@ -505,7 +557,6 @@ impl Viewer {
                 }),
                 text_tool: Cell::new(false),
                 draft: RefCell::new(None),
-                redo: RefCell::new(Vec::new()),
             },
             input: InteractionState {
                 hand_mode: Cell::new(false),
@@ -698,6 +749,7 @@ impl Viewer {
         }
 
         Self::install_shortcuts(&viewer);
+        Self::install_note_keys(&viewer);
         Self::install_ctrl_scroll(&viewer);
         Self::install_page_sync(&viewer);
         Self::install_copy_shortcut(&viewer);
@@ -829,8 +881,26 @@ impl Viewer {
             viewer.toggle_mark_mode(MarkKind::Highlight);
         });
         Self::install_action(viewer, "insert-text", |viewer| viewer.prompt_text_note());
-        Self::install_action(viewer, "undo", |viewer| viewer.undo());
-        Self::install_action(viewer, "redo", |viewer| viewer.redo());
+        Self::install_action(viewer, "undo", |viewer| {
+            let undone = viewer.undo();
+            viewer.announce_change(if undone {
+                "Cambio deshecho"
+            } else {
+                "No hay cambios para deshacer."
+            });
+        });
+        Self::install_action(viewer, "redo", |viewer| {
+            let redone = viewer.redo();
+            viewer.announce_change(if redone {
+                "Cambio rehecho"
+            } else {
+                "No hay cambios para rehacer."
+            });
+        });
+        Self::install_action(viewer, "note-edit", |viewer| viewer.prompt_note_edit());
+        Self::install_action(viewer, "note-delete", |viewer| {
+            viewer.delete_selected_note();
+        });
         Self::install_action(viewer, "save-annotations", |viewer| viewer.save_annotations());
         Self::install_action(viewer, "save-annotations-as", |viewer| {
             viewer.save_annotations_as(None);
@@ -838,6 +908,11 @@ impl Viewer {
 
         let controller = gtk::ShortcutController::new();
         for (trigger, action) in SHORTCUTS {
+            // `Delete` lo maneja el controlador en fase de burbuja: como atajo se
+            // quedaría con la tecla que usan los campos de texto.
+            if trigger == "Delete" {
+                continue;
+            }
             let Some(trigger) = gtk::ShortcutTrigger::parse_string(trigger) else {
                 continue;
             };
@@ -845,6 +920,7 @@ impl Viewer {
             controller.add_shortcut(shortcut);
         }
         viewer.ui.window.add_controller(controller);
+        viewer.refresh_note_actions();
     }
 
     pub(crate) fn install_action<F>(viewer: &Rc<Self>, name: &str, action: F)
@@ -1352,7 +1428,7 @@ impl Viewer {
             overlay.set_size_request(logical.0 as i32, logical.1 as i32);
 
             if let Some(viewer) = self.me.borrow().upgrade() {
-                Self::selection_gesture(&viewer, index, &overlay);
+                Self::selection_gesture(&viewer, index, &overlay, &canvas);
             }
 
             pictures.push(overlay.clone());
@@ -1715,9 +1791,12 @@ impl Viewer {
             text: draft.text,
             font: draft.font,
         };
-        self.annot.edits.borrow_mut().push(Annotation::Note(note));
-        // Una nota nueva corta la línea de tiempo de rehacer.
-        self.annot.redo.borrow_mut().clear();
+        self.begin_edit();
+        let id = self.new_id();
+        self.annot.edits.borrow_mut().push(Edit {
+            id,
+            value: Annotation::Note(note),
+        });
         // El borrador se coloca una sola vez: el siguiente clic no repite el
         // texto sin preguntar.
         self.annot.draft.borrow_mut().take();
@@ -1726,17 +1805,37 @@ impl Viewer {
         true
     }
 
-    /// Diálogo modal de la nota: el texto y el selector de fuente de GTK.
-    /// `Insertar` deja el borrador en el estado y arma la herramienta para el
-    /// clic que fija la esquina; `Cancelar` la desarma.
+    /// Diálogo de la nota vacío: el texto y la fuente se piden y, al aceptar, la
+    /// herramienta queda armada para el clic que fija la esquina.
     pub(crate) fn prompt_text_note(self: &Rc<Self>) {
+        self.prompt_note_text(None);
+    }
+
+    /// Diálogo para cambiar el texto y la fuente de la nota elegida, con lo que ya
+    /// tiene precargado. `Cancelar` no cambia nada.
+    pub(crate) fn prompt_note_edit(self: &Rc<Self>) {
+        let Some(id) = self.annot.selected.borrow().clone() else {
+            return;
+        };
+        let Some(note) = self.note(&id) else {
+            return;
+        };
+        self.prompt_note_text(Some((id, note)));
+    }
+
+    /// El diálogo de la nota, en sus dos usos: insertar una nueva (`None`) o
+    /// editar una existente (`Some`), que llega con su texto y su fuente.
+    fn prompt_note_text(self: &Rc<Self>, editing: Option<(String, TextNote)>) {
         // Sin documento no hay página donde insertar: la herramienta está tan
         // inactiva como las de marcado.
         if self.doc.document.borrow().is_none() {
             return;
         }
+        let target = editing.as_ref().map(|(id, _)| id.clone());
+        let inserting = target.is_none();
+
         let window = gtk::Window::builder()
-            .title("Insertar texto")
+            .title(if inserting { "Insertar texto" } else { "Editar texto" })
             .modal(true)
             .transient_for(&self.ui.window)
             .default_width(420)
@@ -1748,14 +1847,24 @@ impl Viewer {
             .build();
         accessible_label(&entry, "Texto de la nota");
 
-        // El selector de fuente de GTK, con «Sans 12» como punto de partida.
+        // El selector de fuente de GTK, con lo que ya tiene la nota o «Sans 12»
+        // como punto de partida.
         let font_dialog = gtk::FontDialog::builder()
             .title("Fuente de la nota")
             .modal(true)
             .build();
-        let mut initial = pango::FontDescription::new();
-        initial.set_family("Sans");
-        initial.set_size(12 * pango::SCALE);
+        let initial = match &editing {
+            Some((_, note)) => font_description(&note.font, 1.0),
+            None => {
+                let mut initial = pango::FontDescription::new();
+                initial.set_family("Sans");
+                initial.set_size(12 * pango::SCALE);
+                initial
+            }
+        };
+        if let Some((_, note)) = &editing {
+            entry.set_text(&note.text);
+        }
         let font_button = gtk::FontDialogButton::builder()
             .dialog(&font_dialog)
             .font_desc(&initial)
@@ -1764,7 +1873,7 @@ impl Viewer {
             .build();
         accessible_label(&font_button, "Fuente de la nota");
 
-        let accept = gtk::Button::with_label("Insertar");
+        let accept = gtk::Button::with_label(if inserting { "Insertar" } else { "Guardar" });
         accept.add_css_class("suggested-action");
         let cancel = gtk::Button::with_label("Cancelar");
 
@@ -1778,9 +1887,11 @@ impl Viewer {
         content.set_margin_bottom(14);
         content.set_margin_start(14);
         content.set_margin_end(14);
-        content.append(&gtk::Label::new(Some(
-            "Texto a insertar en la página. Después, hacé clic en el lugar:",
-        )));
+        content.append(&gtk::Label::new(Some(if inserting {
+            "Texto a insertar en la página. Después, hacé clic en el lugar:"
+        } else {
+            "Texto de la nota. Al guardar se vuelve a medir con esta fuente:"
+        })));
         content.append(&entry);
         content.append(&font_button);
         content.append(&buttons);
@@ -1802,7 +1913,12 @@ impl Viewer {
                 .map(font_choice)
                 .unwrap_or_else(default_font_choice);
             window_ref.close();
-            viewer.apply_text_draft(text, font);
+            match target.as_ref() {
+                Some(id) => {
+                    viewer.apply_note_text(id, text, font);
+                }
+                None => viewer.apply_text_draft(text, font),
+            }
         });
 
         let weak = Rc::downgrade(self);
@@ -1888,9 +2004,12 @@ impl Viewer {
             MarkKind::Underline => TextMark::underline(selection.page, rects, color),
             MarkKind::Highlight => TextMark::highlight(selection.page, rects, color),
         };
-        self.annot.edits.borrow_mut().push(Annotation::Mark(mark));
-        // Un marcado nuevo corta la línea de tiempo de rehacer.
-        self.annot.redo.borrow_mut().clear();
+        self.begin_edit();
+        let id = self.new_id();
+        self.annot.edits.borrow_mut().push(Edit {
+            id,
+            value: Annotation::Mark(mark),
+        });
 
         // La selección azul taparía el marcado que se acaba de poner.
         *self.sel.selection.borrow_mut() = None;
@@ -1899,9 +2018,10 @@ impl Viewer {
         true
     }
 
-    /// True when there are annotations that are not in the file yet.
+    /// True cuando las anotaciones en memoria difieren de las que el archivo
+    /// tiene escritas: mismo orden y mismos valores.
     pub(crate) fn has_pending_marks(&self) -> bool {
-        self.annot.saved.get() < self.annot.edits.borrow().len()
+        *self.annot.edits.borrow() != *self.annot.persisted.borrow()
     }
 
     /// Escribe las anotaciones pendientes en `target` y devuelve si quedaron
@@ -1914,17 +2034,18 @@ impl Viewer {
             return false;
         };
 
-        let pending: Vec<Annotation> = self.pending_edits();
-        if pending.is_empty() {
+        if !self.has_pending_marks() {
             return true;
         }
 
-        match write_annotations(&source, target, &pending) {
+        let current = annotations_with_ids(&self.annot.edits.borrow());
+        let persisted = annotations_with_ids(&self.annot.persisted.borrow());
+        match write_annotations(&source, target, &current, &persisted) {
             Ok(written) => {
                 // Sólo es un guardado del documento abierto si el destino es ese
                 // archivo: la copia no deja el original al día.
                 if self.is_open_file(target) {
-                    self.annot.saved.set(self.annot.edits.borrow().len());
+                    *self.annot.persisted.borrow_mut() = self.annot.edits.borrow().clone();
                 }
                 let plural = if written == 1 {
                     "anotación"
@@ -2037,10 +2158,14 @@ impl Viewer {
         }
     }
 
-    /// Anotaciones que todavía no están en el archivo.
-    pub(crate) fn pending_edits(&self) -> Vec<Annotation> {
+    /// Cuántas anotaciones difieren del archivo: lo que anuncia el diálogo de
+    /// cambios sin guardar y lo que se perdería al descartar.
+    pub(crate) fn pending_count(&self) -> usize {
         let edits = self.annot.edits.borrow();
-        edits[self.annot.saved.get().min(edits.len())..].to_vec()
+        let persisted = self.annot.persisted.borrow();
+        let added = edits.iter().filter(|edit| !persisted.contains(*edit)).count();
+        let removed = persisted.iter().filter(|edit| !edits.contains(*edit)).count();
+        added + removed
     }
 
     /// Pregunta qué hacer con las anotaciones sin guardar y sólo después ejecuta
@@ -2055,7 +2180,7 @@ impl Viewer {
             return;
         }
 
-        let count = self.pending_edits().len();
+        let count = self.pending_count();
         let name = self
             .doc
             .current_path
@@ -2120,93 +2245,421 @@ impl Viewer {
         self.save_pending_edits(&path)
     }
 
-    /// Tira los cambios pendientes y redibuja para que desaparezcan de la página.
-    /// Lo que ya está escrito en el archivo se queda.
+    /// Vuelve a lo que está escrito en el archivo: los cambios pendientes se tiran
+    /// y lo guardado se queda. Los historiales no pueden sobrevivir a eso, porque
+    /// deshacer repondría anotaciones de un estado que ya no existe.
     pub(crate) fn discard_edits(&self) {
-        let saved = self.annot.saved.get().min(self.annot.edits.borrow().len());
-        let pages: Vec<usize> = self.annot.edits.borrow()[saved..]
-            .iter()
-            .map(Annotation::page)
-            .collect();
-        self.annot.edits.borrow_mut().truncate(saved);
-        self.annot.redo.borrow_mut().clear();
+        let persisted = self.annot.persisted.borrow().clone();
+        let pages = changed_pages(&self.annot.edits.borrow(), &persisted);
+        *self.annot.edits.borrow_mut() = persisted;
+        self.annot.undo_stack.borrow_mut().clear();
+        self.annot.redo_stack.borrow_mut().clear();
+        *self.annot.selected.borrow_mut() = None;
+        self.refresh_note_actions();
         for page in pages {
             self.queue_page_draw(page);
         }
     }
 
-    /// Deshace la última anotación que todavía no está en el PDF. Lo que ya se
-    /// escribió en el archivo no se puede deshacer desde el visor: habría que
-    /// reescribir la anotación.
-    pub(crate) fn undo_mark(&self) -> bool {
-        let saved = self.annot.saved.get();
-        let edit = {
-            let mut edits = self.annot.edits.borrow_mut();
-            if edits.len() <= saved {
-                return false;
-            }
-            let Some(edit) = edits.pop() else {
-                return false;
-            };
-            edit
-        };
-        self.queue_page_draw(edit.page());
-        self.annot.redo.borrow_mut().push(edit);
-        true
+    /// Empuja una copia de las anotaciones a la pila de deshacer y vacía la de
+    /// rehacer: un cambio nuevo corta la línea de tiempo. Se llama siempre ANTES
+    /// de mutar, así la instantánea es el estado al que hay que volver.
+    pub(crate) fn begin_edit(&self) {
+        let snapshot = self.annot.edits.borrow().clone();
+        self.push_undo(snapshot);
+        self.annot.redo_stack.borrow_mut().clear();
     }
 
-    /// Vuelve a poner la última anotación deshecha. Una anotación nueva descarta
-    /// el historial de rehacer: ya no hay una línea de tiempo que continuar.
-    pub(crate) fn redo_mark(&self) -> bool {
-        let Some(edit) = self.annot.redo.borrow_mut().pop() else {
+    /// Empuja una instantánea a la pila de deshacer, descartando la más vieja
+    /// cuando se pasa del tope.
+    fn push_undo(&self, snapshot: Vec<Edit>) {
+        let mut undo = self.annot.undo_stack.borrow_mut();
+        undo.push(snapshot);
+        if undo.len() > UNDO_LIMIT {
+            undo.remove(0);
+        }
+    }
+
+    /// Deshace el último cambio restaurando su instantánea. Alcanza también a lo
+    /// que ya está escrito en el PDF: el próximo guardado quita del archivo la
+    /// anotación que ya no está en memoria, por su `/NM`. Devuelve si había algo
+    /// que deshacer.
+    pub(crate) fn undo(&self) -> bool {
+        let Some(previous) = self.annot.undo_stack.borrow_mut().pop() else {
             return false;
         };
-        self.queue_page_draw(edit.page());
-        self.annot.edits.borrow_mut().push(edit);
+        let current = self.annot.edits.borrow().clone();
+        let pages = changed_pages(&current, &previous);
+        self.annot.redo_stack.borrow_mut().push(current);
+        *self.annot.edits.borrow_mut() = previous;
+        self.after_history_change(&pages);
         true
     }
 
-    /// Ctrl+Shift+Z, con aviso cuando no hay nada que rehacer.
-    pub(crate) fn redo(self: &Rc<Self>) {
-        if self.redo_mark() {
-            self.ui.window.announce(
-                "Cambio rehecho",
-                gtk::AccessibleAnnouncementPriority::Medium,
-            );
-            return;
-        }
-        self.ui.window.announce(
-            "No hay cambios para rehacer.",
-            gtk::AccessibleAnnouncementPriority::Medium,
-        );
+    /// Rehace el último cambio deshecho.
+    pub(crate) fn redo(&self) -> bool {
+        let Some(next) = self.annot.redo_stack.borrow_mut().pop() else {
+            return false;
+        };
+        let current = self.annot.edits.borrow().clone();
+        let pages = changed_pages(&current, &next);
+        self.push_undo(current);
+        *self.annot.edits.borrow_mut() = next;
+        self.after_history_change(&pages);
+        true
     }
 
-    /// Ctrl+Z, con aviso cuando no hay nada que deshacer.
-    pub(crate) fn undo(self: &Rc<Self>) {
-        if self.undo_mark() {
-            self.ui.window.announce(
-                "Cambio deshecho",
-                gtk::AccessibleAnnouncementPriority::Medium,
-            );
+    /// Lo que hay que hacer después de mover el historial: soltar una selección
+    /// que ya no apunta a ninguna anotación y redibujar lo que cambió.
+    fn after_history_change(&self, pages: &[usize]) {
+        self.keep_visible_selection();
+        for page in pages {
+            self.queue_page_draw(*page);
+        }
+    }
+
+    /// Suelta la selección cuando la anotación elegida ya no existe.
+    fn keep_visible_selection(&self) {
+        let Some(selected) = self.annot.selected.borrow().clone() else {
+            return;
+        };
+        if self.annot.edits.borrow().iter().any(|edit| edit.id == selected) {
             return;
         }
-        let message = if self.annot.edits.borrow().is_empty() {
-            "No hay cambios para deshacer."
-        } else {
-            "Las anotaciones ya escritas en el PDF no se pueden deshacer desde el visor."
-        };
-        self.ui.window.announce(message, gtk::AccessibleAnnouncementPriority::Medium);
+        *self.annot.selected.borrow_mut() = None;
+        self.refresh_note_actions();
+    }
+
+    /// Anuncia un cambio de deshacer o rehacer por el canal accesible.
+    pub(crate) fn announce_change(&self, message: &str) {
+        self.ui
+            .window
+            .announce(message, gtk::AccessibleAnnouncementPriority::Medium);
     }
 
     /// Deja el documento sin anotaciones en memoria: se usan al abrir otro.
     pub(crate) fn clear_edits(&self) {
         self.annot.edits.borrow_mut().clear();
-        self.annot.redo.borrow_mut().clear();
-        self.annot.saved.set(0);
+        self.annot.persisted.borrow_mut().clear();
+        self.annot.undo_stack.borrow_mut().clear();
+        self.annot.redo_stack.borrow_mut().clear();
         self.annot.draft.borrow_mut().take();
+        self.annot.note_drag.borrow_mut().take();
+        self.annot.hover.borrow_mut().take();
+        *self.annot.selected.borrow_mut() = None;
         self.set_text_tool(false);
         self.set_mark_mode(MarkKind::Underline, false);
         self.set_mark_mode(MarkKind::Highlight, false);
+        self.refresh_note_actions();
+    }
+
+    /// Identificador de una anotación nueva: único en esta sesión y estable
+    /// mientras el documento esté abierto. Es el `/NM` que se escribe en el PDF.
+    pub(crate) fn new_id(&self) -> String {
+        let next = self.annot.next_id.get() + 1;
+        self.annot.next_id.set(next);
+        format!("{}-{next}", self.annot.id_prefix)
+    }
+
+    /// Nota bajo el punto `(x, y)` de la vista, si hay alguna. Se busca sobre el
+    /// rectángulo de la nota, que es lo que se ve y lo que se puede agarrar; la
+    /// última dibujada gana.
+    pub(crate) fn note_at(&self, page: usize, x: f64, y: f64) -> Option<String> {
+        let point = self.view_to_pdf(page, x, y)?;
+        let edits = self.annot.edits.borrow();
+        edits.iter().rev().find_map(|edit| match &edit.value {
+            Annotation::Note(note) if note.page == page && note_contains(note, point) => {
+                Some(edit.id.clone())
+            }
+            _ => None,
+        })
+    }
+
+    /// Copia de la nota `id`, si esa anotación existe y es una nota de texto.
+    pub(crate) fn note(&self, id: &str) -> Option<TextNote> {
+        self.annot
+            .edits
+            .borrow()
+            .iter()
+            .find(|edit| edit.id == id)
+            .and_then(|edit| match &edit.value {
+                Annotation::Note(note) => Some(note.clone()),
+                Annotation::Mark(_) => None,
+            })
+    }
+
+    /// Elige una anotación (o ninguna) y redibuja las páginas que cambian. Sólo
+    /// una puede estar elegida: es la que responde a `Supr` y al menú.
+    pub(crate) fn select_note(&self, id: Option<String>) {
+        let previous = self.annot.selected.borrow().clone();
+        if previous == id {
+            return;
+        }
+        let pages = [
+            self.edit_page(previous.as_deref()),
+            self.edit_page(id.as_deref()),
+        ];
+        *self.annot.selected.borrow_mut() = id;
+        self.refresh_note_actions();
+        for page in pages.into_iter().flatten() {
+            self.queue_page_draw(page);
+        }
+    }
+
+    /// Página de la anotación `id`, si todavía está.
+    fn edit_page(&self, id: Option<&str>) -> Option<usize> {
+        let id = id?;
+        self.annot
+            .edits
+            .borrow()
+            .iter()
+            .find(|edit| edit.id == id)
+            .map(|edit| edit.value.page())
+    }
+
+    /// Habilita las acciones de la nota sólo mientras hay una elegida: sin
+    /// selección no hay nada que editar ni borrar.
+    fn refresh_note_actions(&self) {
+        let selected = self.annot.selected.borrow().is_some();
+        for name in ["note-edit", "note-delete"] {
+            let action = self
+                .ui
+                .window
+                .lookup_action(name)
+                .and_then(|action| action.downcast::<gio::SimpleAction>().ok());
+            if let Some(action) = action {
+                action.set_enabled(selected);
+            }
+        }
+    }
+
+    /// Borra la nota elegida. La instantánea va antes de tocar la lista: el
+    /// borrado se deshace como cualquier otro cambio.
+    pub(crate) fn delete_selected_note(&self) -> bool {
+        let Some(id) = self.annot.selected.borrow().clone() else {
+            return false;
+        };
+        let Some(page) = self.edit_page(Some(&id)) else {
+            self.select_note(None);
+            return false;
+        };
+        self.begin_edit();
+        self.annot.edits.borrow_mut().retain(|edit| edit.id != id);
+        *self.annot.selected.borrow_mut() = None;
+        self.refresh_note_actions();
+        self.queue_page_draw(page);
+        self.ui
+            .window
+            .announce("Nota borrada", gtk::AccessibleAnnouncementPriority::Medium);
+        true
+    }
+
+    /// Empieza a arrastrar la nota que está bajo `(x, y)` y devuelve si el gesto
+    /// es un arrastre de nota: si lo es, no hay selección de texto.
+    pub(crate) fn note_drag_begin(&self, page: usize, x: f64, y: f64) -> bool {
+        let Some(id) = self.note_at(page, x, y) else {
+            return false;
+        };
+        let Some(origin) = self.note(id.as_str()).map(|note| note.at) else {
+            return false;
+        };
+        // La selección de texto anterior se suelta: este gesto mueve la nota.
+        if self.sel.selection.borrow_mut().take().is_some() {
+            self.sel.selection_rects.borrow_mut().clear();
+        }
+        self.select_note(Some(id.clone()));
+        *self.annot.note_drag.borrow_mut() = Some(NoteDrag {
+            id,
+            page,
+            grab: (x, y),
+            origin,
+            moved: false,
+        });
+        self.queue_page_draw(page);
+        true
+    }
+
+    /// True mientras se está arrastrando una nota.
+    pub(crate) fn note_drag_active(&self) -> bool {
+        self.annot.note_drag.borrow().is_some()
+    }
+
+    /// Mueve la nota del arrastre con el desplazamiento del puntero. El
+    /// desplazamiento se mide en puntos de la página, así que ni el zoom ni la
+    /// rotación de la vista cambian el resultado; la instantánea para deshacer se
+    /// empuja una sola vez por arrastre.
+    pub(crate) fn note_drag_update(&self, offset_x: f64, offset_y: f64) -> bool {
+        if offset_x == 0.0 && offset_y == 0.0 {
+            return false;
+        }
+        let Some((page, id, at)) = self.note_drag_target(offset_x, offset_y) else {
+            return false;
+        };
+        if !self
+            .annot
+            .note_drag
+            .borrow()
+            .as_ref()
+            .is_some_and(|drag| drag.moved)
+        {
+            self.begin_edit();
+            if let Some(drag) = self.annot.note_drag.borrow_mut().as_mut() {
+                drag.moved = true;
+            }
+        }
+        if !self.set_note_position(&id, at) {
+            return false;
+        }
+        self.queue_page_draw(page);
+        true
+    }
+
+    /// Página, identificador y posición nueva de la nota que se está arrastrando.
+    fn note_drag_target(&self, offset_x: f64, offset_y: f64) -> Option<(usize, String, (f64, f64))> {
+        let drag = self.annot.note_drag.borrow();
+        let drag = drag.as_ref()?;
+        let anchor = self.view_to_pdf(drag.page, drag.grab.0, drag.grab.1)?;
+        let head = self.view_to_pdf(drag.page, drag.grab.0 + offset_x, drag.grab.1 + offset_y)?;
+        Some((
+            drag.page,
+            drag.id.clone(),
+            (
+                drag.origin.0 + head.0 - anchor.0,
+                drag.origin.1 + head.1 - anchor.1,
+            ),
+        ))
+    }
+
+    /// Pone la esquina superior izquierda de la nota `id` en `at`.
+    fn set_note_position(&self, id: &str, at: (f64, f64)) -> bool {
+        let mut edits = self.annot.edits.borrow_mut();
+        let Some(edit) = edits.iter_mut().find(|edit| edit.id == id) else {
+            return false;
+        };
+        match &mut edit.value {
+            Annotation::Note(note) => {
+                note.at = at;
+                true
+            }
+            Annotation::Mark(_) => false,
+        }
+    }
+
+    /// Suelta la nota que se estaba arrastrando; devuelve si había una.
+    pub(crate) fn note_drag_end(&self) -> bool {
+        self.annot.note_drag.borrow_mut().take().is_some()
+    }
+
+    /// Cambia el texto y la fuente de la nota `id`, la vuelve a medir y la
+    /// redibuja. Un texto en blanco no la borra: una nota sin texto no se puede
+    /// leer ni volver a editar.
+    pub(crate) fn apply_note_text(&self, id: &str, text: String, font: FontChoice) -> bool {
+        if text.trim().is_empty() {
+            return false;
+        }
+        let Some(note) = self.note(id) else {
+            return false;
+        };
+        let (width, height) = measure_text(&text, &font);
+        self.begin_edit();
+        {
+            let mut edits = self.annot.edits.borrow_mut();
+            let Some(edit) = edits.iter_mut().find(|edit| edit.id == id) else {
+                return false;
+            };
+            let Annotation::Note(value) = &mut edit.value else {
+                return false;
+            };
+            value.text = text;
+            value.font = font;
+            value.width = width;
+            value.height = height;
+        }
+        self.queue_page_draw(note.page);
+        true
+    }
+
+    /// Cursor de la capa de la página: `grab` sobre una nota, porque se puede
+    /// arrastrar. El modo mano y las herramientas armadas mandan: mientras alguno
+    /// esté activo, el cursor es el suyo.
+    pub(crate) fn update_note_cursor(&self, page: usize, x: f64, y: f64, overlay: &gtk::Overlay) {
+        if self.input.hand_mode.get()
+            || self.active_mark_tool().is_some()
+            || self.text_tool_active()
+        {
+            return;
+        }
+        let hit = self.note_at(page, x, y);
+        let mut hover = self.annot.hover.borrow_mut();
+        if *hover == hit {
+            return;
+        }
+        let cursor = if hit.is_some() {
+            gdk::Cursor::from_name("grab", None)
+        } else {
+            None
+        };
+        *hover = hit;
+        overlay.set_cursor(cursor.as_ref());
+    }
+
+    /// El puntero salió de la página: ya no hay nota bajo el cursor.
+    pub(crate) fn clear_note_cursor(&self, overlay: &gtk::Overlay) {
+        self.annot.hover.borrow_mut().take();
+        overlay.set_cursor(None::<&gdk::Cursor>);
+    }
+
+    /// Menú contextual de la nota: editar el texto o borrarla. `Mover con el
+    /// ratón` contesta cómo se mueve sin ofrecer un camino aparte, así que va sin
+    /// acción y queda insensible.
+    pub(crate) fn open_note_menu(&self, anchor: &gtk::DrawingArea, x: f64, y: f64) {
+        let menu = gio::Menu::new();
+        menu.append(Some("Editar texto"), Some("win.note-edit"));
+        menu.append(Some("Borrar"), Some("win.note-delete"));
+        menu.append(Some("Mover con el ratón"), None::<&str>);
+
+        let popover = gtk::PopoverMenu::from_model(Some(&menu));
+        popover.set_has_arrow(false);
+        // El menú cuelga de la página y se suelta al cerrarse: un popover sin padre
+        // no se puede abrir, y dejarlo colgado acumularía widgets.
+        popover.set_parent(anchor);
+        popover.connect_closed(|popover| popover.unparent());
+        let place = gdk::Rectangle::new(x as i32, y as i32, 1, 1);
+        popover.set_pointing_to(Some(&place));
+        popover.popup();
+    }
+
+    /// `Supr` y `Retroceso` borran la nota elegida. El controlador va en fase de
+    /// burbuja y no hace nada cuando el foco está en un campo de texto: ahí esas
+    /// teclas borran caracteres.
+    pub(crate) fn install_note_keys(viewer: &Rc<Self>) {
+        let keys = gtk::EventControllerKey::new();
+        keys.set_propagation_phase(gtk::PropagationPhase::Bubble);
+        let weak = Rc::downgrade(viewer);
+        keys.connect_key_pressed(move |_, keyval, _, _| {
+            if keyval != gdk::Key::Delete && keyval != gdk::Key::BackSpace {
+                return glib::Propagation::Proceed;
+            }
+            let Some(viewer) = weak.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
+            if viewer.text_input_focused() || !viewer.delete_selected_note() {
+                return glib::Propagation::Proceed;
+            }
+            glib::Propagation::Stop
+        });
+        viewer.ui.window.add_controller(keys);
+    }
+
+    /// True cuando el foco está en un campo que usa `Supr` o `Retroceso` para
+    /// editar texto.
+    fn text_input_focused(&self) -> bool {
+        gtk::prelude::GtkWindowExt::focus(&self.ui.window).is_some_and(|widget| {
+            widget.is::<gtk::Entry>()
+                || widget.is::<gtk::Text>()
+                || widget.is::<gtk::TextView>()
+                || widget.is::<gtk::PasswordEntry>()
+        })
     }
 
     /// Dibuja la capa de la página: primero las anotaciones, que son parte del
@@ -2228,7 +2681,7 @@ impl Viewer {
     /// de texto en negro con su fuente.
     pub(crate) fn draw_annotations(&self, page: usize, context: &cairo::Context) {
         let edits = self.annot.edits.borrow();
-        if edits.iter().all(|edit| edit.page() != page) {
+        if edits.iter().all(|edit| edit.value.page() != page) {
             return;
         }
         let Some(size) = self.doc.page_sizes.borrow().get(page).copied() else {
@@ -2237,12 +2690,14 @@ impl Viewer {
 
         let zoom = self.view.zoom.get();
         let rotation = self.view.rotation.get();
+        let selected = self.annot.selected.borrow().clone();
 
-        for edit in edits.iter().filter(|edit| edit.page() == page) {
-            let mark = match edit {
+        for edit in edits.iter().filter(|edit| edit.value.page() == page) {
+            let mark = match &edit.value {
                 Annotation::Mark(mark) => mark,
                 Annotation::Note(note) => {
-                    draw_note(context, note, size, rotation, zoom);
+                    let chosen = selected.as_deref() == Some(edit.id.as_str());
+                    draw_note(context, note, size, rotation, zoom, chosen);
                     continue;
                 }
             };
@@ -2345,6 +2800,10 @@ impl Viewer {
         }
         if self.input.hand_mode.get() {
             self.set_hand_mode(false);
+            return glib::Propagation::Stop;
+        }
+        if self.annot.selected.borrow().is_some() {
+            self.select_note(None);
             return glib::Propagation::Stop;
         }
         glib::Propagation::Proceed
@@ -2963,7 +3422,12 @@ impl Viewer {
         ))
     }
 
-    pub(crate) fn selection_gesture(viewer: &Rc<Self>, page: usize, overlay: &gtk::Overlay) {
+    pub(crate) fn selection_gesture(
+        viewer: &Rc<Self>,
+        page: usize,
+        overlay: &gtk::Overlay,
+        canvas: &gtk::DrawingArea,
+    ) {
         let gesture = gtk::GestureDrag::new();
 
         let weak = Rc::downgrade(viewer);
@@ -2984,24 +3448,92 @@ impl Viewer {
                 viewer.insert_text_note(page, x, y);
                 return;
             }
+            // Arrastrar desde dentro de una nota la mueve y no selecciona texto.
+            // Con una herramienta de marcado armada el arrastre marca igual.
+            if viewer.active_mark_tool().is_none() && viewer.note_drag_begin(page, x, y) {
+                return;
+            }
             viewer.begin_selection(page, x, y);
         });
 
         let weak = Rc::downgrade(viewer);
         gesture.connect_drag_update(move |_, offset_x, offset_y| {
-            if let Some(viewer) = weak.upgrade() {
+            let Some(viewer) = weak.upgrade() else {
+                return;
+            };
+            if viewer.note_drag_active() {
+                viewer.note_drag_update(offset_x, offset_y);
+            } else {
                 viewer.update_selection(page, offset_x, offset_y);
             }
         });
 
         let weak = Rc::downgrade(viewer);
         gesture.connect_drag_end(move |_, _, _| {
-            if let Some(viewer) = weak.upgrade() {
+            let Some(viewer) = weak.upgrade() else {
+                return;
+            };
+            // Un arrastre de nota no termina en una selección de texto.
+            if !viewer.note_drag_end() {
                 viewer.finish_selection();
             }
         });
 
         overlay.add_controller(gesture);
+
+        // Clic sobre una nota: la elige; el doble clic abre el diálogo del texto y
+        // el clic derecho el menú. Un clic fuera de toda nota deselecciona.
+        let click = gtk::GestureClick::new();
+        click.set_button(0);
+        let weak = Rc::downgrade(viewer);
+        // El menú se cuelga de la capa que se dibuja, no del `Overlay`: así no entra
+        // en la maquetación de la página.
+        let canvas_for_menu = canvas.clone();
+        click.connect_pressed(move |gesture, presses, x, y| {
+            let Some(viewer) = weak.upgrade() else {
+                return;
+            };
+            if viewer.input.hand_mode.get()
+                || viewer.text_tool_active()
+                || viewer.active_mark_tool().is_some()
+            {
+                return;
+            }
+            match (gesture.current_button(), viewer.note_at(page, x, y)) {
+                (gdk::BUTTON_SECONDARY, Some(id)) => {
+                    viewer.select_note(Some(id));
+                    viewer.open_note_menu(&canvas_for_menu, x, y);
+                    gesture.set_state(gtk::EventSequenceState::Claimed);
+                }
+                (gdk::BUTTON_PRIMARY, Some(id)) => {
+                    viewer.select_note(Some(id));
+                    if presses >= 2 {
+                        viewer.prompt_note_edit();
+                    }
+                }
+                (gdk::BUTTON_PRIMARY, None) => viewer.select_note(None),
+                _ => {}
+            }
+        });
+        overlay.add_controller(click);
+
+        // El cursor cuenta que la nota se puede arrastrar.
+        let motion = gtk::EventControllerMotion::new();
+        let weak = Rc::downgrade(viewer);
+        let overlay_for_motion = overlay.clone();
+        motion.connect_motion(move |_, x, y| {
+            if let Some(viewer) = weak.upgrade() {
+                viewer.update_note_cursor(page, x, y, &overlay_for_motion);
+            }
+        });
+        let weak = Rc::downgrade(viewer);
+        let overlay_for_leave = overlay.clone();
+        motion.connect_leave(move |_| {
+            if let Some(viewer) = weak.upgrade() {
+                viewer.clear_note_cursor(&overlay_for_leave);
+            }
+        });
+        overlay.add_controller(motion);
     }
 
     pub(crate) fn begin_selection(&self, page: usize, x: f64, y: f64) {
@@ -4706,6 +5238,54 @@ impl Viewer {
     }
 }
 
+/// Marca de tiempo del arranque en nanosegundos: completa el prefijo de los
+/// identificadores para que dos sesiones no coincidan.
+fn session_nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0)
+}
+
+/// Las anotaciones con su identificador, en la forma que pide el servicio de
+/// escritura.
+fn annotations_with_ids(edits: &[Edit]) -> Vec<(String, Annotation)> {
+    edits
+        .iter()
+        .map(|edit| (edit.id.clone(), edit.value.clone()))
+        .collect()
+}
+
+/// Páginas cuyo contenido cambió entre dos estados: es lo único que hay que
+/// volver a dibujar después de deshacer o rehacer.
+fn changed_pages(before: &[Edit], after: &[Edit]) -> Vec<usize> {
+    let mut pages: Vec<usize> = before
+        .iter()
+        .chain(after.iter())
+        .map(|edit| edit.value.page())
+        .collect();
+    pages.sort_unstable();
+    pages.dedup();
+    pages.retain(|page| {
+        let on_page = |edits: &[Edit]| -> Vec<Edit> {
+            edits
+                .iter()
+                .filter(|edit| edit.value.page() == *page)
+                .cloned()
+                .collect()
+        };
+        on_page(before) != on_page(after)
+    });
+    pages
+}
+
+/// True cuando `point`, en puntos PDF con el origen arriba a la izquierda, cae
+/// dentro del rectángulo de la nota.
+fn note_contains(note: &TextNote, point: (f64, f64)) -> bool {
+    let (x, y) = point;
+    x >= note.at.0 && x <= note.at.0 + note.width && y >= note.at.1 && y <= note.at.1 + note.height
+}
+
 /// Descripción de Pango de la fuente de la nota, escalada por `zoom`. El tamaño
 /// va en puntos y el layout se crea a 72 dpi, así que una unidad de cairo es un
 /// punto del PDF.
@@ -4780,13 +5360,15 @@ fn measure_text(text: &str, font: &FontChoice) -> (f64, f64) {
 }
 
 /// Pinta una nota con pangocairo: texto negro, escalado por el zoom y girado con
-/// la vista como el resto de la capa.
+/// la vista como el resto de la capa. La nota elegida lleva además un contorno
+/// punteado, que es lo que dice cuál responde a `Supr` y al menú.
 fn draw_note(
     context: &cairo::Context,
     note: &TextNote,
     page: (f64, f64),
     rotation: i32,
     zoom: f64,
+    selected: bool,
 ) {
     let layout = pangocairo::functions::create_layout(context);
     // 72 dpi: el tamaño en puntos de la nota es el tamaño en unidades del
@@ -4805,6 +5387,23 @@ fn draw_note(
     // el zoom, para que la pantalla y el `/Rect` que se escribe coincidan.
     context.move_to(0.0, f64::from(layout.baseline()) / f64::from(pango::SCALE));
     pangocairo::functions::show_layout(context, &layout);
+
+    if selected {
+        // El sistema de coordenadas ya tiene la rotación de la vista y la esquina
+        // de la nota: el contorno es el rectángulo desde el origen. El guion y el
+        // grosor se escalan con el zoom, como el resto de la capa.
+        let dash = (4.0 * zoom).max(2.0);
+        context.set_dash(&[dash, dash * 0.75], 0.0);
+        context.set_line_width((1.0 * zoom).max(1.0));
+        context.set_source_rgba(0.20, 0.45, 0.95, 0.9);
+        context.rectangle(
+            0.0,
+            0.0,
+            (note.width * zoom).max(1.0),
+            (note.height * zoom).max(1.0),
+        );
+        let _ = context.stroke();
+    }
     let _ = context.restore();
 }
 

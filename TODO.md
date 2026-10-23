@@ -39,7 +39,7 @@ Una línea por capacidad, sin agrupar cosas distintas en una sola casilla.
 
 - [x] Subrayado del texto seleccionado en el color a elección (selector de color de GTK, ámbar por omisión), escrito en el PDF como anotación `/Underline` con `/QuadPoints` y `/C`: al pulsar el botón al lado del zoom se abre el selector de color de GTK y, si ya había texto seleccionado, se subraya en el acto; si no, la herramienta queda armada para el siguiente arrastre (`Ctrl+U`, `Esc` sale del modo)
 - [x] Resaltado del texto (rotulador) en el color a elección (selector de color de GTK, amarillo de rotulador por omisión), escrito en el PDF como anotación `/Highlight` con `/CA 0.4` para que el texto se siga leyendo: al pulsar el botón al lado del zoom se abre el selector de color de GTK y, si ya había texto seleccionado, se resalta en el acto; si no, la herramienta queda armada para el siguiente arrastre (`Ctrl+Shift+U`, `Esc` sale del modo)
-- [x] Deshacer y rehacer (`Ctrl+Z` / `Ctrl+Shift+Z`, también `Ctrl+Y`, y `Edit > Deshacer` / `Rehacer`) de los marcados que todavía no están en el PDF, uno por uno y en orden; un marcado nuevo descarta lo que había para rehacer, y lo ya escrito en el archivo no se deshace desde el visor porque habría que reescribir la anotación
+- [x] Deshacer y rehacer (`Ctrl+Z` / `Ctrl+Shift+Z`, también `Ctrl+Y`, y `Edit > Deshacer` / `Rehacer`) por instantáneas de la lista de anotaciones, de a un cambio y con un tope de 20: alcanza a crear, mover, borrar y editar el texto, también de lo que ya está escrito en el PDF (el archivo se pone al día en el próximo guardado, que quita la anotación por su `/NM`); un cambio nuevo descarta lo que había para rehacer
 - [x] El color elegido se muestra en el botón de cada herramienta: la `U` con la línea en ese color y la `A` con ese fondo
 - [x] Guardar los marcados (subrayados y resaltados) y las notas de texto en el PDF abierto (`Ctrl+S`) o en una copia (`Ctrl+Shift+S`), con escritura atómica y pregunta de Descartar / Guardar / Guardar como al cerrar el documento, recargarlo, abrir otro o cerrar la ventana
 - [ ] [BLOQUEADA: escritura de PDF] Tachado de texto
@@ -49,8 +49,8 @@ Una línea por capacidad, sin agrupar cosas distintas en una sola casilla.
 - [ ] [BLOQUEADA: escritura de PDF] Formas: rectángulo, elipse, línea, flecha
 - [ ] [BLOQUEADA: escritura de PDF] Sellos (aprobado, revisado, borrador) e imágenes pegadas
 - [ ] [BLOQUEADA: escritura de PDF] Firmas manuscritas reutilizables
-- [ ] [BLOQUEADA: escritura de PDF] Inspector de anotaciones: listar, filtrar, saltar, borrar
-- [ ] [BLOQUEADA: escritura de PDF] Deshacer / rehacer de anotaciones
+- [ ] [BLOQUEADA: escritura de PDF] Inspector de anotaciones: listar, filtrar y saltar entre ellas (borrar ya se hace desde la página)
+- [x] Editar las anotaciones ya creadas, también después de guardarlas: un clic sobre la nota la selecciona (contorno punteado), arrastrarla la mueve, `Supr` / `Retroceso` la borra, el doble clic o `Edit > Editar texto de la nota` abre el diálogo con su texto y su fuente precargados (se vuelve a medir con Pango) y el clic derecho abre el menú con `Editar texto` y `Borrar`; el cursor sobre una nota es `grab` y `Esc` deselecciona. Cada anotación propia se escribe con un `/NM` de la sesión, así que el guardado reemplaza o quita sólo las del visor y las de otros programas quedan intactas
 - [ ] [BLOQUEADA: escritura de PDF] Guardar anotaciones en el PDF (guardado incremental)
 - [ ] [BLOQUEADA: escritura de PDF] Guardar como / aplanar anotaciones (flatten) y exportar copia limpia
 - [ ] [BLOQUEADA: escritura de PDF] Importar y exportar anotaciones en FDF / XFDF
@@ -146,6 +146,21 @@ necesita una decisión o una dependencia nueva.
   por línea vienen de `poppler_page_get_selection_region` mediante FFI propio.
   Convención verificada empíricamente: poppler usa origen arriba-izquierda, igual
   que el espacio de vista, así que el mapeo es directo.
+- Anotaciones: cada una lleva un identificador estable en la capa de UI
+  (`Edit { id, value }`, con prefijo de proceso y nanosegundos para que dos
+  sesiones no coincidan) que se escribe como `/NM` en el PDF. El servicio recibe
+  la lista actual y la última guardada, calcula qué quitar y qué reescribir por
+  identidad y valor, filtra `/Annots` sólo por esos `/NM` y deja intactas las
+  anotaciones sin `/NM` o con un `/NM` ajeno (si una lista queda vacía, se quita
+  la clave de la página). Reabrir el archivo todavía no reconstruye esas
+  anotaciones en memoria: la edición posterior a un guardado vale dentro de la
+  sesión.
+
+- Anotaciones: el historial de deshacer guarda instantáneas completas de la
+  lista (tope de 20, se descartan las más viejas) y redibuja sólo las páginas
+  cuyo contenido cambió entre dos instantáneas. `discard_edits()` vuelve a la
+  copia guardada en lugar de truncar, porque ahora una anotación puede cambiar
+  de valor en el medio de la lista.
 
 - Inversión por capas: heurística por saturación (diferencia entre canales > 28 se
   considera imagen y no se invierte). Un escaneo en blanco y negro sí se invierte
