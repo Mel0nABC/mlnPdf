@@ -592,6 +592,33 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
         assert!(!viewer.has_pending_marks());
         std::fs::remove_file(&copy).ok();
 
+        // Guardar como (Ctrl+Shift+S) tiene que dejar un archivo en el destino
+        // aunque no haya nada pendiente: es una copia del documento abierto.
+        let plain = dir.join("plain-copy-ui.pdf");
+        std::fs::remove_file(&plain).ok();
+        assert!(
+            viewer.save_copy(&plain),
+            "guardar como sin cambios pendientes tiene que escribir la copia"
+        );
+        assert_eq!(
+            std::fs::read(&plain).expect("leer la copia"),
+            std::fs::read(&text_path).expect("leer el original"),
+            "sin marcados pendientes la copia es el archivo, byte por byte"
+        );
+
+        // Elegir el mismo archivo no puede truncar el original.
+        let before = std::fs::read(&text_path).expect("leer el original");
+        assert!(
+            viewer.save_copy(&text_path),
+            "guardar como sobre el mismo archivo no rompe nada"
+        );
+        assert_eq!(
+            std::fs::read(&text_path).expect("releer el original"),
+            before,
+            "el archivo abierto sobrevive a un guardar como sobre sí mismo"
+        );
+        std::fs::remove_file(&plain).ok();
+
         // Pulsar la herramienta abre el selector de color del sistema. Es la
         // única parte del flujo que no se puede probar sin un clic real, así que
         // se comprueba que la ventana del selector aparezca.

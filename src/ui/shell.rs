@@ -1745,13 +1745,54 @@ impl Viewer {
             "Guardar como",
             Some(name),
             move |viewer, target| {
-                if viewer.save_pending_marks(target) {
+                if viewer.save_copy(target) {
                     if let Some(then) = then.as_ref() {
                         then(viewer);
                     }
                 }
             },
         );
+    }
+
+    /// Guarda una copia del documento abierto en `target`: con los marcados
+    /// pendientes si los hay, o el archivo tal como está si ya no queda nada por
+    /// escribir. Elegir el mismo archivo no escribe nada, porque copiar sobre sí
+    /// mismo truncaría el original.
+    pub(crate) fn save_copy(&self, target: &Path) -> bool {
+        let Some(source) = self.doc.current_path.borrow().clone() else {
+            show_error(&self.ui.window, "No hay ningún documento abierto.", "");
+            return false;
+        };
+        if self.is_open_file(target) {
+            self.ui.window.announce(
+                "Ese es el archivo abierto: elegí otro nombre para la copia.",
+                gtk::AccessibleAnnouncementPriority::Medium,
+            );
+            return true;
+        }
+        if self.has_pending_marks() {
+            return self.save_pending_marks(target);
+        }
+
+        match std::fs::copy(&source, target) {
+            Ok(_) => {
+                let name = display_name(target);
+                self.ui.window.announce(
+                    &format!("Copia guardada en {name}"),
+                    gtk::AccessibleAnnouncementPriority::Medium,
+                );
+                self.notify("Copia guardada", &name);
+                true
+            }
+            Err(error) => {
+                show_error(
+                    &self.ui.window,
+                    "No se pudo guardar la copia.",
+                    &error.to_string(),
+                );
+                false
+            }
+        }
     }
 
     /// Subrayados que todavía no están en el archivo.
