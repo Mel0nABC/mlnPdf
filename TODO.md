@@ -195,16 +195,18 @@ necesita una decisión o una dependencia nueva.
   y pinta rectángulos translúcidos al rasterizar. Los hits se limitan a 300 para
   que una palabra común no dispare tiempo y memoria. Antes bloqueaba el bucle
   principal ~1,4 s en un PDF de 666 páginas.
-- Impresión: el diálogo es propio (`src/ui/print.rs`) porque el de GTK no se
-  puede reformar: su botón Preview destruye el diálogo por diseño (lo trata como
-  el final de la operación y manda las páginas a otra aplicación). El diálogo
-  propio pide impresora, expresión de páginas y copias, muestra a la derecha una
-  miniatura de cada hoja con flechas ‹ › abajo, y al confirmar envía el trabajo
-  con `PrintOperationAction::Print`, sin diálogo intermedio: las páginas se
-  dibujan con el mismo código que antes. La impresión con opciones y el folleto
-  usan el mismo diálogo; en el folleto el rango cuenta hojas, que es lo que el
-  trabajo imprime. Las impresoras se enumeran con `enumerate_printers` (la
-  predeterminada primero).
+- Impresión: el diálogo lo pone GTK (incluye imprimir a PDF); el dibujado escala
+  la página al área imprimible y respeta la rotación actual. El botón Preview del
+  diálogo no es un botón que podamos conservar: GTK lo trata como el final del
+  diálogo (lo destruye, pasa la operación a modo vista previa y manda las páginas
+  a otra aplicación). Por eso la señal `preview` se atiende acá: abre una ventana
+  propia que dibuja la página con el mismo código que imprime (`set_cairo_context`
+  con el dpi del área; en modo vista previa GTK no renderiza nada por su cuenta,
+  solo emite `ready` y espera), y al cerrarla `end_preview` termina la operación y
+  se vuelve a abrir el diálogo con la impresora y las opciones elegidas. Una
+  operación terminada no se puede volver a correr, así que cada vuelta construye
+  una nueva con `print_settings` y `default_page_setup` de la anterior, con un
+  tope de cinco vueltas. Vale para imprimir, imprimir con opciones y folleto.
 - Exportación: la página suelta se puede guardar en PDF (cairo `PdfSurface` con
   el contenido vectorial de poppler, sin la rotación ni la inversión de la vista),
   PNG o JPEG. La exportación por lotes pide una expresión de páginas
