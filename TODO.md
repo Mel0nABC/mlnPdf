@@ -38,8 +38,9 @@ Una línea por capacidad, sin agrupar cosas distintas en una sola casilla.
 ## 2. Anotaciones y edición
 
 - [x] Subrayado del texto seleccionado en el color a elección (selector de color de GTK, ámbar por omisión), escrito en el PDF como anotación `/Underline` con `/QuadPoints` y `/C`: botón al lado del zoom, `Ctrl+U`, y `Esc` sale del modo
-- [x] Guardar los subrayados en el PDF abierto (`Ctrl+S`) o en una copia (`Ctrl+Shift+S`), con escritura atómica y pregunta de Descartar / Guardar / Guardar una copia al cerrar el documento, recargarlo, abrir otro o cerrar la ventana
-- [ ] [BLOQUEADA: escritura de PDF] Resaltado de bloque y tachado de texto
+- [x] Resaltado del texto (rotulador) en el color a elección (selector de color de GTK, amarillo de rotulador por omisión), escrito en el PDF como anotación `/Highlight` con `/CA 0.4` para que el texto se siga leyendo: botón al lado del zoom, `Ctrl+Shift+U`, `Esc` sale del modo, y se aplica a la selección o al siguiente arrastre
+- [x] Guardar los marcados (subrayados y resaltados) en el PDF abierto (`Ctrl+S`) o en una copia (`Ctrl+Shift+S`), con escritura atómica y pregunta de Descartar / Guardar / Guardar una copia al cerrar el documento, recargarlo, abrir otro o cerrar la ventana
+- [ ] [BLOQUEADA: escritura de PDF] Tachado de texto
 - [ ] [BLOQUEADA: escritura de PDF] Notas adhesivas (sticky notes) y comentarios con hilos de respuesta
 - [ ] [BLOQUEADA: escritura de PDF] Texto libre sobre la página (fuente, tamaño, color)
 - [ ] [BLOQUEADA: escritura de PDF] Dibujo a mano alzada (lápiz) con grosor y color
@@ -122,7 +123,7 @@ necesita una decisión o una dependencia nueva.
 
 - **Escritura de PDF** (resto de la sección 2, unir/dividir/comprimir): poppler-glib
   es de solo lectura. La escritura de anotaciones ya se resolvió con `lopdf`
-  (subrayado, sección 2); lo que queda sigue necesitando escribir el PDF (qpdf,
+  (subrayado y resaltado, sección 2); lo que queda sigue necesitando escribir el PDF (qpdf,
   mupdf, lopdf) o cambiar de motor a pdfium.
 - **Formularios y firmas** (sección 3): poppler no guarda AcroForm ni firmas; PAdES
   además necesita un stack criptográfico (`openssl`/`ring`) y verificación de

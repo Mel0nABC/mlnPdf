@@ -65,7 +65,8 @@ ventana.
 | Salto entre coincidencias con contador `n/m` | `Ctrl+G` / `Ctrl+Shift+G` |
 | Copiar el texto de la página actual | `Ctrl+Shift+C` |
 | Selección con el ratón y copiar solo lo seleccionado | Arrastrar y `Ctrl+C` |
-| Subrayar el texto como anotación real del PDF, en el color elegido | Botón al lado del zoom, `Ctrl+U` |
+| Subrayar el texto como anotación real del PDF, en el color elegido | Botón al lado del zoom, `Ctrl+U`; se aplica a la selección o al siguiente arrastre |
+| Resaltar el texto como rotulador, en su propio color | Botón al lado del zoom, `Ctrl+Shift+U`; se aplica a la selección o al siguiente arrastre |
 | Metadatos del documento | `Ctrl+D` |
 
 ### Apariencia y lectura nocturna
@@ -89,7 +90,7 @@ ventana.
 | Exportar una selección de páginas | `Tools > Exportar páginas…`: `1,2,100`, `1-55`, `pares`, `impares`, `última`, `todas` |
 | Exportar el texto plano del documento | `Tools > Exportar texto…` |
 | Imprimir, con vista previa, opciones y folleto | `Ctrl+P`, `File > Imprimir con opciones…`, `File > Imprimir folleto…`; el diálogo suma a la derecha la miniatura de las páginas con flechas ‹ › |
-| Guardar los subrayados en el PDF abierto o en una copia, preguntando antes si quedan cambios sin guardar | `Ctrl+S` / `Ctrl+Shift+S` |
+| Guardar los marcados (subrayados y resaltados) en el PDF abierto o en una copia, preguntando antes si quedan cambios sin guardar | `Ctrl+S` / `Ctrl+Shift+S` |
 
 ## Atajos
 
@@ -105,7 +106,7 @@ ventana.
 | `Alt+←` / `→` | Historial atrás / adelante | `F11` / `F5` | Pantalla completa / presentación |
 | `Ctrl` + rueda | Zoom con la rueda | `Espacio` + arrastrar | Herramienta mano, con inercia al soltar |
 | `Ctrl+C` / `Ctrl+Shift+C` | Copiar la selección / la página | `Esc` | Sale de presentación o del modo mano; limpia la búsqueda |
-| `Ctrl+U` | Subrayar | `Ctrl+S` / `Ctrl+Shift+S` | Guardar los subrayados / guardar una copia |
+| `Ctrl+U` / `Ctrl+Shift+U` | Subrayar / resaltar | `Ctrl+S` / `Ctrl+Shift+S` | Guardar los marcados / guardar una copia |
 
 La lista completa está en `Help > Atajos de teclado…` dentro de la aplicación.
 
@@ -133,7 +134,7 @@ src/
 | Búsqueda desde el layout por carácter, no desde `find_text` | `find_text` estira la caja hasta los blancos de al lado |
 | FFI propio para lo que `poppler-rs` no expone | `poppler_page_get_text_layout` y `poppler_page_get_selection_region` |
 | Motor sin dependencia de GTK | Geometría, búsqueda y sesión se prueban sin display |
-| El PDF se escribe con lopdf, en un temporal que después reemplaza al original | poppler-glib es de solo lectura, así que el subrayado solo puede quedar como anotación real escribiendo el archivo; el reemplazo al final evita dejar el PDF roto si el guardado falla |
+| Las anotaciones de marcado se escriben con lopdf, en un temporal que después reemplaza al original | poppler-glib es de solo lectura, así que el subrayado (`/Underline`) y el resaltado (`/Highlight` con `/CA`) solo pueden quedar como anotación real escribiendo el archivo; el reemplazo al final evita dejar el PDF roto si el guardado falla |
 
 ## Requisitos
 
@@ -156,7 +157,7 @@ Probado con GTK 4.24 y poppler-glib 26.10.
 
 ```bash
 cargo build --release
-cargo test                 # 71 pruebas: motor, render, selección, búsqueda, páginas, sesión, anotaciones
+cargo test                 # 74 pruebas: motor, render, selección, búsqueda, páginas, sesión, anotaciones
 cargo test -- --ignored    # prueba de display: atajos, zoom y propiedad del viewer
 ```
 
@@ -188,10 +189,10 @@ poppler no las guarda; OCR, que necesita `tesseract`; e índice/marcadores, porq
 visible, así que un documento enorme puede tardar un instante en responder), la
 interfaz no es traducible todavía, no hay archivo `.desktop` ni registro MIME, y
 las pruebas automatizadas cubren el motor y el arranque, no cada comando de la
-interfaz. El subrayado se guarda reescribiendo el PDF completo (no es un guardado
-incremental) y se escribe sin *appearance stream* (`/AP`), así que el grosor
-exacto de la línea lo decide cada lector; tampoco hay todavía deshacer ni
-borrado de subrayados.
+interfaz. Los marcados (subrayado y resaltado) se guardan reescribiendo el PDF
+completo (no es un guardado incremental) y se escriben sin *appearance stream*
+(`/AP`), así que el aspecto exacto de cada marcado lo decide cada lector; tampoco
+hay todavía deshacer ni borrado de marcados.
 
 **Licencia:** todavía sin definir.
 
