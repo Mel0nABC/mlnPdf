@@ -195,18 +195,15 @@ necesita una decisión o una dependencia nueva.
   y pinta rectángulos translúcidos al rasterizar. Los hits se limitan a 300 para
   que una palabra común no dispare tiempo y memoria. Antes bloqueaba el bucle
   principal ~1,4 s en un PDF de 666 páginas.
-- Impresión: el diálogo lo pone GTK (incluye imprimir a PDF); el dibujado escala
-  la página al área imprimible y respeta la rotación actual. El botón Preview del
-  diálogo no es un botón que podamos conservar: GTK lo trata como el final del
-  diálogo (lo destruye, pasa la operación a modo vista previa y manda las páginas
-  a otra aplicación). Por eso la señal `preview` se atiende acá: abre una ventana
-  propia que dibuja la página con el mismo código que imprime (`set_cairo_context`
-  con el dpi del área; en modo vista previa GTK no renderiza nada por su cuenta,
-  solo emite `ready` y espera), y al cerrarla `end_preview` termina la operación y
-  se vuelve a abrir el diálogo con la impresora y las opciones elegidas. Una
-  operación terminada no se puede volver a correr, así que cada vuelta construye
-  una nueva con `print_settings` y `default_page_setup` de la anterior, con un
-  tope de cinco vueltas. Vale para imprimir, imprimir con opciones y folleto.
+- Impresión: el diálogo sigue siendo el de GTK (impresora, rango, copias, papel,
+  orientación e imprimir a PDF), sin tocar nada de él. Lo único que se agrega es
+  la vista previa, en la pestaña “Vista previa” que el propio diálogo arma con el
+  widget que pide por `create-custom-widget`: una miniatura de la página (260 px,
+  más grande que las del panel lateral) y flechas ‹ › con el contador para
+  recorrer el documento. La dibuja el render de la app, no el contexto de
+  impresión. El dibujado del trabajo escala la página al área imprimible y
+  respeta la rotación actual. En el folleto la vista previa cuenta hojas, que es
+  lo que imprime el trabajo.
 - Exportación: la página suelta se puede guardar en PDF (cairo `PdfSurface` con
   el contenido vectorial de poppler, sin la rotación ni la inversión de la vista),
   PNG o JPEG. La exportación por lotes pide una expresión de páginas

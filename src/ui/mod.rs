@@ -2,5 +2,6 @@
 
 pub mod actions;
 pub mod nav;
+pub mod print;
 pub mod shell;
 pub mod style;
