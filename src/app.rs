@@ -9,14 +9,14 @@ use gtk::glib;
 
 use crate::ui::shell::Viewer;
 
-const APP_ID: &str = "com.example.VisorPdf";
+const APP_ID: &str = "dev.mel0n.MlnPdf";
 
 
 /// Runs the application loop.
 pub fn run() -> glib::ExitCode {
     let app = gtk::Application::builder().application_id(APP_ID).build();
 
-    // `visor_pdf documento.pdf` opens it on start. Gio parses argv itself and
+    // `mlnpdf documento.pdf` opens it on start. Gio parses argv itself and
     // refuses file arguments unless the app declares HANDLES_OPEN, so the path
     // is taken out of argv before the application sees it.
     let mut args: Vec<String> = std::env::args().collect();

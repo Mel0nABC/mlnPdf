@@ -414,6 +414,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mlnpdf"
+version = "0.1.0"
+dependencies = [
+ "cairo-rs",
+ "glib",
+ "gtk4",
+ "poppler-rs",
+]
+
+[[package]]
 name = "pango"
 version = "0.22.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -663,16 +673,6 @@ name = "version-compare"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03c2856837ef78f57382f06b2b8563a2f512f7185d732608fd9176cb3b8edf0e"
-
-[[package]]
-name = "visor_pdf"
-version = "0.1.0"
-dependencies = [
- "cairo-rs",
- "glib",
- "gtk4",
- "poppler-rs",
-]
 
 [[package]]
 name = "windows-link"

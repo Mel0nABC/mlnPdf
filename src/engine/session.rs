@@ -16,13 +16,13 @@ pub struct Session {
     pub recent: Vec<PathBuf>,
 }
 
-/// Default location: `$XDG_CONFIG_HOME/visor_pdf/state.txt`.
+/// Default location: `$XDG_CONFIG_HOME/mlnpdf/state.txt`.
 pub fn state_file() -> PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
         .unwrap_or_else(|| PathBuf::from("."));
-    base.join("visor_pdf").join("state.txt")
+    base.join("mlnpdf").join("state.txt")
 }
 
 /// Reads a session from an explicit path, so tests never touch the real one.

@@ -21,7 +21,7 @@ use crate::ui::style::*;
 
 /// Navigation history is bounded so a long session cannot grow it forever.
 /// Window title until a document is open.
-pub(crate) const WINDOW_TITLE: &str = "Visor PDF";
+pub(crate) const WINDOW_TITLE: &str = "MlnPdf";
 
 const HISTORY_LIMIT: usize = 100;
 
@@ -2070,7 +2070,7 @@ impl Viewer {
         let notification = gio::Notification::new(title);
         notification.set_body(Some(body));
         if let Some(application) = self.ui.window.application() {
-            application.send_notification(Some("visor-pdf"), &notification);
+            application.send_notification(Some("mlnpdf"), &notification);
         }
     }
 

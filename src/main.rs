@@ -141,7 +141,7 @@ trailer\n<< /Root 1 0 R /Size 5 >>\n%%EOF\n";
         // this also covers the regression where nothing owned the viewer and
         // every handler silently did nothing.
         let app = gtk::Application::builder()
-            .application_id("com.example.VisorPdfTest")
+            .application_id("dev.mel0n.MlnPdfTest")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         // Windows may only be attached after `startup`; the real app gets this

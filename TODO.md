@@ -1,4 +1,4 @@
-# TODO — Visor PDF (Rust + GTK 4)
+# TODO — MlnPdf (Rust + GTK 4)
 
 Lista de opciones que tiene un lector de PDF habitual, ordenada por área y con el
 estado de este proyecto. Convención: `[x]` hecho y verificado, `[ ]` pendiente.
@@ -102,9 +102,9 @@ Una línea por capacidad, sin agrupar cosas distintas en una sola casilla.
 Sin archivo `.desktop` ni registro en el manejador MIME del sistema: el visor no
 se ofrece como aplicación predeterminada para `application/pdf`.
 
-- [x] Abrir por línea de comandos: `visor_pdf archivo.pdf` (el path se saca de argv porque Gio rechaza archivos)
+- [x] Abrir por línea de comandos: `mlnpdf archivo.pdf` (el path se saca de argv porque Gio rechaza archivos)
 - [x] Arrastrar y soltar un PDF sobre la ventana
-- [x] Recordar la posición: página y zoom del último documento se retoman al abrirlo de nuevo, sin abrirlo solo al arrancar (`~/.config/visor_pdf/state.txt`)
+- [x] Recordar la posición: página y zoom del último documento se retoman al abrirlo de nuevo, sin abrirlo solo al arrancar (`~/.config/mlnpdf/state.txt`)
 - [x] Notificaciones de escritorio al terminar exportaciones y al cambiar el archivo en disco
 
 ## 8. Calidad y verificación
@@ -171,7 +171,7 @@ necesita una decisión o una dependencia nueva.
   hay un cambio de layout (rotar, dos páginas, ajustar). Si el toolkit tiene
   `gtk-enable-animations` apagado, el zoom se aplica de inmediato.
 - La sesión guarda ruta, página y zoom, más los 8 archivos recientes, en
-  `~/.config/visor_pdf/state.txt`. Se escribe al cerrar la ventana: abrir un
+  `~/.config/mlnpdf/state.txt`. Se escribe al cerrar la ventana: abrir un
   documento nunca borra la posición guardada. Arrancar sin argumento no abre
   nada: el visor espera a que el lector elija el archivo, así que un documento
   ya borrado o ajeno no aparece solo. Al abrir de nuevo ese mismo archivo (por
