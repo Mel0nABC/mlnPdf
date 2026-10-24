@@ -17,6 +17,14 @@ use crate::engine::annotation::{
 /// el visor conoce; las demás se siguen viendo porque las pinta el lector.
 const ANNOTATION_PREFIX: &str = "mlnpdf-";
 
+/// Tope de píxeles que se leen de una imagen: por encima de esto el archivo no
+/// es un documento razonable y no se reserva la memoria.
+const IMAGE_MAX_PIXELS: usize = 100_000_000;
+
+/// Margen que se acepta por encima de los bytes declarados de una imagen, por si
+/// el archivo escribió algún relleno.
+const COLOR_SLACK: usize = 64;
+
 /// Escribe en el PDF las anotaciones propias y lo guarda en `target`; devuelve
 /// cuántas anotaciones propias quedaron escritas (las que se quitaron y las que
 /// se agregaron o reemplazaron).
@@ -783,11 +791,17 @@ fn appearance_pixels(document: &Document, dictionary: &Dictionary) -> Option<Ima
 
     let width = u32::try_from(image.dict.get(b"Width").ok()?.as_i64().ok()?).ok()?;
     let height = u32::try_from(image.dict.get(b"Height").ok()?.as_i64().ok()?).ok()?;
-    let count = width as usize * height as usize;
+    // El tamaño declarado lo escribe el archivo: se comprueba antes de reservar
+    // nada, porque un `Width` absurdo intentaría una reserva imposible.
+    let count = (width as usize).checked_mul(height as usize)?;
+    if count == 0 || count > IMAGE_MAX_PIXELS {
+        return None;
+    }
 
     // Los píxeles van sin comprimir y en el orden del PDF, que es el mismo con el
-    // que los escribió `image_stream`.
-    let color = image.decompressed_content().ok()?;
+    // que los escribió `image_stream`. La descompresión se limita a lo que la
+    // geometría declarada necesita: un archivo ajeno no puede inflar la memoria.
+    let color = image.decompressed_content_with_limit(count * 3 + COLOR_SLACK).ok()?;
     if color.len() < count * 3 {
         return None;
     }
@@ -797,7 +811,7 @@ fn appearance_pixels(document: &Document, dictionary: &Dictionary) -> Option<Ima
         .ok()
         .and_then(|value| resolve(document, value))
         .and_then(|value| value.as_stream().ok())
-        .and_then(|stream| stream.decompressed_content().ok());
+        .and_then(|stream| stream.decompressed_content_with_limit(count).ok());
     if let Some(mask) = &mask
         && mask.len() < count
     {
@@ -836,7 +850,12 @@ fn numbers_of(document: &Document, dictionary: &Dictionary, key: &[u8]) -> Optio
         .ok()?;
     values
         .iter()
-        .map(|value| value.as_float().ok().map(f64::from))
+        // Un `NaN` o un infinito en un archivo ajeno rompería la caja, el acierto
+        // del clic y hasta la reserva de memoria de una imagen: se descarta.
+        .map(|value| {
+            let number = f64::from(value.as_float().ok()?);
+            number.is_finite().then_some(number)
+        })
         .collect()
 }
 
@@ -1370,6 +1389,129 @@ mod tests {
             }
         }
         (yellow, ink)
+    }
+
+    /// PDF de una página con un `/Stamp` nuestro cuya imagen declara `width` x
+    /// `height` y guarda `content` como píxeles sin comprimir.
+    fn fixture_with_own_stamp(width: i64, height: i64, content: Vec<u8>) -> Vec<u8> {
+        let mut document = Document::with_version("1.4");
+        let pages_id = document.new_object_id();
+        let contents_id = document.add_object(Stream::new(Dictionary::new(), Vec::new()));
+
+        let mut image_dictionary = Dictionary::new();
+        image_dictionary.set("Type", Object::Name(b"XObject".to_vec()));
+        image_dictionary.set("Subtype", Object::Name(b"Image".to_vec()));
+        image_dictionary.set("Width", Object::Integer(width));
+        image_dictionary.set("Height", Object::Integer(height));
+        image_dictionary.set("ColorSpace", Object::Name(b"DeviceRGB".to_vec()));
+        image_dictionary.set("BitsPerComponent", Object::Integer(8));
+        let image_id = document.add_object(Stream::new(image_dictionary, content));
+
+        let mut xobjects = Dictionary::new();
+        xobjects.set("Im0", Object::Reference(image_id));
+        let mut resources = Dictionary::new();
+        resources.set("XObject", Object::Dictionary(xobjects));
+        let mut form_dictionary = Dictionary::new();
+        form_dictionary.set("Type", Object::Name(b"XObject".to_vec()));
+        form_dictionary.set("Subtype", Object::Name(b"Form".to_vec()));
+        form_dictionary.set(
+            "BBox",
+            Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(10),
+                Object::Integer(10),
+            ]),
+        );
+        form_dictionary.set("Resources", Object::Dictionary(resources));
+        let form_id = document.add_object(Stream::new(
+            form_dictionary,
+            b"q 10 0 0 10 0 0 cm /Im0 Do Q".to_vec(),
+        ));
+
+        let mut annotation = Dictionary::new();
+        annotation.set("Type", Object::Name(b"Annot".to_vec()));
+        annotation.set("Subtype", Object::Name(b"Stamp".to_vec()));
+        annotation.set(
+            "NM",
+            Object::String(
+                b"mlnpdf-prueba-imagen".to_vec(),
+                lopdf::StringFormat::Literal,
+            ),
+        );
+        annotation.set(
+            "Rect",
+            Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(10),
+                Object::Integer(10),
+            ]),
+        );
+        let mut appearance = Dictionary::new();
+        appearance.set("N", Object::Reference(form_id));
+        annotation.set("AP", Object::Dictionary(appearance));
+
+        let page_id = document.add_object({
+            let mut page = Dictionary::new();
+            page.set("Type", Object::Name(b"Page".to_vec()));
+            page.set("Parent", Object::Reference(pages_id));
+            page.set("Contents", Object::Reference(contents_id));
+            page.set(
+                "MediaBox",
+                Object::Array(vec![
+                    Object::Integer(0),
+                    Object::Integer(0),
+                    Object::Integer(200),
+                    Object::Integer(200),
+                ]),
+            );
+            page.set("Annots", Object::Array(vec![Object::Dictionary(annotation)]));
+            page
+        });
+        let mut pages = Dictionary::new();
+        pages.set("Type", Object::Name(b"Pages".to_vec()));
+        pages.set("Kids", Object::Array(vec![Object::Reference(page_id)]));
+        pages.set("Count", Object::Integer(1));
+        document.set_object(pages_id, pages);
+        let catalog_id = document.add_object({
+            let mut catalog = Dictionary::new();
+            catalog.set("Type", Object::Name(b"Catalog".to_vec()));
+            catalog.set("Pages", Object::Reference(pages_id));
+            catalog
+        });
+        document.trailer.set("Root", Object::Reference(catalog_id));
+
+        let mut bytes = Vec::new();
+        document.save_to(&mut bytes).expect("serializar el fixture");
+        bytes
+    }
+
+    #[test]
+    fn an_image_that_declares_an_impossible_size_is_skipped() {
+        // Cien mil por cien mil píxeles son diez mil millones: el archivo lo
+        // declara, así que hay que rechazarlo antes de reservar nada.
+        let path = scratch("image-absurd.pdf");
+        std::fs::write(&path, fixture_with_own_stamp(100_000, 100_000, vec![0; 12]))
+            .expect("escribir el PDF");
+
+        let read = read_annotations(&path).expect("leer el archivo");
+        assert!(read.is_empty(), "la imagen absurda no se carga: {read:?}");
+    }
+
+    #[test]
+    fn an_image_stream_that_inflates_past_its_geometry_is_rejected() {
+        // Declara 2x2 (doce bytes de color) y guarda un mega: descomprimir sin
+        // límite dejaría que un archivo ajeno se coma la memoria al abrirlo.
+        let path = scratch("image-bomb.pdf");
+        std::fs::write(&path, fixture_with_own_stamp(2, 2, vec![0; 1 << 20]))
+            .expect("escribir el PDF");
+
+        let read = read_annotations(&path).expect("leer el archivo");
+        assert!(
+            read.is_empty(),
+            "el stream no puede crecer más de lo que su geometría necesita: {read:?}"
+        );
     }
 
     #[test]
