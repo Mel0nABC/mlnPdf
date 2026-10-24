@@ -1654,6 +1654,7 @@ impl Viewer {
 
             if let Some(viewer) = self.me.borrow().upgrade() {
                 Self::selection_gesture(&viewer, index, &overlay, &canvas);
+                Self::install_page_drop_target(&viewer, index, &overlay);
             }
 
             pictures.push(overlay.clone());
@@ -2129,6 +2130,36 @@ impl Viewer {
         self.queue_page_draw(page);
         self.announce_change("Imagen insertada");
         true
+    }
+
+    /// Inserta la primera imagen de un arrastre soltado sobre la página `page`,
+    /// centrada en el punto `(x, y)` del widget de esa página. Devuelve si la
+    /// imagen entró.
+    ///
+    /// La lista se prueba en orden y gana el primer archivo que tenga ruta
+    /// local: es la imagen que se puede decodificar. Si ese archivo no es una
+    /// imagen, `insert_image` ya avisa con el motivo y devuelve `false`, así que
+    /// no se sigue con el siguiente: el aviso explica el problema y el gesto
+    /// termina ahí.
+    pub(crate) fn drop_image_files(
+        self: &Rc<Self>,
+        page: usize,
+        files: &gdk::FileList,
+        x: f64,
+        y: f64,
+    ) -> bool {
+        let Some(point) = self.view_to_pdf(page, x, y) else {
+            return false;
+        };
+        let Some(path) = files.files().iter().find_map(|file| file.path()) else {
+            show_error(
+                &self.ui.window,
+                "No se pudo insertar la imagen.",
+                "El archivo soltado no está en el disco local.",
+            );
+            return false;
+        };
+        self.insert_image(&path, Some((page, point)))
     }
 
     /// Página y punto —en el espacio de esa página, con el origen arriba— que
@@ -4375,6 +4406,33 @@ impl Viewer {
             size,
             self.view.rotation.get(),
         ))
+    }
+
+    /// Arrastrar un archivo de imagen sobre esta página la inserta donde se
+    /// soltó (S2). Nombrado aparte del destino de la ventana
+    /// (`install_drop_target`), que abre PDFs, porque Rust no permite dos
+    /// funciones con el mismo nombre en el mismo `impl`.
+    ///
+    /// Devuelve `false` cuando la imagen no entró: así el gesto sigue subiendo
+    /// hasta el destino de la ventana y soltar un PDF sobre una página lo abre
+    /// como siempre.
+    pub(crate) fn install_page_drop_target(
+        viewer: &Rc<Self>,
+        page: usize,
+        overlay: &gtk::Overlay,
+    ) {
+        let target = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
+        let weak = Rc::downgrade(viewer);
+        target.connect_drop(move |_, value, x, y| {
+            let Ok(files) = value.get::<gdk::FileList>() else {
+                return false;
+            };
+            let Some(viewer) = weak.upgrade() else {
+                return false;
+            };
+            viewer.drop_image_files(page, &files, x, y)
+        });
+        overlay.add_controller(target);
     }
 
     pub(crate) fn selection_gesture(

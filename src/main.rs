@@ -1682,6 +1682,70 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             matches!(&viewer.annot.edits.borrow()[0].value, Annotation::Image(_)),
             "deshacer recupera la imagen, no otra anotación"
         );
+
+        // S2: soltar un archivo de imagen sobre una página la inserta centrada
+        // en el punto donde cayó. Un arrastre real necesita un dispositivo que
+        // la prueba no tiene, así que se comprueba el destino de arrastre de
+        // cada página y después se llama a la misma función que el destino
+        // llama al soltar.
+        for (index, slot) in viewer.doc.slots.borrow().iter().enumerate() {
+            let controllers = slot.overlay.observe_controllers();
+            let mut accepts_copy = false;
+            for position in 0..controllers.n_items() {
+                let Some(controller) = controllers.item(position) else {
+                    continue;
+                };
+                let Ok(target) = controller.downcast::<gtk::DropTarget>() else {
+                    continue;
+                };
+                if target.actions().contains(gtk::gdk::DragAction::COPY) {
+                    accepts_copy = true;
+                }
+            }
+            assert!(
+                accepts_copy,
+                "la página {index} acepta un archivo soltado con COPY"
+            );
+        }
+
+        // El PNG que generó esta misma prueba se suelta en el centro de la
+        // página 0: lejos de los bordes, el centrado se mide sin recortes.
+        let files = gtk::gdk::FileList::from_array(&[gtk::gio::File::for_path(&image_path)]);
+        let (page_width, page_height) = viewer.doc.page_sizes.borrow()[0];
+        let drop_point = (page_width / 2.0, page_height / 2.0);
+        let before = viewer.annot.edits.borrow().len();
+        assert!(
+            viewer.drop_image_files(0, &files, drop_point.0 * zoom, drop_point.1 * zoom),
+            "el archivo soltado se inserta en la página"
+        );
+        assert_eq!(
+            viewer.annot.edits.borrow().len(),
+            before + 1,
+            "la imagen soltada entra como una anotación nueva"
+        );
+        let dropped_id = edit_id(&viewer, before);
+        assert_eq!(
+            viewer.annot.selected.borrow().clone(),
+            Some(dropped_id),
+            "la imagen soltada queda elegida, con sus asas"
+        );
+        let dropped = image_value(&viewer, before);
+        assert_eq!(dropped.page, 0, "la imagen soltada cae en la página soltada");
+        let dropped_center = (
+            dropped.at.0 + dropped.width / 2.0,
+            dropped.at.1 + dropped.height / 2.0,
+        );
+        assert!(
+            (dropped_center.0 - drop_point.0).abs() < 1.0
+                && (dropped_center.1 - drop_point.1).abs() < 1.0,
+            "la imagen se centra donde se soltó: {dropped_center:?} != {drop_point:?}"
+        );
+        assert!(viewer.undo(), "la imagen soltada se deshace");
+        assert_eq!(
+            viewer.annot.edits.borrow().len(),
+            before,
+            "deshacer quita la imagen soltada"
+        );
         std::fs::remove_file(&image_path).ok();
 
         // Pulsar la herramienta abre el selector de color del sistema. Es la
