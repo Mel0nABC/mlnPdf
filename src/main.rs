@@ -1478,8 +1478,9 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         let image_stride = image_width * 4;
         let mut image_bytes = vec![0u8; image_stride * image_height];
         for pixel in image_bytes.chunks_exact_mut(4) {
-            // BGRA premultiplicado y opaco: un azul que se distingue del papel.
-            pixel.copy_from_slice(&[255, 0, 0, 255]);
+            // BGRA premultiplicado y opaco: un verde que se distingue tanto del
+            // papel como del recuadro azul de la selección.
+            pixel.copy_from_slice(&[0, 255, 0, 255]);
         }
         let texture = gtk::gdk::MemoryTexture::new(
             image_width as i32,
@@ -1501,6 +1502,21 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             1,
             "la imagen entra como una anotación nueva"
         );
+        // Y tiene que verse: la capa pinta sus píxeles dentro de la caja, no solo
+        // el recuadro punteado de la selección. Es el error que dejaba a la vista
+        // únicamente el contorno.
+        let painted_side = 400usize;
+        let painted_page = viewer.annot.edits.borrow()[0].value.page();
+        let painted = annotation_pixels(&viewer, painted_page, painted_side, painted_side);
+        let green = pixel_box(painted_side, &painted, |[red, green, blue]| {
+            green > 200 && red < 60 && blue < 60
+        })
+        .expect("la imagen se pinta sobre la página");
+        assert!(
+            green.2 - green.0 > 10 && green.3 - green.1 > 5,
+            "la imagen se pinta entera y no un solo píxel: {green:?}"
+        );
+
         let image_id = edit_id(&viewer, 0);
         let image = match viewer.annot.edits.borrow()[0].value.clone() {
             Annotation::Image(image) => image,

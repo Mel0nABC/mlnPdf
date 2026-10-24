@@ -3646,33 +3646,10 @@ impl Viewer {
         zoom: f64,
         selected: bool,
     ) {
-        let (x1, y1, x2, y2) = image.rect();
-        let top_left = forward_rotation((x1, y1), page, rotation);
-        let top_right = forward_rotation((x2, y1), page, rotation);
-        let bottom_left = forward_rotation((x1, y2), page, rotation);
         let Ok(surface) = self.image_surface(&image.pixels) else {
             return;
         };
-
-        let matrix = cairo::Matrix::new(
-            (top_right.0 - top_left.0) * zoom,
-            (top_right.1 - top_left.1) * zoom,
-            (bottom_left.0 - top_left.0) * zoom,
-            (bottom_left.1 - top_left.1) * zoom,
-            top_left.0 * zoom,
-            top_left.1 * zoom,
-        );
-
-        let _ = context.save();
-        context.transform(matrix);
-        context.scale(
-            1.0 / f64::from(image.pixels.width),
-            1.0 / f64::from(image.pixels.height),
-        );
-        let _ = context.set_source_surface(surface.as_ref(), 0.0, 0.0);
-        context.rectangle(0.0, 0.0, 1.0, 1.0);
-        let _ = context.fill();
-        let _ = context.restore();
+        paint_image(context, surface.as_ref(), image, page, rotation, zoom);
 
         if selected {
             draw_image_selection(context, image, page, rotation, zoom);
@@ -6727,6 +6704,45 @@ fn draw_mark_selection(
     let _ = context.restore();
 }
 
+/// Pinta la superficie de una imagen dentro de su caja.
+///
+/// La matriz lleva el espacio de la imagen —con un punto por píxel, origen en la
+/// esquina superior izquierda— al de la vista. El patrón se fija con esa matriz
+/// ya puesta y el rectángulo se pide en píxeles de la imagen: si se escalara el
+/// contexto antes de fijar el patrón, el patrón quedaría ligado a esa escala y el
+/// relleno taparía un solo píxel de la imagen en lugar de toda ella.
+fn paint_image(
+    context: &cairo::Context,
+    surface: &cairo::Surface,
+    image: &ImageNote,
+    page: (f64, f64),
+    rotation: i32,
+    zoom: f64,
+) {
+    let (x1, y1, x2, y2) = image.rect();
+    let top_left = forward_rotation((x1, y1), page, rotation);
+    let top_right = forward_rotation((x2, y1), page, rotation);
+    let bottom_left = forward_rotation((x1, y2), page, rotation);
+    let width = f64::from(image.pixels.width);
+    let height = f64::from(image.pixels.height);
+
+    let matrix = cairo::Matrix::new(
+        (top_right.0 - top_left.0) * zoom / width,
+        (top_right.1 - top_left.1) * zoom / width,
+        (bottom_left.0 - top_left.0) * zoom / height,
+        (bottom_left.1 - top_left.1) * zoom / height,
+        top_left.0 * zoom,
+        top_left.1 * zoom,
+    );
+
+    let _ = context.save();
+    context.transform(matrix);
+    let _ = context.set_source_surface(surface, 0.0, 0.0);
+    context.rectangle(0.0, 0.0, width, height);
+    let _ = context.fill();
+    let _ = context.restore();
+}
+
 /// Superficie de cairo con los píxeles de una imagen. El formato `ARGB32` de cairo
 /// es BGRA premultiplicado, exactamente lo que guarda `ImagePixels`, así que solo
 /// hay que copiar las filas: el relleno del final de cada una puede no coincidir.
@@ -7256,6 +7272,95 @@ mod tests {
 
     fn is_black(pixel: [u8; 3]) -> bool {
         pixel[0] < 80 && pixel[1] < 80 && pixel[2] < 80
+    }
+
+    /// Píxeles de una imagen de un solo color, en BGRA premultiplicado.
+    fn image_pixels(width: u32, height: u32, color: [u8; 4]) -> ImagePixels {
+        let mut data = Vec::new();
+        for _ in 0..width * height {
+            data.extend_from_slice(&color);
+        }
+        ImagePixels::new(width, height, data).expect("píxeles completos")
+    }
+
+    /// Pinta una imagen sobre papel blanco a escala 1 y devuelve los píxeles.
+    fn image_paint(
+        image: &ImageNote,
+        page: (f64, f64),
+        rotation: i32,
+    ) -> (usize, Vec<[u8; 3]>) {
+        let side = 200usize;
+        let mut surface =
+            cairo::ImageSurface::create(cairo::Format::ARgb32, side as i32, side as i32)
+                .expect("crear la superficie");
+        {
+            let context = cairo::Context::new(&surface).expect("contexto");
+            context.set_source_rgb(1.0, 1.0, 1.0);
+            context.paint().expect("fondo blanco");
+            let pixels = image_surface_for(&image.pixels).expect("superficie de la imagen");
+            paint_image(&context, pixels.as_ref(), image, page, rotation, 1.0);
+        }
+        surface.flush();
+
+        let stride = usize::try_from(surface.stride()).expect("stride");
+        let data = surface.data().expect("píxeles");
+        let mut pixels = Vec::with_capacity(side * side);
+        for row in 0..side {
+            for column in 0..side {
+                let offset = row * stride + column * 4;
+                pixels.push([data[offset + 2], data[offset + 1], data[offset]]);
+            }
+        }
+        (side, pixels)
+    }
+
+    fn is_red(pixel: [u8; 3]) -> bool {
+        let [red, green, blue] = pixel;
+        red > 200 && green < 60 && blue < 60
+    }
+
+    #[test]
+    fn an_image_paints_its_pixels_inside_its_box() {
+        // La imagen tiene que llenar su caja entera. Pintar un solo píxel —lo que
+        // pasaba al escalar el contexto antes de fijar el patrón— dejaba a la vista
+        // únicamente el recuadro de la selección.
+        let image = ImageNote::new(
+            0,
+            (10.0, 10.0),
+            40.0,
+            20.0,
+            image_pixels(40, 20, [0, 0, 255, 255]),
+        );
+        let (side, pixels) = image_paint(&image, (200.0, 200.0), 0);
+        let red = pixel_box(side, &pixels, is_red).expect("la imagen se pinta");
+
+        assert!(
+            (red.0 as f64 - 10.0).abs() <= 1.0 && (red.1 as f64 - 10.0).abs() <= 1.0,
+            "empieza en la esquina de su caja: {red:?}"
+        );
+        assert!(
+            (red.2 as f64 - 49.0).abs() <= 1.0 && (red.3 as f64 - 29.0).abs() <= 1.0,
+            "termina en la esquina opuesta de su caja: {red:?}"
+        );
+    }
+
+    #[test]
+    fn a_rotated_page_paints_the_image_lying_with_it() {
+        let image = ImageNote::new(
+            0,
+            (10.0, 10.0),
+            40.0,
+            20.0,
+            image_pixels(40, 20, [0, 0, 255, 255]),
+        );
+        let (side, pixels) = image_paint(&image, (200.0, 200.0), 90);
+        let red = pixel_box(side, &pixels, is_red).expect("la imagen se pinta girada");
+
+        let (width, height) = (red.2 - red.0, red.3 - red.1);
+        assert!(
+            (width as f64 - 19.0).abs() <= 2.0 && (height as f64 - 39.0).abs() <= 2.0,
+            "con /Rotate 90 la caja se acuesta: {width}x{height} en {red:?}"
+        );
     }
 
     #[test]
