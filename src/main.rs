@@ -58,6 +58,16 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
 4 0 obj\n<< /Length 27 >>\nstream\n1 0 0 rg\n0 0 200 1200 re\nf\nendstream\nendobj\n\
 trailer\n<< /Root 1 0 R /Size 5 >>\n%%EOF\n";
 
+    /// Dos páginas de 200x200 pt, rojas, para mover una nota de una a otra.
+    const TWO_PAGE_PDF: &[u8] = b"%PDF-1.4\n\
+1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\
+2 0 obj\n<< /Type /Pages /Kids [3 0 R 5 0 R] /Count 2 >>\nendobj\n\
+3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R /Resources << >> >>\nendobj\n\
+4 0 obj\n<< /Length 27 >>\nstream\n1 0 0 rg\n0 0 200 200 re\nf\nendstream\nendobj\n\
+5 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 6 0 R /Resources << >> >>\nendobj\n\
+6 0 obj\n<< /Length 27 >>\nstream\n0 1 0 rg\n0 0 200 200 re\nf\nendstream\nendobj\n\
+trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
+
     fn red_page() -> (poppler::Document, poppler::Page) {
         let document =
             poppler::Document::from_data(RED_PAGE_PDF, None).expect("minimal PDF should parse");
@@ -1074,17 +1084,15 @@ trailer\n<< /Root 1 0 R /Size 5 >>\n%%EOF\n";
             "clicar la página deja la ventana sin foco de texto"
         );
 
-        // El menú contextual usa acciones propias del popover: editar abre el
-        // diálogo (después de cerrarse el menú) y borrar quita la nota.
+        // El menú contextual tiene botones propios: editar abre el diálogo
+        // (después de cerrarse el menú), borrar quita la nota y mover arma el
+        // cursor de cuatro flechas.
         let menu_anchor = viewer.doc.slots.borrow()[0].canvas.clone();
         viewer.select_note(Some(note_id.clone()));
         let popover = viewer.open_note_menu(note_id.clone(), &menu_anchor, 20.0, 20.0);
-        assert!(
-            popover.activate_action("note.edit", None).is_ok(),
-            "Editar texto es una acción del menú de la nota"
-        );
-        popover.popdown();
-        popover.unparent();
+        let edit_button = labeled_button(popover.upcast_ref::<gtk::Widget>(), "Editar texto")
+            .expect("el menú de la nota ofrece Editar texto");
+        edit_button.emit_by_name::<()>("clicked", &[]);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut dialog: Option<gtk::Window> = None;
         while dialog.is_none() && std::time::Instant::now() < deadline {
@@ -1107,12 +1115,10 @@ trailer\n<< /Root 1 0 R /Size 5 >>\n%%EOF\n";
         // La opción Mover arma el cursor de cuatro flechas sobre la nota.
         viewer.select_note(Some(note_id.clone()));
         let popover = viewer.open_note_menu(note_id.clone(), &menu_anchor, 20.0, 20.0);
-        assert!(
-            popover.activate_action("note.move", None).is_ok(),
-            "Mover con el ratón es una acción del menú de la nota"
-        );
-        popover.popdown();
-        popover.unparent();
+        let move_button =
+            labeled_button(popover.upcast_ref::<gtk::Widget>(), "Mover con el ratón")
+                .expect("el menú de la nota ofrece Mover con el ratón");
+        move_button.emit_by_name::<()>("clicked", &[]);
         assert!(
             viewer.annot.move_armed.get(),
             "Mover con el ratón deja armado el cursor de mover"
@@ -1125,12 +1131,9 @@ trailer\n<< /Root 1 0 R /Size 5 >>\n%%EOF\n";
 
         viewer.select_note(Some(note_id.clone()));
         let popover = viewer.open_note_menu(note_id.clone(), &menu_anchor, 20.0, 20.0);
-        assert!(
-            popover.activate_action("note.delete", None).is_ok(),
-            "Borrar es una acción del menú de la nota"
-        );
-        popover.popdown();
-        popover.unparent();
+        let delete_button = labeled_button(popover.upcast_ref::<gtk::Widget>(), "Borrar")
+            .expect("el menú de la nota ofrece Borrar");
+        delete_button.emit_by_name::<()>("clicked", &[]);
         assert!(
             !viewer
                 .annot
@@ -1208,6 +1211,50 @@ trailer\n<< /Root 1 0 R /Size 5 >>\n%%EOF\n";
         );
         assert!(!viewer.text_tool_active(), "Esc desarma insertar texto");
 
+        // Mover una nota de una página a otra no la pierde: la nota cambia de
+        // página y su esquina se recalcula en el espacio de la página nueva.
+        let two_path = dir.join("two-pages-ui.pdf");
+        std::fs::write(&two_path, TWO_PAGE_PDF).expect("write two-page PDF");
+        viewer.open(&two_path).expect("open the two pages");
+        viewer.apply_text_draft(vec![TextRun {
+            text: "Mover".to_string(),
+            font: FontChoice {
+                family: "Sans".to_string(),
+                size: 12.0,
+                bold: false,
+                italic: false,
+            },
+            color: NOTE_COLOR,
+        }]);
+        assert!(
+            viewer.insert_text_note(0, 20.0, 20.0),
+            "la nota se coloca en la primera página"
+        );
+        let drag_id = edit_id(&viewer, 0);
+        let before = note_value(&viewer, 0);
+        assert_eq!(before.page, 0);
+        let grab = (before.at.0 + 2.0, before.at.1 + 2.0);
+        assert!(viewer.note_drag_begin(0, grab.0, grab.1));
+        assert!(viewer.note_drag_update(0.0, 250.0));
+        assert!(viewer.note_drag_end());
+        let moved = note_value(&viewer, 0);
+        assert_eq!(moved.page, 1, "la nota pasa a la página de destino");
+        assert_eq!(
+            moved.at,
+            (20.0, 58.0),
+            "la esquina se recalcula en el espacio de la página nueva"
+        );
+        assert_eq!(edit_id(&viewer, 0), drag_id, "mover no crea otra nota");
+        assert_eq!(
+            annotation_ink(&viewer, 0),
+            0,
+            "la nota ya no se pinta en la página de origen"
+        );
+        assert!(
+            annotation_ink(&viewer, 1) > 0,
+            "la nota se pinta en la página de destino"
+        );
+
         // Pulsar la herramienta abre el selector de color del sistema. Es la
         // única parte del flujo que no se puede probar sin un clic real, así que
         // se comprueba que la ventana del selector aparezca.
@@ -1229,6 +1276,7 @@ trailer\n<< /Root 1 0 R /Size 5 >>\n%%EOF\n";
         std::fs::remove_file(&text_path).ok();
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(&tall_path).ok();
+        std::fs::remove_file(&two_path).ok();
     }
 
     /// Pulsa el botón del diálogo modal que se esté mostrando encima de la

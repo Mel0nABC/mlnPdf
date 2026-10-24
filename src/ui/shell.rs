@@ -251,8 +251,9 @@ pub(crate) struct NoteDrag {
     pub(crate) page: usize,
     /// Punto de la vista donde empezó el arrastre, en píxeles lógicos.
     pub(crate) grab: (f64, f64),
-    /// `at` de la nota cuando empezó el arrastre.
-    pub(crate) origin: (f64, f64),
+    /// Puntero relativo a la esquina de la nota, en puntos de la vista
+    /// orientada (rotación aplicada, zoom 1): se conserva al cambiar de página.
+    pub(crate) offset: (f64, f64),
     /// True una vez que se empujó la instantánea y la nota se movió.
     pub(crate) moved: bool,
 }
@@ -2734,6 +2735,17 @@ impl Viewer {
         let Some(origin) = self.note(id.as_str()).map(|note| note.at) else {
             return false;
         };
+        let zoom = self.view.zoom.get();
+        if zoom <= 0.0 {
+            return false;
+        }
+        let Some(size) = self.doc.page_sizes.borrow().get(page).copied() else {
+            return false;
+        };
+        // Dónde se agarró la nota, en puntos de la vista: no depende de la página
+        // ni del zoom, así que el puntero conserva el mismo punto al cruzarla.
+        let note_view = forward_rotation(origin, size, self.view.rotation.get());
+        let offset = (x / zoom - note_view.0, y / zoom - note_view.1);
         // La selección de texto anterior se suelta: este gesto mueve la nota.
         if self.sel.selection.borrow_mut().take().is_some() {
             self.sel.selection_rects.borrow_mut().clear();
@@ -2743,7 +2755,7 @@ impl Viewer {
             id,
             page,
             grab: (x, y),
-            origin,
+            offset,
             moved: false,
         });
         self.queue_page_draw(page);
@@ -2778,37 +2790,68 @@ impl Viewer {
                 drag.moved = true;
             }
         }
-        if !self.set_note_position(&id, at) {
+        let previous = self.edit_page(Some(&id));
+        if !self.set_note_position(&id, page, at) {
             return false;
+        }
+        if let Some(previous) = previous
+            && previous != page
+        {
+            self.queue_page_draw(previous);
         }
         self.queue_page_draw(page);
         true
     }
 
     /// Página, identificador y posición nueva de la nota que se está arrastrando.
+    /// El puntero puede salir de la página de origen: la nota pasa a la página que
+    /// hay debajo y se recalcula su esquina en el espacio de esa página.
     fn note_drag_target(&self, offset_x: f64, offset_y: f64) -> Option<(usize, String, (f64, f64))> {
         let drag = self.annot.note_drag.borrow();
         let drag = drag.as_ref()?;
-        let anchor = self.view_to_pdf(drag.page, drag.grab.0, drag.grab.1)?;
-        let head = self.view_to_pdf(drag.page, drag.grab.0 + offset_x, drag.grab.1 + offset_y)?;
+        let zoom = self.view.zoom.get();
+        if zoom <= 0.0 {
+            return None;
+        }
+        let rotation = self.view.rotation.get();
+        let spread = self.view.spread.get();
+        let cover = self.view.cover_alone.get();
+        let oriented = self.oriented_sizes();
+        let layout = self.doc.layout.borrow();
+        let origin_left = page_left(&oriented, zoom, spread, cover, drag.page)?;
+        let origin_top = layout.page_offset(drag.page);
+        // El gesto mide desde la capa de la página de origen: se pasa a
+        // coordenadas de contenido para poder buscar la página de destino.
+        let content = (
+            origin_left + drag.grab.0 + offset_x,
+            origin_top + drag.grab.1 + offset_y,
+        );
+        let target = page_under_content(&layout, &oriented, zoom, spread, cover, content)?;
+        let left = page_left(&oriented, zoom, spread, cover, target)?;
+        let top = layout.page_offset(target);
+        let pointer_view = ((content.0 - left) / zoom, (content.1 - top) / zoom);
+        let note_view = (
+            pointer_view.0 - drag.offset.0,
+            pointer_view.1 - drag.offset.1,
+        );
+        let raw = *self.doc.page_sizes.borrow().get(target)?;
         Some((
-            drag.page,
+            target,
             drag.id.clone(),
-            (
-                drag.origin.0 + head.0 - anchor.0,
-                drag.origin.1 + head.1 - anchor.1,
-            ),
+            inverse_rotation(note_view, raw, rotation),
         ))
     }
 
-    /// Pone la esquina superior izquierda de la nota `id` en `at`.
-    fn set_note_position(&self, id: &str, at: (f64, f64)) -> bool {
+    /// Pone la nota `id` en la página `page`, con su esquina superior izquierda en
+    /// `at` (espacio de esa página).
+    fn set_note_position(&self, id: &str, page: usize, at: (f64, f64)) -> bool {
         let mut edits = self.annot.edits.borrow_mut();
         let Some(edit) = edits.iter_mut().find(|edit| edit.id == id) else {
             return false;
         };
         match &mut edit.value {
             Annotation::Note(note) => {
+                note.page = page;
                 note.at = at;
                 true
             }
@@ -2881,27 +2924,35 @@ impl Viewer {
     }
 
     /// Menú contextual de la nota: editar el texto, borrarla o armar el movimiento
-    /// con el cursor de cuatro flechas. Las acciones son propias del popover: un
-    /// menú colgado de la página no siempre resuelve las acciones de la ventana, y
-    /// el diálogo tiene que abrirse después de que el menú se cierre.
+    /// con el cursor de cuatro flechas. Los botones llaman directamente a la
+    /// acción: un menú de modelo resuelve nombres de acción y puede quedar
+    /// insensible cuando cuelga de una página, y el diálogo tiene que abrirse
+    /// después de que el menú se cierre.
     pub(crate) fn open_note_menu(
         self: &Rc<Self>,
         id: String,
         anchor: &gtk::DrawingArea,
         x: f64,
         y: f64,
-    ) -> gtk::PopoverMenu {
-        let menu = gio::Menu::new();
-        menu.append(Some("Editar texto"), Some("note.edit"));
-        menu.append(Some("Borrar"), Some("note.delete"));
-        menu.append(Some("Mover con el ratón"), Some("note.move"));
+    ) -> gtk::Popover {
+        let popover = gtk::Popover::new();
+        popover.set_has_arrow(false);
 
-        let actions = gio::SimpleActionGroup::new();
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        content.set_margin_top(6);
+        content.set_margin_bottom(6);
+        content.set_margin_start(6);
+        content.set_margin_end(6);
+        content.set_width_request(190);
 
-        let edit = gio::SimpleAction::new("edit", None);
+        let edit = note_menu_button("Editar texto");
         {
             let weak = Rc::downgrade(self);
-            edit.connect_activate(move |_, _| {
+            let popover_ref = popover.downgrade();
+            edit.connect_clicked(move |_| {
+                if let Some(popover) = popover_ref.upgrade() {
+                    popover.popdown();
+                }
                 // Presentar el modal mientras el popover todavía tiene el grab
                 // deja la ventana detrás del menú; se abre cuando ya se cerró.
                 let weak = weak.clone();
@@ -2912,33 +2963,40 @@ impl Viewer {
                 });
             });
         }
-        actions.add_action(&edit);
+        content.append(&edit);
 
-        let delete = gio::SimpleAction::new("delete", None);
+        let delete = note_menu_button("Borrar");
         {
             let weak = Rc::downgrade(self);
-            delete.connect_activate(move |_, _| {
+            let popover_ref = popover.downgrade();
+            delete.connect_clicked(move |_| {
+                if let Some(popover) = popover_ref.upgrade() {
+                    popover.popdown();
+                }
                 if let Some(viewer) = weak.upgrade() {
                     viewer.delete_selected_note();
                 }
             });
         }
-        actions.add_action(&delete);
+        content.append(&delete);
 
-        let move_action = gio::SimpleAction::new("move", None);
+        let move_button = note_menu_button("Mover con el ratón");
         {
             let weak = Rc::downgrade(self);
-            move_action.connect_activate(move |_, _| {
+            let popover_ref = popover.downgrade();
+            let id = id.clone();
+            move_button.connect_clicked(move |_| {
+                if let Some(popover) = popover_ref.upgrade() {
+                    popover.popdown();
+                }
                 if let Some(viewer) = weak.upgrade() {
                     viewer.begin_note_move(&id);
                 }
             });
         }
-        actions.add_action(&move_action);
+        content.append(&move_button);
 
-        let popover = gtk::PopoverMenu::from_model(Some(&menu));
-        popover.insert_action_group("note", Some(&actions));
-        popover.set_has_arrow(false);
+        popover.set_child(Some(&content));
         // El menú cuelga de la página y se suelta al cerrarse: un popover sin padre
         // no se puede abrir, y dejarlo colgado acumularía widgets.
         popover.set_parent(anchor);
@@ -6050,6 +6108,51 @@ fn view_angle(rotation: i32) -> f64 {
         270 => -std::f64::consts::FRAC_PI_2,
         _ => 0.0,
     }
+}
+
+/// Página de la fila que cubre `point` (coordenadas de contenido) cuya franja
+/// horizontal contiene la `x`; si el puntero está en un margen, la más cercana.
+fn page_under_content(
+    layout: &PageLayout,
+    sizes: &[(f64, f64)],
+    zoom: f64,
+    spread: bool,
+    cover: bool,
+    point: (f64, f64),
+) -> Option<usize> {
+    let first = layout.page_at(point.1);
+    let row = *layout.row_of_page.get(first)?;
+    let pages = &layout.rows.get(row)?.pages;
+    let mut nearest = None;
+    let mut best = f64::INFINITY;
+    for page in pages {
+        let left = page_left(sizes, zoom, spread, cover, *page)?;
+        let right = left + sizes[*page].0 * zoom;
+        let distance = if point.0 < left {
+            left - point.0
+        } else if point.0 > right {
+            point.0 - right
+        } else {
+            0.0
+        };
+        if distance < best {
+            best = distance;
+            nearest = Some(*page);
+        }
+    }
+    nearest
+}
+
+/// Botón de una entrada del menú contextual de la nota: aspecto de ítem de menú
+/// y texto alineado a la izquierda.
+fn note_menu_button(label: &str) -> gtk::Button {
+    let button = gtk::Button::with_label(label);
+    button.add_css_class("flat");
+    button.set_halign(gtk::Align::Fill);
+    if let Some(child) = button.child() {
+        child.set_halign(gtk::Align::Start);
+    }
+    button
 }
 
 /// Logical size of a thumbnail for a page of `size` points.
