@@ -176,6 +176,20 @@ La prueba de display necesita una sesión gráfica y debe correr sola: GTK se
 inicializa una vez por proceso y la prueba aísla `XDG_CONFIG_HOME` dentro de
 `target/` para no tocar la sesión real.
 
+## Instalación local (lanzador e icono)
+
+```bash
+cargo build --release
+./packaging/install-desktop.sh
+```
+
+Copia el binario a `~/.local/bin/mlnpdf`, el lanzador a
+`~/.local/share/applications/dev.mel0n.MlnPdf.desktop` y el icono de 512 px a
+`~/.local/share/icons/hicolor/512x512/apps/mlnpdf.png`. No necesita root. Con el
+lanzador, MlnPdf aparece en el menú de aplicaciones, en el dock con su icono y en
+«Abrir con» para los PDF. Si el icono no aparece al instante, cierra la sesión o
+ejecuta `gtk-update-icon-cache -f -t ~/.local/share/icons/hicolor`.
+
 Convenciones del repositorio:
 
 - Un commit por unidad revisable, con tests y documentación junto al

@@ -104,9 +104,12 @@ Una línea por capacidad, sin agrupar cosas distintas en una sola casilla.
 
 ## 7. Integración con el escritorio
 
-Sin archivo `.desktop` ni registro en el manejador MIME del sistema: el visor no
-se ofrece como aplicación predeterminada para `application/pdf`.
+La integración se prepara para una instalación local en `~/.local`: no hay
+paquete del sistema, así que el lanzador y el icono se copian con
+`packaging/install-desktop.sh`.
 
+- [x] Lanzador `packaging/dev.mel0n.MlnPdf.desktop` con el nombre del app ID, icono de 512 px, categorías `Office;Viewer;` y asociación `application/pdf`; el instalador local copia binario, lanzador e icono en `~/.local` sin root
+- [ ] [BLOQUEADA: empaquetado] Paquete del sistema (Flatpak/DEB/Nix) e instalación del icono en el tema a nivel del sistema
 - [x] Abrir por línea de comandos: `mlnpdf archivo.pdf` (el path se saca de argv porque Gio rechaza archivos)
 - [x] Arrastrar y soltar un PDF sobre la ventana
 - [x] Recordar la posición: página y zoom del último documento se retoman al abrirlo de nuevo, sin abrirlo solo al arrancar (`~/.config/mlnpdf/state.txt`)

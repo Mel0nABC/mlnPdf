@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=MlnPdf
+GenericName=Lector de PDF
+Comment=Lector de PDF con búsqueda, anotaciones y edición de texto
+Exec=mlnpdf %f
+TryExec=mlnpdf
+Icon=mlnpdf
+Terminal=false
+Categories=Office;Viewer;
+MimeType=application/pdf;
+Keywords=PDF;pdf;documento;lector;anotaciones;notas;
+StartupNotify=true
+StartupWMClass=mlnpdf
+X-GNOME-UsesNotifications=true
