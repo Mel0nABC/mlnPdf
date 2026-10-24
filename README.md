@@ -72,6 +72,7 @@ ventana.
 | Cambiar la fuente o el color de solo una parte de la nota | En el diálogo de edición, seleccionar el texto y elegir la fuente o el color; sin selección, se aplica a toda la nota |
 | Insertar una imagen sobre la página, en cualquier formato que el sistema sepa abrir (PNG, JPEG, WebP, GIF, BMP y SVG si está librsvg) | Botón con el icono de imagen al lado de la `T`, `Ctrl+Shift+I` o `Edit > Insertar imagen…`: el selector filtra `image/*` y la imagen entra en el acto centrada en lo que se está viendo, ya elegida y con asas |
 | Mover y redimensionar una imagen, y borrarla como cualquier otra anotación | Arrastrarla desde dentro para moverla (`move`), arrastrar una esquina para redimensionarla (`Shift` conserva la proporción, la esquina opuesta queda fija y ningún lado baja de 8 pt), `Supr` o `Eliminar` del menú contextual para borrarla; también se puede soltar un archivo de imagen directamente sobre la página |
+| Volver a editar lo guardado: al reabrir el archivo, los subrayados, resaltados, notas e imágenes que escribió MlnPdf vuelven a la lista editable | Abrir el archivo y usar las mismas herramientas: clic para elegir, `Supr` para borrar, doble clic o `Edit > Editar texto de la nota` para el texto, arrastrar para mover y las esquinas para redimensionar; las anotaciones de otros programas se respetan y no se reescriben |
 | Deshacer y rehacer con instantáneas, de a un cambio | `Ctrl+Z` / `Ctrl+Shift+Z` (o `Ctrl+Y`), `Edit > Deshacer` / `Rehacer` |
 | Metadatos del documento | `Ctrl+D` |
 
@@ -171,7 +172,7 @@ Probado con GTK 4.24 y poppler-glib 26.10.
 
 ```bash
 cargo build --release
-cargo test                 # 115 pruebas: motor, render, selección, búsqueda, páginas, sesión, anotaciones
+cargo test                 # 132 pruebas: motor, render, selección, búsqueda, páginas, sesión, anotaciones
 cargo test -- --ignored    # prueba de display: atajos, zoom y propiedad del viewer
 ```
 
