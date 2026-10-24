@@ -7,7 +7,7 @@ use gtk::gio;
 
 /// Keyboard shortcuts bound to the window actions. Declared as data so the
 /// display test can prove every trigger string actually parses.
-pub const SHORTCUTS: [(&str, &str); 41] = [
+pub const SHORTCUTS: [(&str, &str); 42] = [
     ("<Control>plus", "win.zoom-in"),
     ("<Control>equal", "win.zoom-in"),
     ("<Control>minus", "win.zoom-out"),
@@ -46,6 +46,7 @@ pub const SHORTCUTS: [(&str, &str); 41] = [
     ("<Control>y", "win.redo"),
     ("<Control>u", "win.underline"),
     ("<Control><Shift>u", "win.highlight"),
+    ("<Control><Alt>u", "win.strikeout"),
     ("<Control>t", "win.insert-text"),
     ("<Control><Shift>i", "win.insert-image"),
     ("<Control>s", "win.save-annotations"),
@@ -56,7 +57,7 @@ pub const SHORTCUTS: [(&str, &str); 41] = [
 ];
 
 /// Human-readable shortcut list shown by Help > Atajos de teclado.
-pub const SHORTCUT_HELP: [(&str, &str); 28] = [
+pub const SHORTCUT_HELP: [(&str, &str); 29] = [
     ("Ctrl+O", "Abrir un PDF"),
     ("Ctrl+P", "Imprimir"),
     ("Ctrl+F", "Buscar en el documento"),
@@ -74,6 +75,7 @@ pub const SHORTCUT_HELP: [(&str, &str); 28] = [
     ("Supr", "Borrar la anotación seleccionada"),
     ("Ctrl+U", "Subrayar el texto seleccionado"),
     ("Ctrl+Shift+U", "Resaltar el texto seleccionado"),
+    ("Ctrl+Alt+U", "Tachar el texto seleccionado"),
     ("Ctrl+T", "Insertar una nota de texto en la página"),
     ("Ctrl+Shift+I", "Insertar una imagen en la página"),
     ("Ctrl+S / Ctrl+Shift+S", "Guardar los marcados / guardar como"),
@@ -112,6 +114,7 @@ pub fn build_menu_bar() -> gtk::PopoverMenuBar {
     edit_menu.append(Some("Buscar…"), Some("win.search"));
     edit_menu.append(Some("Subrayar"), Some("win.underline"));
     edit_menu.append(Some("Resaltar"), Some("win.highlight"));
+    edit_menu.append(Some("Tachar"), Some("win.strikeout"));
     edit_menu.append(Some("Insertar texto…"), Some("win.insert-text"));
     edit_menu.append(Some("Insertar imagen…"), Some("win.insert-image"));
     edit_menu.append(Some("Copiar texto de la página"), Some("win.copy-page-text"));

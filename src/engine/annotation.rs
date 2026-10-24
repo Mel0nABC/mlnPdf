@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Mel0nABC <mel0n@mel0n.dev>
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Anotaciones: los subrayados, las notas de texto y las imágenes pendientes, y
-//! su paso al espacio de usuario del PDF, que es con el origen abajo a la
-//! izquierda y el que leen los demás lectores.
+//! Anotaciones: los marcados sobre el texto, las notas y las imágenes
+//! pendientes, y su paso al espacio de usuario del PDF, que es con el origen
+//! abajo a la izquierda y el que leen los demás lectores.
 
 use std::rc::Rc;
 
@@ -32,6 +32,8 @@ pub enum MarkKind {
     Underline,
     /// Fondo translúcido sobre el texto, como un rotulador.
     Highlight,
+    /// Línea por el medio del texto, opaca: el texto queda tachado.
+    StrikeOut,
 }
 
 impl MarkKind {
@@ -40,6 +42,7 @@ impl MarkKind {
         match self {
             Self::Underline => "Underline",
             Self::Highlight => "Highlight",
+            Self::StrikeOut => "StrikeOut",
         }
     }
 
@@ -48,6 +51,7 @@ impl MarkKind {
         match self {
             Self::Underline => 0,
             Self::Highlight => 1,
+            Self::StrikeOut => 2,
         }
     }
 
@@ -57,6 +61,7 @@ impl MarkKind {
         match self {
             Self::Underline => 1.0,
             Self::Highlight => 0.4,
+            Self::StrikeOut => 1.0,
         }
     }
 }
@@ -82,6 +87,11 @@ impl TextMark {
     /// Resaltado: el fondo del texto, con transparencia.
     pub fn highlight(page: usize, rects: Vec<Rect>, color: (f64, f64, f64)) -> Self {
         Self::new(page, rects, color, MarkKind::Highlight)
+    }
+
+    /// Tachado: la línea cruza el texto por el medio.
+    pub fn strikeout(page: usize, rects: Vec<Rect>, color: (f64, f64, f64)) -> Self {
+        Self::new(page, rects, color, MarkKind::StrikeOut)
     }
 
     /// Marcado con su página, sus rectángulos, su color y su tipo. Sirve tanto
@@ -121,7 +131,8 @@ impl TextMark {
 
     /// True cuando `point` cae sobre el marcado. El subrayado se agarra por su
     /// línea, en el borde inferior de cada rectángulo; el resaltado, por dentro
-    /// de cualquiera de sus rectángulos. La tolerancia llega en puntos del PDF.
+    /// de cualquiera de sus rectángulos; el tachado, por la línea que cruza el
+    /// medio del texto. La tolerancia llega en puntos del PDF.
     pub fn contains(&self, point: (f64, f64), tolerance: f64) -> bool {
         let (x, y) = point;
         match self.kind {
@@ -135,6 +146,12 @@ impl TextMark {
                     && x <= x1.max(x2) + tolerance
                     && y >= y1.min(y2) - tolerance
                     && y <= y1.max(y2) + tolerance
+            }),
+            MarkKind::StrikeOut => self.rects.iter().any(|&(x1, y1, x2, y2)| {
+                let left = x1.min(x2) - tolerance;
+                let right = x1.max(x2) + tolerance;
+                let middle = (y1.min(y2) + y1.max(y2)) / 2.0;
+                x >= left && x <= right && (y - middle).abs() <= tolerance
             }),
         }
     }
@@ -1176,6 +1193,40 @@ mod tests {
         assert!(mark.contains((8.0, 25.0), 2.0), "la tolerancia llega afuera");
         assert!(!mark.contains((5.0, 25.0), 2.0));
         assert!(!mark.contains((35.0, 35.0), 2.0));
+    }
+
+    #[test]
+    fn a_strikeout_is_hit_through_the_middle_of_the_text_box() {
+        let mark = TextMark::strikeout(0, vec![(10.0, 20.0, 60.0, 30.0)], (0.0, 0.0, 0.0));
+
+        assert!(mark.contains((35.0, 25.0), 2.0), "justo por el medio del texto");
+        assert!(
+            mark.contains((35.0, 27.0), 2.0),
+            "la tolerancia llega alrededor de la línea"
+        );
+        assert!(
+            !mark.contains((35.0, 30.0), 2.0),
+            "el borde inferior es el del subrayado, no el del tachado"
+        );
+        assert!(
+            !mark.contains((5.0, 25.0), 2.0),
+            "fuera del ancho de la línea"
+        );
+    }
+
+    #[test]
+    fn a_strikeout_declares_the_subtype_the_reader_recognizes() {
+        assert_eq!(MarkKind::StrikeOut.subtype(), "StrikeOut");
+        assert_eq!(
+            MarkKind::StrikeOut.index(),
+            2,
+            "es la tercera herramienta de marcado"
+        );
+        assert_eq!(
+            MarkKind::StrikeOut.opacity(),
+            1.0,
+            "el tachado va opaco, como el subrayado"
+        );
     }
 
     #[test]

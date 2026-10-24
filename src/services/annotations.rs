@@ -616,9 +616,10 @@ fn temporary_path(target: &Path) -> PathBuf {
 /// Lee del archivo las anotaciones propias y las devuelve como anotaciones en
 /// memoria, en orden de página y de aparición, con su `/NM`.
 ///
-/// Se reconstruyen los cuatro tipos que escribe el visor —subrayado, resaltado,
-/// nota de texto e imagen— y solo esos: una anotación sin `/NM` o con un `/NM`
-/// ajeno es de otro programa, así que no entra en la lista y nunca se reescribe.
+/// Se reconstruyen los cinco tipos que escribe el visor —subrayado, resaltado,
+/// tachado, nota de texto e imagen— y solo esos: una anotación sin `/NM` o con un
+/// `/NM` ajeno es de otro programa, así que no entra en la lista y nunca se
+/// reescribe.
 ///
 /// Un PDF protegido devuelve una lista vacía en vez de un error: en ese archivo
 /// no se pueden escribir anotaciones, así que no hay nada que reconstruir y el
@@ -750,6 +751,7 @@ fn read_annotation(
     match subtype {
         b"Underline" => read_mark(document, dictionary, page, page_box, MarkKind::Underline),
         b"Highlight" => read_mark(document, dictionary, page, page_box, MarkKind::Highlight),
+        b"StrikeOut" => read_mark(document, dictionary, page, page_box, MarkKind::StrikeOut),
         b"FreeText" => read_note(document, dictionary, page, page_box),
         b"Stamp" => read_image(document, dictionary, page, page_box),
         _ => None,
@@ -2337,6 +2339,80 @@ mod tests {
         assert_eq!(highlight.kind, MarkKind::Highlight);
         assert_eq!(highlight.color, [0.0, 0.5, 1.0]);
         for (got, want) in highlight.rects.iter().zip(&rects) {
+            assert_same_rect(*got, *want);
+        }
+    }
+
+    #[test]
+    fn a_strikeout_is_written_with_the_subtype_the_reader_recognizes() {
+        let source = scratch("strikeout.pdf");
+        let target = scratch("strikeout-out.pdf");
+        std::fs::write(&source, fixture([0.0, 0.0, 200.0, 200.0], 0)).expect("escribir el PDF");
+
+        let written = write_fresh(
+            &source,
+            &target,
+            &[Annotation::Mark(TextMark::strikeout(
+                0,
+                vec![(20.0, 20.0, 120.0, 40.0)],
+                (0.25, 0.25, 0.25),
+            ))],
+        )
+        .expect("el tachado tiene que escribirse");
+        assert_eq!(written, 1);
+
+        let document = Document::load(&target).expect("el archivo escrito tiene que cargarse");
+        let page_id = *document.get_pages().get(&1).expect("página 1");
+        let annotations = document.get_page_annotations(page_id).expect("anotaciones");
+        assert_eq!(annotations.len(), 1, "una anotación por tachado");
+        let annotation = annotations[0];
+
+        assert_eq!(
+            annotation
+                .get(b"Subtype")
+                .and_then(Object::as_name)
+                .expect("Subtype"),
+            b"StrikeOut",
+            "el lector de PDF tiene que reconocer el tachado"
+        );
+        assert_eq!(
+            numbers(annotation, b"QuadPoints"),
+            vec![20.0, 180.0, 120.0, 180.0, 20.0, 160.0, 120.0, 160.0],
+            "los mismos quads que el subrayado"
+        );
+        assert_eq!(
+            numbers(annotation, b"C"),
+            vec![0.25, 0.25, 0.25],
+            "color en 0..=1"
+        );
+        assert!(
+            annotation.get(b"CA").is_err(),
+            "el tachado va opaco: no lleva /CA"
+        );
+
+        let bytes = std::fs::read(&target).expect("leer el resultado");
+        let document = poppler::Document::from_data(&bytes, None).expect("poppler abre el PDF");
+        assert_eq!(document.n_pages(), 1, "el PDF sigue siendo válido para poppler");
+    }
+
+    #[test]
+    fn a_strikeout_comes_back_with_its_page_rects_and_colour() {
+        let rects = vec![(20.0, 20.0, 120.0, 40.0), (20.0, 60.0, 80.0, 75.0)];
+        let current = vec![owned(
+            "mlnpdf-ida-tachado",
+            Annotation::Mark(TextMark::strikeout(0, rects.clone(), (0.25, 0.25, 0.25))),
+        )];
+
+        let (_, read) = round_trip("rt-strikeout", fixture([0.0, 0.0, 200.0, 100.0], 0), &current);
+        assert_eq!(read.len(), 1, "vuelve el tachado: {read:?}");
+        assert_eq!(read[0].0, "mlnpdf-ida-tachado");
+
+        let strikeout = read_mark_of(&read[0]);
+        assert_eq!(strikeout.page, 0, "misma página");
+        assert_eq!(strikeout.kind, MarkKind::StrikeOut, "mismo tipo");
+        assert_eq!(strikeout.color, [0.25, 0.25, 0.25], "mismo color");
+        assert_eq!(strikeout.rects.len(), rects.len(), "una línea por rectángulo");
+        for (got, want) in strikeout.rects.iter().zip(&rects) {
             assert_same_rect(*got, *want);
         }
     }

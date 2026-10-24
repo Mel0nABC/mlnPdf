@@ -227,8 +227,8 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         };
         assert_eq!(
             children.len(),
-            9,
-            "búsqueda, hueco, páginas, hueco, zoom, subrayar, resaltar, insertar texto e insertar imagen"
+            10,
+            "búsqueda, hueco, páginas, hueco, zoom, subrayar, resaltar, tachar, insertar texto e insertar imagen"
         );
         for gap in [&children[1], &children[3]] {
             assert_eq!(
@@ -245,7 +245,8 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         for (index, name) in [
             (5, "el subrayado"),
             (6, "el resaltado"),
-            (7, "insertar texto"),
+            (7, "el tachado"),
+            (8, "insertar texto"),
         ] {
             assert!(
                 children[index].is::<gtk::ToggleButton>(),
@@ -254,17 +255,22 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         }
         assert_eq!(
             children[7].tooltip_text().as_deref(),
+            Some("Tachar (Ctrl+Alt+U)"),
+            "la herramienta de tachar se anuncia con su atajo"
+        );
+        assert_eq!(
+            children[8].tooltip_text().as_deref(),
             Some("Insertar texto (Ctrl+T)"),
-            "la tercera herramienta se anuncia con su atajo"
+            "la herramienta de texto se anuncia con su atajo"
         );
         // Insertar imagen no es un modo que quede armado: es un botón normal con
         // icono que abre el selector de archivos en el acto.
         assert!(
-            !children[8].is::<gtk::ToggleButton>() && children[8].is::<gtk::Button>(),
+            !children[9].is::<gtk::ToggleButton>() && children[9].is::<gtk::Button>(),
             "insertar imagen es un botón normal, no una herramienta armada"
         );
         assert_eq!(
-            children[8].tooltip_text().as_deref(),
+            children[9].tooltip_text().as_deref(),
             Some("Insertar imagen (Ctrl+Shift+I)"),
             "el botón de imagen se anuncia con su atajo"
         );
@@ -471,9 +477,9 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             dialog.close();
         }
 
-        // Subrayar y resaltar: al pulsar la herramienta se abre el selector de
-        // color de GTK; si ya había texto seleccionado se marca en el acto y, si
-        // no, la herramienta queda armada para el siguiente arrastre.
+        // Subrayar, resaltar y tachar: al pulsar la herramienta se abre el
+        // selector de color de GTK; si ya había texto seleccionado se marca en el
+        // acto y, si no, la herramienta queda armada para el siguiente arrastre.
         let text_path = dir.join("text-page-ui.pdf");
         std::fs::write(&text_path, TEXT_PAGE_PDF).expect("write scratch text PDF");
         viewer.open(&text_path).expect("open the text page");
@@ -481,7 +487,11 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             viewer.ui.tools[0].button.is_sensitive(),
             "con un documento abierto la herramienta está disponible"
         );
-        for (index, title) in [(0, "Color del subrayado"), (1, "Color del resaltado")] {
+        for (index, title) in [
+            (0, "Color del subrayado"),
+            (1, "Color del resaltado"),
+            (2, "Color del tachado"),
+        ] {
             assert_eq!(
                 viewer.ui.tools[index].dialog.title(),
                 title,
@@ -618,6 +628,76 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         assert_eq!(mark_at(&viewer, 3).kind, MarkKind::Highlight);
         assert_eq!(mark_at(&viewer, 3).color, [1.0, 0.5, 0.0]);
         viewer.set_mark_mode(MarkKind::Highlight, false);
+
+        // Tachar: la tercera herramienta de marcado, con su propio gris y el
+        // mismo gesto que las otras dos. Armar una apaga las demás.
+        viewer.begin_selection(0, 20.0, 155.0);
+        viewer.update_selection(0, 160.0, 40.0);
+        viewer.finish_selection();
+        viewer.accept_mark_color(MarkKind::StrikeOut, STRIKEOUT_COLOR);
+        assert_eq!(
+            viewer.annot.edits.borrow().len(),
+            5,
+            "el color sobre la selección pendiente tacha en el acto"
+        );
+        assert!(
+            matches!(
+                &viewer.annot.edits.borrow()[4].value,
+                Annotation::Mark(mark) if mark.kind == MarkKind::StrikeOut
+            ),
+            "el tachado se guarda como un marcado de tipo StrikeOut"
+        );
+        assert_eq!(
+            mark_at(&viewer, 4).color,
+            [STRIKEOUT_COLOR.0, STRIKEOUT_COLOR.1, STRIKEOUT_COLOR.2],
+            "arranca con el gris por omisión del tachado"
+        );
+        assert!(
+            viewer.mark_tool(MarkKind::StrikeOut).active
+                && !viewer.mark_tool(MarkKind::Underline).active
+                && !viewer.mark_tool(MarkKind::Highlight).active,
+            "armar el tachado apaga las otras dos herramientas"
+        );
+        assert!(
+            mark_glyph_markup(MarkKind::StrikeOut, STRIKEOUT_COLOR).contains("strikethrough"),
+            "el botón de tachar lleva la línea en su glifo"
+        );
+        // La capa de anotaciones dibuja una línea por el medio de cada línea de
+        // texto, no sobre el borde inferior como el subrayado.
+        let strikeout_mark = mark_at(&viewer, 4);
+        let (sx1, sy1, sx2, sy2) = strikeout_mark.rects[0];
+        let middle = (sy1 + sy2) / 2.0;
+        let page_size = viewer.doc.page_sizes.borrow()[0];
+        let rotation = viewer.view.rotation.get();
+        let zoom = viewer.view.zoom.get();
+        let side = 200usize;
+        let painted = annotation_pixels(&viewer, 0, side, side);
+        let painted_at = |x: f64, y: f64| {
+            let (px, py) = forward_rotation((x, y), page_size, rotation);
+            let (column, row) = ((px * zoom) as usize, (py * zoom) as usize);
+            painted[row * side + column][0] < 120
+        };
+        assert!(
+            painted_at((sx1 + sx2) / 2.0, middle),
+            "el tachado cruza el medio de la línea de texto"
+        );
+        assert!(
+            painted_at(sx1 + (sx2 - sx1) * 0.25, middle),
+            "la línea recorre el ancho del texto"
+        );
+        viewer.escape_pressed();
+        assert!(
+            !viewer.mark_tool(MarkKind::StrikeOut).active,
+            "Esc sale del modo tachar"
+        );
+        // Se borra para que el resto de la prueba siga con los cuatro marcados.
+        let strikeout_id = edit_id(&viewer, 4);
+        viewer.select_annotation(Some(strikeout_id));
+        assert!(
+            viewer.delete_selected_annotation(),
+            "el tachado se borra como cualquier marcado"
+        );
+        assert_eq!(viewer.annot.edits.borrow().len(), 4);
 
         // Un clic sobre un marcado lo elige; Supr o el menú lo borran.
         let underline = mark_at(&viewer, 0);

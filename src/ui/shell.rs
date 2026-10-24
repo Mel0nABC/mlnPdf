@@ -55,6 +55,10 @@ pub(crate) const HIGHLIGHT_COLOR: (f64, f64, f64) = (1.0, 0.88, 0.2);
 /// carries in `/CA`, so the page and the saved file read the same.
 pub(crate) const HIGHLIGHT_ALPHA: f64 = 0.4;
 
+/// Color con el que empieza un tachado: un gris oscuro que se lee sobre el papel
+/// blanco y no se confunde con la línea ámbar del subrayado.
+pub(crate) const STRIKEOUT_COLOR: (f64, f64, f64) = (0.25, 0.25, 0.25);
+
 /// Width in logical pixels of the border band of a note where the cursor turns
 /// into the four-arrow move cursor, measured towards the inside of the note.
 const NOTE_CURSOR_BORDER: f64 = 5.0;
@@ -139,7 +143,7 @@ pub(crate) struct UiHandles {
     pub(crate)     scale_provider: gtk::CssProvider,
     /// Un juego de botón, diálogo y selector de color por cada herramienta de
     /// marcado, en el orden de `MarkKind::index`.
-    pub(crate)     tools: [MarkToolUi; 2],
+    pub(crate)     tools: [MarkToolUi; 3],
     /// Botón de la herramienta «insertar texto».
     pub(crate)     text_button: gtk::ToggleButton,
     /// Botón de la herramienta «insertar imagen»: no es un modo, abre el selector
@@ -216,7 +220,7 @@ pub(crate) struct SelectionState {
     pub(crate)     selection_start: Cell<Option<(f64, f64)>>,
 }
 
-/// Una herramienta de marcado: el color elegido y si está armada. Las dos son
+/// Una herramienta de marcado: el color elegido y si está armada. Las tres son
 /// excluyentes, así que a lo sumo una está activa.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct MarkTool {
@@ -261,6 +265,7 @@ pub(crate) struct AnnotationState {
     pub(crate)     hover: RefCell<Option<(String, &'static str)>>,
     pub(crate)     underline: Cell<MarkTool>,
     pub(crate)     highlight: Cell<MarkTool>,
+    pub(crate)     strikeout: Cell<MarkTool>,
     /// Herramienta «insertar texto» armada: el próximo clic coloca la nota.
     pub(crate)     text_tool: Cell<bool>,
     /// Texto y fuente que dejó el diálogo, esperando ese clic.
@@ -414,16 +419,17 @@ impl Viewer {
         zoom_box.append(&zoom_label);
         zoom_box.append(&zoom_in_button);
 
-        // Las dos herramientas de marcado, justo al lado del zoom. Usan una
-        // letra como glifo: Adwaita no trae iconos de subrayado ni de rotulador y
-        // una etiqueta se lee igual en cualquier tema.
+        // Las tres herramientas de marcado, justo al lado del zoom. Usan una
+        // letra como glifo: Adwaita no trae iconos de subrayado, rotulador ni
+        // tachado y una etiqueta se lee igual en cualquier tema.
         let tools = [
             build_mark_tool(&mark_spec(MarkKind::Underline)),
             build_mark_tool(&mark_spec(MarkKind::Highlight)),
+            build_mark_tool(&mark_spec(MarkKind::StrikeOut)),
         ];
 
-        // Tercera herramienta: insertar texto. También con una letra como
-        // glifo, por el mismo motivo que las otras dos.
+        // Cuarta herramienta: insertar texto. También con una letra como glifo,
+        // por el mismo motivo que las otras tres.
         let text_button = gtk::ToggleButton::builder()
             .child(&gtk::Label::new(Some("T")))
             .tooltip_text("Insertar texto (Ctrl+T)")
@@ -501,6 +507,7 @@ impl Viewer {
         controls.append(&zoom_box);
         controls.append(&tools[0].button);
         controls.append(&tools[1].button);
+        controls.append(&tools[2].button);
         controls.append(&text_button);
         controls.append(&image_button);
 
@@ -652,6 +659,10 @@ impl Viewer {
                     color: HIGHLIGHT_COLOR,
                     active: false,
                 }),
+                strikeout: Cell::new(MarkTool {
+                    color: STRIKEOUT_COLOR,
+                    active: false,
+                }),
                 text_tool: Cell::new(false),
                 draft: RefCell::new(None),
                 image_surfaces: RefCell::new(HashMap::new()),
@@ -680,7 +691,7 @@ impl Viewer {
         Self::connect_click(&viewer, &zoom_in_button, |viewer| viewer.zoom_in());
         Self::connect_click(&viewer, &zoom_out_button, |viewer| viewer.zoom_out());
 
-        for kind in [MarkKind::Underline, MarkKind::Highlight] {
+        for kind in [MarkKind::Underline, MarkKind::Highlight, MarkKind::StrikeOut] {
             let ui = &viewer.ui.tools[kind.index()];
 
             // `clicked` y no `toggled`: al pulsar la herramienta se abre el
@@ -986,6 +997,9 @@ impl Viewer {
         });
         Self::install_action(viewer, "highlight", |viewer| {
             viewer.toggle_mark_mode(MarkKind::Highlight);
+        });
+        Self::install_action(viewer, "strikeout", |viewer| {
+            viewer.toggle_mark_mode(MarkKind::StrikeOut);
         });
         Self::install_action(viewer, "insert-text", |viewer| viewer.prompt_text_note());
         Self::install_action(viewer, "insert-image", |viewer| viewer.prompt_insert_image());
@@ -1882,10 +1896,11 @@ impl Viewer {
     /// Turns the hand tool on or off and keeps the cursor consistent.
     pub(crate) fn set_hand_mode(&self, active: bool) {
         if active {
-            // Las tres herramientas no pueden estar activas a la vez.
+            // Las cuatro herramientas no pueden estar activas a la vez.
             self.set_text_tool(false);
             self.set_mark_mode(MarkKind::Underline, false);
             self.set_mark_mode(MarkKind::Highlight, false);
+            self.set_mark_mode(MarkKind::StrikeOut, false);
         }
         self.input.hand_mode.set(active);
         if !active {
@@ -1909,13 +1924,15 @@ impl Viewer {
         }
     }
 
-    /// Herramienta de marcado armada, si hay alguna: subrayar y resaltar son
-    /// excluyentes.
+    /// Herramienta de marcado armada, si hay alguna: subrayar, resaltar y tachar
+    /// son excluyentes.
     pub(crate) fn active_mark_tool(&self) -> Option<MarkKind> {
         if self.annot.underline.get().active {
             Some(MarkKind::Underline)
         } else if self.annot.highlight.get().active {
             Some(MarkKind::Highlight)
+        } else if self.annot.strikeout.get().active {
+            Some(MarkKind::StrikeOut)
         } else {
             None
         }
@@ -1925,6 +1942,7 @@ impl Viewer {
         match kind {
             MarkKind::Underline => self.annot.underline.get(),
             MarkKind::Highlight => self.annot.highlight.get(),
+            MarkKind::StrikeOut => self.annot.strikeout.get(),
         }
     }
 
@@ -1932,6 +1950,7 @@ impl Viewer {
         match kind {
             MarkKind::Underline => self.annot.underline.set(tool),
             MarkKind::Highlight => self.annot.highlight.set(tool),
+            MarkKind::StrikeOut => self.annot.strikeout.set(tool),
         }
     }
 
@@ -1957,8 +1976,12 @@ impl Viewer {
         let active = active && self.doc.document.borrow().is_some();
         if active {
             self.set_hand_mode(false);
-            // La otra herramienta de marcado se apaga.
-            for other in [MarkKind::Underline, MarkKind::Highlight] {
+            // Las otras herramientas de marcado se apagan.
+            for other in [
+                MarkKind::Underline,
+                MarkKind::Highlight,
+                MarkKind::StrikeOut,
+            ] {
                 if other != kind {
                     self.set_mark_mode(other, false);
                 }
@@ -2002,13 +2025,14 @@ impl Viewer {
 
     /// Arma o desarma la herramienta «insertar texto»: el botón, el cursor y el
     /// estado tienen que contar lo mismo. Es excluyente con el modo mano y con
-    /// las dos herramientas de marcado.
+    /// las tres herramientas de marcado.
     pub(crate) fn set_text_tool(&self, active: bool) {
         let active = active && self.doc.document.borrow().is_some();
         if active {
             self.set_hand_mode(false);
             self.set_mark_mode(MarkKind::Underline, false);
             self.set_mark_mode(MarkKind::Highlight, false);
+            self.set_mark_mode(MarkKind::StrikeOut, false);
         }
         self.annot.text_tool.set(active);
         if self.ui.text_button.is_active() != active {
@@ -2550,6 +2574,7 @@ impl Viewer {
         let mark = match kind {
             MarkKind::Underline => TextMark::underline(selection.page, rects, color),
             MarkKind::Highlight => TextMark::highlight(selection.page, rects, color),
+            MarkKind::StrikeOut => TextMark::strikeout(selection.page, rects, color),
         };
         self.begin_edit();
         let id = self.new_id();
@@ -2896,6 +2921,7 @@ impl Viewer {
         self.set_text_tool(false);
         self.set_mark_mode(MarkKind::Underline, false);
         self.set_mark_mode(MarkKind::Highlight, false);
+        self.set_mark_mode(MarkKind::StrikeOut, false);
         self.refresh_edit_actions();
     }
 
@@ -2930,8 +2956,8 @@ impl Viewer {
     }
 
     /// Marcado bajo el punto `(x, y)` de la vista, si hay alguno. El subrayado se
-    /// agarra por su línea y el resaltado por dentro del rectángulo; la última
-    /// anotación dibujada gana.
+    /// agarra por su línea, el resaltado por dentro del rectángulo y el tachado
+    /// por la línea del medio; la última anotación dibujada gana.
     pub(crate) fn mark_at(&self, page: usize, x: f64, y: f64) -> Option<String> {
         let point = self.view_to_pdf(page, x, y)?;
         let zoom = self.view.zoom.get();
@@ -3601,8 +3627,8 @@ impl Viewer {
     }
 
     /// Pinta las anotaciones de la página: el subrayado sobre el borde inferior
-    /// de cada línea de texto, el resaltado como fondo translúcido y las notas
-    /// de texto en negro con su fuente.
+    /// de cada línea de texto, el resaltado como fondo translúcido, el tachado por
+    /// el medio de cada línea y las notas de texto en negro con su fuente.
     pub(crate) fn draw_annotations(&self, page: usize, context: &cairo::Context) {
         let edits = self.annot.edits.borrow();
         if edits.iter().all(|edit| edit.value.page() != page) {
@@ -3661,6 +3687,21 @@ impl Viewer {
                         );
                     }
                     let _ = context.fill();
+                }
+                MarkKind::StrikeOut => {
+                    // Una línea por el medio de cada línea de texto, del mismo
+                    // grosor que la del subrayado.
+                    context.set_line_cap(cairo::LineCap::Butt);
+                    context.set_line_width((UNDERLINE_WIDTH * zoom).max(1.0));
+                    context.set_source_rgba(mark.color[0], mark.color[1], mark.color[2], 1.0);
+                    for (x1, y1, x2, y2) in mark.rects.iter() {
+                        let middle = (y1.min(*y2) + y1.max(*y2)) / 2.0;
+                        let (px1, py1) = forward_rotation((*x1, middle), size, rotation);
+                        let (px2, py2) = forward_rotation((*x2, middle), size, rotation);
+                        context.move_to(px1 * zoom, py1 * zoom);
+                        context.line_to(px2 * zoom, py2 * zoom);
+                    }
+                    let _ = context.stroke();
                 }
             }
         }
@@ -7080,11 +7121,19 @@ fn mark_spec(kind: MarkKind) -> MarkToolSpec {
             color_title: "Color del resaltado",
             default_color: HIGHLIGHT_COLOR,
         },
+        MarkKind::StrikeOut => MarkToolSpec {
+            kind,
+            tooltip: "Tachar (Ctrl+Alt+U)",
+            accessible: "Tachar el texto seleccionado",
+            color_title: "Color del tachado",
+            default_color: STRIKEOUT_COLOR,
+        },
     }
 }
 
 /// Glifo del botón con el color de la herramienta: la "U" lleva la línea en ese
-/// color y la "A" lo lleva de fondo, con letra clara si el fondo es oscuro.
+/// color, la "A" lo lleva de fondo, con letra clara si el fondo es oscuro, y la
+/// "S" lleva el tachado en ese color.
 pub(crate) fn mark_glyph_markup(kind: MarkKind, color: (f64, f64, f64)) -> String {
     let hex = hex_color(color);
     match kind {
@@ -7096,6 +7145,9 @@ pub(crate) fn mark_glyph_markup(kind: MarkKind, color: (f64, f64, f64)) -> Strin
             let ink = if luminance > 0.55 { "#000000" } else { "#FFFFFF" };
             format!("<span background=\"{hex}\" foreground=\"{ink}\">A</span>")
         }
+        MarkKind::StrikeOut => format!(
+            "<span strikethrough=\"true\" strikethrough_color=\"{hex}\">S</span>"
+        ),
     }
 }
 
