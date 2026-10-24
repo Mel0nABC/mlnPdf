@@ -7,7 +7,7 @@ use gtk::gio;
 
 /// Keyboard shortcuts bound to the window actions. Declared as data so the
 /// display test can prove every trigger string actually parses.
-pub const SHORTCUTS: [(&str, &str); 51] = [
+pub const SHORTCUTS: [(&str, &str); 52] = [
     ("<Control>plus", "win.zoom-in"),
     ("<Control>equal", "win.zoom-in"),
     ("<Control>minus", "win.zoom-out"),
@@ -68,10 +68,13 @@ pub const SHORTCUTS: [(&str, &str); 51] = [
     // Sin `<Control>`: es la tecla de borrar las anotaciones elegidas. El visor
     // la maneja en fase de burbuja para que los campos de texto conserven la suya.
     ("Delete", "win.note-delete"),
+    // Cambiar el color de lo que ya está colocado. `Alt` lo separa de los atajos
+    // de marcado, que usan el mismo `C` para copiar.
+    ("<Control><Alt>c", "win.recolor-selection"),
 ];
 
 /// Human-readable shortcut list shown by Help > Atajos de teclado.
-pub const SHORTCUT_HELP: [(&str, &str); 36] = [
+pub const SHORTCUT_HELP: [(&str, &str); 37] = [
     ("Ctrl+O", "Abrir un PDF"),
     ("Ctrl+P", "Imprimir"),
     ("Ctrl+F", "Buscar en el documento"),
@@ -87,6 +90,7 @@ pub const SHORTCUT_HELP: [(&str, &str); 36] = [
     ("Ctrl+Z", "Deshacer el último marcado sin guardar"),
     ("Ctrl+Shift+Z / Ctrl+Y", "Rehacer el marcado deshecho"),
     ("Supr", "Borrar las anotaciones seleccionadas"),
+    ("Ctrl+Alt+C", "Cambiar el color de lo seleccionado"),
     ("Ctrl+U", "Subrayar el texto seleccionado"),
     ("Ctrl+Shift+U", "Resaltar el texto seleccionado"),
     ("Ctrl+Alt+U", "Tachar el texto seleccionado"),
@@ -132,6 +136,7 @@ pub fn build_menu_bar() -> gtk::PopoverMenuBar {
     edit_menu.append(Some("Rehacer"), Some("win.redo"));
     edit_menu.append(Some("Editar texto de la nota"), Some("win.note-edit"));
     edit_menu.append(Some("Borrar las anotaciones"), Some("win.note-delete"));
+    edit_menu.append(Some("Cambiar color…"), Some("win.recolor-selection"));
     edit_menu.append(Some("Buscar…"), Some("win.search"));
     edit_menu.append(Some("Subrayar"), Some("win.underline"));
     edit_menu.append(Some("Resaltar"), Some("win.highlight"));

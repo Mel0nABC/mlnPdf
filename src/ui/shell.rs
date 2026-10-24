@@ -1334,6 +1334,9 @@ impl Viewer {
         Self::install_action(viewer, "note-delete", |viewer| {
             viewer.delete_selected_annotations();
         });
+        Self::install_action(viewer, "recolor-selection", |viewer| {
+            viewer.prompt_selection_color();
+        });
         Self::install_action(viewer, "save-annotations", |viewer| viewer.save_annotations());
         Self::install_action(viewer, "save-annotations-as", |viewer| {
             viewer.save_annotations_as(None);
@@ -4066,6 +4069,101 @@ impl Viewer {
         true
     }
 
+    /// Colores propios de las anotaciones elegidas, en orden de elección. Una
+    /// anotación sin color propio —una imagen o una nota de texto— no aporta.
+    fn selection_colors(&self) -> Vec<(String, [f64; 3])> {
+        let selected = self.selected_ids();
+        let edits = self.annot.edits.borrow();
+        selected
+            .iter()
+            .filter_map(|id| {
+                edits
+                    .iter()
+                    .find(|edit| edit.id == *id)
+                    .and_then(|edit| edit.value.color().map(|color| (edit.id.clone(), color)))
+            })
+            .collect()
+    }
+
+    /// Cambia el color de todas las anotaciones elegidas que tengan color propio,
+    /// con una sola instantánea de deshacer: el cambio del conjunto se deshace de
+    /// una vez, como el borrado. Devuelve si cambió algo; una selección sin color
+    /// propio, o que ya tiene ese color, no toca nada.
+    pub(crate) fn recolor_selection(&self, color: (f64, f64, f64)) -> bool {
+        let color = [color.0, color.1, color.2].map(|component| component.clamp(0.0, 1.0));
+        let changing: Vec<String> = self
+            .selection_colors()
+            .into_iter()
+            .filter(|(_, current)| *current != color)
+            .map(|(id, _)| id)
+            .collect();
+        if changing.is_empty() {
+            return false;
+        }
+        let pages = self.selection_pages(&changing);
+        self.begin_edit();
+        for edit in self.annot.edits.borrow_mut().iter_mut() {
+            if changing.iter().any(|id| *id == edit.id) {
+                edit.value = edit.value.recolored((color[0], color[1], color[2]));
+            }
+        }
+        for page in pages {
+            self.queue_page_draw(page);
+        }
+        let message = if changing.len() == 1 {
+            "Color cambiado".to_string()
+        } else {
+            format!("Color cambiado en {} anotaciones", changing.len())
+        };
+        self.announce_change(&message);
+        true
+    }
+
+    /// Diálogo de color de lo elegido: el mismo selector de GTK que usan las
+    /// herramientas, abierto sobre la ventana. Al aceptar, el color se aplica a
+    /// toda la selección con `recolor_selection`.
+    ///
+    /// Quien abra este diálogo desde un popover tiene que cerrarlo antes y
+    /// esperar a que suelte el grab, como hace `open_annotation_menu`: presentar el
+    /// modal con un popover vivo deja la ventana detrás del menú.
+    pub(crate) fn prompt_selection_color(self: &Rc<Self>) {
+        let colors = self.selection_colors();
+        let Some((_, first)) = colors.first() else {
+            // Sin nada elegido no hay color que cambiar; con una imagen o una nota
+            // de texto elegidas tampoco, porque no tienen un solo color.
+            self.announce_change(if self.selected_ids().is_empty() {
+                "No hay nada seleccionado"
+            } else {
+                "Lo seleccionado no tiene color propio"
+            });
+            return;
+        };
+        let initial = gdk::RGBA::new(first[0] as f32, first[1] as f32, first[2] as f32, 1.0);
+        let dialog = gtk::ColorDialog::builder()
+            .title("Color de lo seleccionado")
+            .with_alpha(false)
+            .modal(true)
+            .build();
+        let weak = Rc::downgrade(self);
+        dialog.choose_rgba(
+            Some(&self.ui.window),
+            Some(&initial),
+            None::<&gio::Cancellable>,
+            move |result| {
+                let Ok(rgba) = result else {
+                    return;
+                };
+                if let Some(viewer) = weak.upgrade() {
+                    viewer.recolor_selection((
+                        rgba.red().into(),
+                        rgba.green().into(),
+                        rgba.blue().into(),
+                    ));
+                }
+            },
+        );
+    }
+
     /// Empieza a arrastrar la nota que está bajo `(x, y)` y devuelve si el gesto
     /// es un arrastre de nota: si lo es, no hay selección de texto.
     pub(crate) fn note_drag_begin(&self, page: usize, x: f64, y: f64) -> bool {
@@ -4649,6 +4747,28 @@ impl Viewer {
             }
             content.append(&edit);
         }
+
+        // Cambiar el color actúa sobre toda la selección: el menú se abre sobre
+        // una elegida y el cambio alcanza al conjunto.
+        let recolor = context_menu_button("Cambiar color…");
+        {
+            let weak = Rc::downgrade(self);
+            let popover_ref = popover.downgrade();
+            recolor.connect_clicked(move |_| {
+                if let Some(popover) = popover_ref.upgrade() {
+                    popover.popdown();
+                }
+                // El modal se presenta cuando el popover ya terminó de cerrarse:
+                // abrirlo con el grab del menú vivo congela la ventana.
+                let weak = weak.clone();
+                glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
+                    if let Some(viewer) = weak.upgrade() {
+                        viewer.prompt_selection_color();
+                    }
+                });
+            });
+        }
+        content.append(&recolor);
 
         let delete = context_menu_button(if is_note { "Borrar" } else { "Eliminar" });
         {
@@ -8414,7 +8534,7 @@ fn draw_stamp(
     zoom: f64,
     selected: bool,
 ) {
-    let color = stamp.kind.color();
+    let color = stamp.color;
     let (x, y) = forward_rotation(stamp.at, page, rotation);
     let width = (stamp.width * zoom).max(1.0);
     let height = (stamp.height * zoom).max(1.0);

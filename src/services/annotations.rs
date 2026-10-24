@@ -422,7 +422,7 @@ fn stamp_dictionary(
         "Name",
         Object::Name(stamp.kind.pdf_name().as_bytes().to_vec()),
     );
-    dictionary.set("C", color_array(stamp.kind.color()));
+    dictionary.set("C", color_array(stamp.color));
     // Print flag sin borde de anotación: el marco lo dibuja la apariencia.
     dictionary.set("F", Object::Integer(4));
     dictionary.set(
@@ -489,7 +489,7 @@ fn base_font(document: &mut Document, name: &str) -> Result<ObjectId, String> {
 fn stamp_content(stamp: &Stamp, rect: Rect) -> Vec<u8> {
     let (x1, y1, x2, y2) = rect;
     let (width, height) = ((x2 - x1).abs(), (y2 - y1).abs());
-    let [red, green, blue] = stamp.kind.color();
+    let [red, green, blue] = stamp.color;
     let color = format!("{} {} {}", number(red), number(green), number(blue));
     let stroke = (width.min(height) / 24.0).clamp(0.6, 2.0);
 
@@ -1536,6 +1536,10 @@ fn read_stamp(
             width: rect.2 - rect.0,
             height: rect.3 - rect.1,
             kind,
+            // Un sello sin `/C` (escrito por otro programa) conserva el color de
+            // su tipo; el nuestro escribe siempre el suyo, aunque se haya
+            // cambiado después de estamparlo.
+            color: color_or(document, dictionary, kind.color()),
         }));
     }
     read_image(document, dictionary, page, page_box)
@@ -1657,13 +1661,20 @@ fn rect_of(document: &Document, dictionary: &Dictionary, key: &[u8]) -> Option<R
 /// Color `/C` de una anotación, en `0..=1`. Sin color, o con un número de
 /// componentes que no sea tres, queda el negro con el que empieza toda nota.
 fn color_of(document: &Document, dictionary: &Dictionary) -> [f64; 3] {
+    color_or(document, dictionary, NOTE_COLOR)
+}
+
+/// Color `/C` de una anotación, en `0..=1`, con `fallback` cuando falta o no
+/// tiene exactamente tres componentes. El llamador elige el color por omisión:
+/// negro para una nota, el del tipo para un sello.
+fn color_or(document: &Document, dictionary: &Dictionary, fallback: [f64; 3]) -> [f64; 3] {
     match numbers_of(document, dictionary, b"C") {
         Some(components) if components.len() == 3 => [
             components[0].clamp(0.0, 1.0),
             components[1].clamp(0.0, 1.0),
             components[2].clamp(0.0, 1.0),
         ],
-        _ => NOTE_COLOR,
+        _ => fallback,
     }
 }
 
@@ -4294,6 +4305,33 @@ mod tests {
     }
 
     #[test]
+    fn a_recoloured_stamp_keeps_its_new_colour_when_it_comes_back() {
+        let source = scratch("stamp-recolor.pdf");
+        let target = scratch("stamp-recolor-out.pdf");
+        std::fs::write(&source, fixture([0.0, 0.0, 200.0, 100.0], 0)).expect("escribir el PDF");
+
+        // El sello guarda su color en `/C` como las demás anotaciones, así que
+        // el que se cambia después de estamparlo tiene que sobrevivir al guardado.
+        let recoloured =
+            Annotation::Stamp(Stamp::new(0, (20.0, 10.0), StampKind::Approved))
+                .recolored((0.5, 0.25, 0.75));
+        let written = write_fresh(&source, &target, &[recoloured]).expect("escribir el sello");
+        assert_eq!(written, 1);
+
+        let read = read_annotations(&target).expect("releer el sello");
+        assert_eq!(read.len(), 1, "vuelve el sello: {read:?}");
+        assert_same_color(
+            read[0].1.color().expect("el sello tiene color propio"),
+            [0.5, 0.25, 0.75],
+        );
+        assert!(
+            matches!(&read[0].1, Annotation::Stamp(stamp) if stamp.kind == StampKind::Approved),
+            "el tipo no cambia al cambiar el color: {:?}",
+            read[0].1
+        );
+    }
+
+    #[test]
     fn poppler_paints_the_frame_text_of_the_written_stamp() {
         // La prueba de que el sello se ve en otro lector: el texto y las dos
         // líneas del marco van en el color del tipo, así que rasterizar el archivo
@@ -4420,6 +4458,125 @@ mod tests {
                     && (back.width - STAMP_SIZE.0).abs() <= 0.01
                     && (back.height - STAMP_SIZE.1).abs() <= 0.01,
                 "el sello vuelve con su caja: {back:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn recolouring_rewrites_each_annotation_once_with_its_new_colour() {
+        let source = scratch("recolor.pdf");
+        let target = scratch("recolor-out.pdf");
+        std::fs::write(&source, fixture([0.0, 0.0, 200.0, 200.0], 0)).expect("escribir el PDF");
+
+        // Un lápiz, una forma y un subrayado, cada uno con su propio color.
+        let current = vec![
+            owned(
+                "mlnpdf-color-lapiz",
+                Annotation::Ink(InkStroke::new(
+                    0,
+                    vec![vec![(10.0, 10.0), (80.0, 40.0)]],
+                    [0.10, 0.10, 0.10],
+                    2.0,
+                )),
+            ),
+            owned(
+                "mlnpdf-color-forma",
+                Annotation::Shape(Shape::new(
+                    0,
+                    ShapeKind::Rectangle,
+                    (20.0, 20.0),
+                    (120.0, 80.0),
+                    [0.20, 0.20, 0.20],
+                    2.0,
+                )),
+            ),
+            owned(
+                "mlnpdf-color-subrayado",
+                Annotation::Mark(TextMark::underline(
+                    0,
+                    vec![(20.0, 100.0, 120.0, 120.0)],
+                    (0.30, 0.30, 0.30),
+                )),
+            ),
+        ];
+        write_annotations(&source, &target, &current, &[]).expect("escribir las tres");
+
+        let saved = read_annotations(&target).expect("releer lo escrito");
+        assert_eq!(saved.len(), 3, "vuelven las tres: {saved:?}");
+
+        // Se recolorean con el motor y se vuelven a escribir sobre el mismo
+        // archivo, que es lo que hace el visor al guardar: `current` es lo
+        // recoloreado y `persisted` lo que el archivo tenía.
+        let color = (0.15, 0.55, 0.95);
+        let recoloured: Vec<(String, Annotation)> = saved
+            .iter()
+            .map(|(id, value)| (id.clone(), value.recolored(color)))
+            .collect();
+        let written =
+            write_annotations(&target, &target, &recoloured, &saved).expect("reescribir los colores");
+        assert_eq!(
+            written, 6,
+            "se quitan y se vuelven a escribir las tres: tres bajas y tres altas"
+        );
+
+        let after = read_annotations(&target).expect("releer los colores nuevos");
+        assert_eq!(
+            after.len(),
+            3,
+            "una anotación de cada tipo, sin duplicados: {after:?}"
+        );
+        let mut subtypes: Vec<String> = Vec::new();
+        for (id, value) in &after {
+            assert_same_color(
+                value.color().expect("las tres tienen color propio"),
+                [0.15, 0.55, 0.95],
+            );
+            subtypes.push(match value {
+                Annotation::Ink(_) => "Ink".to_string(),
+                Annotation::Shape(_) => "Square".to_string(),
+                Annotation::Mark(mark) => mark.kind.subtype().to_string(),
+                other => panic!("se esperaba lápiz, forma o subrayado y se leyó {other:?}"),
+            });
+            assert_eq!(
+                saved.iter().filter(|(saved_id, _)| saved_id == id).count(),
+                1,
+                "el /NM {id} aparece una sola vez"
+            );
+        }
+        subtypes.sort();
+        assert_eq!(
+            subtypes,
+            ["Ink", "Square", "Underline"],
+            "los tres tipos, uno cada uno"
+        );
+
+        // Y en el archivo: una anotación por anotación, cada una con su `/NM` y
+        // con el color nuevo en `/C`.
+        let document = Document::load(&target).expect("cargar el archivo reescrito");
+        let page_id = *document.get_pages().get(&1).expect("página 1");
+        let annotations = document.get_page_annotations(page_id).expect("anotaciones");
+        assert_eq!(
+            annotations.len(),
+            3,
+            "el archivo no puede quedar con copias de la anotación vieja"
+        );
+        let mut names: Vec<String> = annotations.iter().map(|item| name_of(item)).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "mlnpdf-color-forma",
+                "mlnpdf-color-lapiz",
+                "mlnpdf-color-subrayado"
+            ],
+            "vuelve una sola anotación por identificador"
+        );
+        for item in annotations {
+            let components = numbers(item, b"C");
+            assert_eq!(components.len(), 3, "el color va en /C");
+            assert_same_color(
+                [components[0], components[1], components[2]],
+                [0.15, 0.55, 0.95],
             );
         }
     }

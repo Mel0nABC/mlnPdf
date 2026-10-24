@@ -780,10 +780,15 @@ pub struct Stamp {
     pub width: f64,
     pub height: f64,
     pub kind: StampKind,
+    /// Color RGB con componentes en `0..=1`, como los toma `/C`. Nace con el
+    /// color de su tipo y después se puede cambiar como el de cualquier otra
+    /// anotación; el tipo decide el nombre y la etiqueta, no el color.
+    pub color: [f64; 3],
 }
 
 impl Stamp {
-    /// Sello del tamaño por omisión (`STAMP_SIZE`) en la esquina `at`.
+    /// Sello del tamaño por omisión (`STAMP_SIZE`) en la esquina `at`, con el
+    /// color de su tipo.
     pub fn new(page: usize, at: (f64, f64), kind: StampKind) -> Self {
         Self {
             page,
@@ -791,6 +796,7 @@ impl Stamp {
             width: STAMP_SIZE.0,
             height: STAMP_SIZE.1,
             kind,
+            color: kind.color(),
         }
     }
 
@@ -1123,6 +1129,59 @@ impl Annotation {
             Self::Shape(shape) => shape.page,
             Self::Sticky(sticky) => sticky.page,
             Self::Stamp(stamp) => stamp.page,
+        }
+    }
+
+    /// Color propio de la anotación, en `0..=1` como lo toma `/C`. `None`
+    /// cuando la anotación no tiene un solo color: la imagen no tiene ninguno y
+    /// la nota de texto lo decide por tramo en su diálogo.
+    pub fn color(&self) -> Option<[f64; 3]> {
+        match self {
+            Self::Mark(mark) => Some(mark.color),
+            Self::Ink(stroke) => Some(stroke.color),
+            Self::Shape(shape) => Some(shape.color),
+            Self::Sticky(sticky) => Some(sticky.color),
+            Self::Stamp(stamp) => Some(stamp.color),
+            Self::Note(_) | Self::Image(_) => None,
+        }
+    }
+
+    /// La misma anotación con su color propio cambiado, recortado a `0..=1` que
+    /// es lo que admite `/C`. No toca nada más: página, geometría, texto,
+    /// grosor, puntos y tipo se conservan tal como estaban.
+    ///
+    /// Una anotación sin color propio vuelve como una copia igual, así el
+    /// llamador puede aplicar el cambio a toda la selección sin casos
+    /// especiales: la imagen y la nota de texto simplemente no cambian.
+    pub fn recolored(&self, color: (f64, f64, f64)) -> Annotation {
+        let color = [color.0, color.1, color.2].map(|component| component.clamp(0.0, 1.0));
+        match self {
+            Self::Mark(mark) => {
+                let mut recolored = mark.clone();
+                recolored.color = color;
+                Self::Mark(recolored)
+            }
+            Self::Ink(stroke) => {
+                let mut recolored = stroke.clone();
+                recolored.color = color;
+                Self::Ink(recolored)
+            }
+            Self::Shape(shape) => {
+                let mut recolored = shape.clone();
+                recolored.color = color;
+                Self::Shape(recolored)
+            }
+            Self::Sticky(sticky) => {
+                let mut recolored = sticky.clone();
+                recolored.color = color;
+                Self::Sticky(recolored)
+            }
+            Self::Stamp(stamp) => {
+                let mut recolored = stamp.clone();
+                recolored.color = color;
+                Self::Stamp(recolored)
+            }
+            Self::Note(_) | Self::Image(_) => self.clone(),
         }
     }
 
@@ -2731,9 +2790,211 @@ mod tests {
             width: 0.0,
             height: 40.0,
             kind: StampKind::Approved,
+            color: StampKind::Approved.color(),
         });
         assert_eq!(flat.page(), 1);
         assert!(flat.is_empty(), "un sello sin ancho no se escribe");
+    }
+
+    /// Marcado con un rectángulo conocido, para las pruebas de color.
+    fn colored_mark(kind: MarkKind, color: (f64, f64, f64)) -> Annotation {
+        Annotation::Mark(TextMark::new(
+            0,
+            vec![(10.0, 20.0, 110.0, 40.0)],
+            color,
+            kind,
+        ))
+    }
+
+    /// Trazo del lápiz con un camino conocido, para las pruebas de color.
+    fn colored_ink(color: (f64, f64, f64)) -> InkStroke {
+        InkStroke::new(
+            0,
+            vec![vec![(10.0, 20.0), (30.0, 40.0)], vec![(50.0, 60.0)]],
+            [color.0, color.1, color.2],
+            2.5,
+        )
+    }
+
+    /// Forma con dos extremos conocidos, para las pruebas de color.
+    fn colored_shape(color: (f64, f64, f64)) -> Shape {
+        Shape::new(
+            0,
+            ShapeKind::Ellipse,
+            (10.0, 20.0),
+            (110.0, 80.0),
+            [color.0, color.1, color.2],
+            3.0,
+        )
+    }
+
+    /// Nota adhesiva con un comentario, para las pruebas de color.
+    fn colored_sticky(color: (f64, f64, f64)) -> StickyNote {
+        let mut sticky = StickyNote::new(0, (10.0, 20.0), [color.0, color.1, color.2]);
+        sticky.comments.push(StickyComment {
+            id: "mlnpdf-color-nota".to_string(),
+            text: "Revisar".to_string(),
+        });
+        sticky
+    }
+
+    /// Nota de texto con un tramo de color, para las pruebas de color.
+    fn colored_note(color: (f64, f64, f64)) -> TextNote {
+        TextNote::new(
+            0,
+            (10.0, 20.0),
+            80.0,
+            20.0,
+            vec![TextRun {
+                text: "Hola".to_string(),
+                font: FontChoice {
+                    family: "Sans".to_string(),
+                    size: 12.0,
+                    bold: false,
+                    italic: false,
+                },
+                color: [color.0, color.1, color.2],
+            }],
+        )
+    }
+
+    /// Imagen de un píxel opaco, para las pruebas de color.
+    fn colored_image() -> ImageNote {
+        let pixels = ImagePixels::new(1, 1, vec![0, 0, 0, 255]).expect("un píxel opaco");
+        ImageNote::new(0, (10.0, 20.0), 30.0, 30.0, pixels)
+    }
+
+    #[test]
+    fn every_annotation_with_a_single_colour_reports_it() {
+        // Cada variante con un solo color lo devuelve tal como lo toma `/C`.
+        let cases = [
+            (
+                colored_mark(MarkKind::Underline, (0.1, 0.2, 0.3)),
+                Some([0.1, 0.2, 0.3]),
+            ),
+            (
+                colored_mark(MarkKind::Highlight, (0.4, 0.5, 0.6)),
+                Some([0.4, 0.5, 0.6]),
+            ),
+            (
+                colored_mark(MarkKind::StrikeOut, (0.7, 0.8, 0.9)),
+                Some([0.7, 0.8, 0.9]),
+            ),
+            (
+                Annotation::Ink(colored_ink((0.11, 0.22, 0.33))),
+                Some([0.11, 0.22, 0.33]),
+            ),
+            (
+                Annotation::Shape(colored_shape((0.21, 0.32, 0.43))),
+                Some([0.21, 0.32, 0.43]),
+            ),
+            (
+                Annotation::Sticky(colored_sticky((0.31, 0.42, 0.53))),
+                Some([0.31, 0.42, 0.53]),
+            ),
+            (
+                Annotation::Stamp(Stamp::new(0, (10.0, 10.0), StampKind::Draft)),
+                Some(StampKind::Draft.color()),
+            ),
+            // Las dos que no tienen un color propio: la imagen no tiene ninguno
+            // y la nota de texto lo decide por tramo en su diálogo.
+            (Annotation::Image(colored_image()), None),
+            (Annotation::Note(colored_note((1.0, 0.0, 0.0))), None),
+        ];
+
+        for (annotation, expected) in cases {
+            assert_eq!(
+                annotation.color(),
+                expected,
+                "color propio de {annotation:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn recolouring_changes_the_colour_and_keeps_everything_else() {
+        let new = (0.2, 0.4, 0.6);
+        let color = [0.2, 0.4, 0.6];
+
+        // Marcado: conserva página, rectángulos y tipo.
+        let recolored = colored_mark(MarkKind::StrikeOut, (0.9, 0.9, 0.9)).recolored(new);
+        let Annotation::Mark(mark) = &recolored else {
+            panic!("el marcado tiene que seguir siendo un marcado: {recolored:?}");
+        };
+        assert_eq!(mark.page, 0);
+        assert_eq!(mark.rects, vec![(10.0, 20.0, 110.0, 40.0)]);
+        assert_eq!(mark.kind, MarkKind::StrikeOut);
+        assert_eq!(mark.color, color);
+        assert_eq!(recolored.color(), Some(color));
+
+        // Lápiz: conserva página, puntos y grosor.
+        let ink = colored_ink((0.9, 0.9, 0.9));
+        let recolored = Annotation::Ink(ink.clone()).recolored(new);
+        let Annotation::Ink(stroke) = &recolored else {
+            panic!("el lápiz tiene que seguir siendo un lápiz: {recolored:?}");
+        };
+        assert_eq!(stroke.page, ink.page);
+        assert_eq!(stroke.paths, ink.paths);
+        assert_eq!(stroke.width, ink.width);
+        assert_eq!(stroke.color, color);
+
+        // Forma: conserva página, tipo, extremos y grosor.
+        let shape = colored_shape((0.9, 0.9, 0.9));
+        let recolored = Annotation::Shape(shape.clone()).recolored(new);
+        let Annotation::Shape(back) = &recolored else {
+            panic!("la forma tiene que seguir siendo una forma: {recolored:?}");
+        };
+        assert_eq!(back.page, shape.page);
+        assert_eq!(back.kind, shape.kind);
+        assert_eq!(back.from, shape.from);
+        assert_eq!(back.to, shape.to);
+        assert_eq!(back.width, shape.width);
+        assert_eq!(back.color, color);
+
+        // Nota adhesiva: conserva página, caja e hilo de comentarios.
+        let sticky = colored_sticky((0.9, 0.9, 0.9));
+        let recolored = Annotation::Sticky(sticky.clone()).recolored(new);
+        let Annotation::Sticky(back) = &recolored else {
+            panic!("la nota adhesiva tiene que seguir siendo una nota: {recolored:?}");
+        };
+        assert_eq!(back.page, sticky.page);
+        assert_eq!(back.at, sticky.at);
+        assert_eq!((back.width, back.height), (sticky.width, sticky.height));
+        assert_eq!(back.comments, sticky.comments);
+        assert_eq!(back.color, color);
+
+        // Sello: conserva página, caja y tipo.
+        let stamp = Stamp::new(1, (10.0, 20.0), StampKind::Approved);
+        let recolored = Annotation::Stamp(stamp.clone()).recolored(new);
+        let Annotation::Stamp(back) = &recolored else {
+            panic!("el sello tiene que seguir siendo un sello: {recolored:?}");
+        };
+        assert_eq!(back.page, stamp.page);
+        assert_eq!(back.at, stamp.at);
+        assert_eq!((back.width, back.height), (stamp.width, stamp.height));
+        assert_eq!(back.kind, stamp.kind);
+        assert_eq!(back.color, color);
+    }
+
+    #[test]
+    fn recolouring_an_annotation_without_its_own_colour_keeps_it_untouched() {
+        let image = Annotation::Image(colored_image());
+        assert_eq!(image.recolored((0.2, 0.4, 0.6)), image.clone());
+        assert_eq!(image.recolored((0.2, 0.4, 0.6)).color(), None);
+
+        let note = Annotation::Note(colored_note((1.0, 0.0, 0.0)));
+        assert_eq!(note.recolored((0.2, 0.4, 0.6)), note.clone());
+        assert_eq!(note.recolored((0.2, 0.4, 0.6)).color(), None);
+    }
+
+    #[test]
+    fn a_recoloured_component_is_clamped_to_the_range_of_c() {
+        let recolored = colored_mark(MarkKind::Underline, (0.5, 0.5, 0.5)).recolored((-0.5, 0.5, 2.0));
+        assert_eq!(
+            recolored.color(),
+            Some([0.0, 0.5, 1.0]),
+            "`/C` solo admite componentes en 0..=1"
+        );
     }
 
     /// Sello con un marco conocido, para las pruebas de geometría.

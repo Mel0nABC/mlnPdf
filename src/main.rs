@@ -494,6 +494,11 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             Some("Borrar las anotaciones"),
             "el menú Edit borra las anotaciones justo después de editar: {edit_labels:?}"
         );
+        assert_eq!(
+            edit_labels.get(rehacer + 3).map(String::as_str),
+            Some("Cambiar color…"),
+            "el menú Edit ofrece cambiar el color de lo elegido: {edit_labels:?}"
+        );
 
         // Help reúne los atajos y el «Acerca de»; el icono de la aplicación se
         // decodifica desde el PNG incrustado.
@@ -3295,6 +3300,192 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         assert!(!viewer.has_pending_marks());
         assert!(viewer.selected_ids().is_empty());
 
+        // S2: cambiar el color de lo ya colocado. Se juntan un subrayado, una
+        // forma, una nota adhesiva y una imagen, se eligen las cuatro y se les
+        // cambia el color de una vez, con una sola instantánea de deshacer. La
+        // imagen no se toca: no tiene color propio.
+        viewer.open(&two_path).expect("volver al documento de la prueba");
+        viewer.apply_zoom(1.0);
+
+        let recolor_mark = "mlnpdf-color-subrayado".to_string();
+        viewer.annot.edits.borrow_mut().push(Edit {
+            id: recolor_mark.clone(),
+            value: Annotation::Mark(TextMark::underline(
+                0,
+                vec![(20.0, 20.0, 120.0, 40.0)],
+                (0.9, 0.1, 0.1),
+            )),
+        });
+
+        viewer.set_stroke_color((0.1, 0.2, 0.9));
+        viewer.start_stroke_tool(StrokeKind::Shape(ShapeKind::Rectangle));
+        assert!(
+            viewer.stroke_drag_begin(0, 30.0, 60.0),
+            "la forma del conjunto empieza en el arrastre"
+        );
+        assert!(
+            viewer.stroke_drag_update(0, 120.0, 40.0),
+            "la forma crece con el arrastre"
+        );
+        assert!(viewer.stroke_drag_end(), "el arrastre cierra la forma");
+        viewer.escape_pressed();
+        let recolor_shape = edit_id(&viewer, 1);
+
+        let recolor_zoom = viewer.view.zoom.get();
+        assert!(recolor_zoom > 0.0, "hay un zoom con el que pasar a puntos");
+        let recolor_sticky = viewer
+            .insert_sticky_note(0, 150.0 * recolor_zoom, 20.0 * recolor_zoom)
+            .expect("la nota adhesiva entra en la página");
+        assert!(
+            viewer.apply_sticky_comments(&recolor_sticky, &["Revisar".to_string()]),
+            "la nota adhesiva del conjunto lleva su texto"
+        );
+
+        let recolor_image = "mlnpdf-color-imagen".to_string();
+        let recolor_pixels = ImagePixels::new(2, 2, [0u8, 255, 0, 255].repeat(4))
+            .expect("cuatro píxeles opacos");
+        viewer.annot.edits.borrow_mut().push(Edit {
+            id: recolor_image.clone(),
+            value: Annotation::Image(ImageNote::new(
+                0,
+                (40.0, 100.0),
+                30.0,
+                30.0,
+                recolor_pixels,
+            )),
+        });
+        assert_eq!(
+            viewer.annot.edits.borrow().len(),
+            4,
+            "el conjunto son cuatro anotaciones"
+        );
+        assert_eq!(
+            viewer.annot.edits.borrow()[3].value.color(),
+            None,
+            "la imagen no tiene color propio"
+        );
+        let image_before = image_value(&viewer, 3);
+
+        viewer.select_annotation(Some(recolor_mark.clone()));
+        viewer.toggle_annotation_selection(&recolor_shape);
+        viewer.toggle_annotation_selection(&recolor_sticky);
+        viewer.toggle_annotation_selection(&recolor_image);
+        assert_eq!(
+            viewer.selected_ids().len(),
+            4,
+            "las cuatro quedan elegidas para el cambio de color"
+        );
+
+        let undo_before = viewer.annot.undo_stack.borrow().len();
+        let new_color = (0.2, 0.8, 0.3);
+        assert!(
+            viewer.recolor_selection(new_color),
+            "el color cambia en las tres que tienen color propio"
+        );
+        assert_eq!(
+            viewer.annot.undo_stack.borrow().len(),
+            undo_before + 1,
+            "el cambio del conjunto deja una sola instantánea de deshacer"
+        );
+        for id in [&recolor_mark, &recolor_shape, &recolor_sticky] {
+            let edit = viewer
+                .annot
+                .edits
+                .borrow()
+                .iter()
+                .find(|edit| edit.id == **id)
+                .map(|edit| edit.value.clone())
+                .expect("la anotación recoloreada sigue en la lista");
+            assert_eq!(
+                edit.color(),
+                Some([new_color.0, new_color.1, new_color.2]),
+                "{id} queda con el color nuevo"
+            );
+        }
+        assert_eq!(
+            image_value(&viewer, 3),
+            image_before,
+            "la imagen elegida queda intacta: no tiene color propio"
+        );
+
+        // Un solo deshacer devuelve los tres colores anteriores.
+        assert!(viewer.undo(), "el cambio de color se deshace de una vez");
+        for (id, expected) in [
+            (&recolor_mark, [0.9, 0.1, 0.1]),
+            (&recolor_shape, [0.1, 0.2, 0.9]),
+            (&recolor_sticky, STICKY_COLOR),
+        ] {
+            let edit = viewer
+                .annot
+                .edits
+                .borrow()
+                .iter()
+                .find(|edit| edit.id == **id)
+                .map(|edit| edit.value.clone())
+                .expect("la anotación vuelve a la lista");
+            assert_eq!(
+                edit.color(),
+                Some(expected),
+                "{id} vuelve a su color anterior"
+            );
+        }
+
+        // Sin nada elegido no hay color que cambiar, y tampoco se empuja una
+        // instantánea vacía: la acción queda siempre habilitada y no hace nada.
+        viewer.clear_selection();
+        let undo_without_selection = viewer.annot.undo_stack.borrow().len();
+        assert!(
+            !viewer.recolor_selection((0.5, 0.5, 0.5)),
+            "sin selección no cambia nada"
+        );
+        assert_eq!(
+            viewer.annot.undo_stack.borrow().len(),
+            undo_without_selection,
+            "un cambio sin efecto no deja instantánea"
+        );
+
+        // El menú contextual de una anotación ofrece «Cambiar color…» arriba de
+        // «Eliminar», y la acción del atajo existe en la ventana.
+        assert!(
+            viewer.ui.window.lookup_action("recolor-selection").is_some(),
+            "la acción de cambiar el color está instalada"
+        );
+        assert!(
+            SHORTCUTS.contains(&("<Control><Alt>c", "win.recolor-selection")),
+            "cambiar el color tiene su atajo, Ctrl+Alt+C"
+        );
+        assert!(
+            SHORTCUT_HELP
+                .iter()
+                .any(|(keys, help)| *keys == "Ctrl+Alt+C" && help.contains("color")),
+            "la ayuda de atajos explica el cambio de color"
+        );
+        viewer.select_annotation(Some(recolor_mark.clone()));
+        let recolor_anchor = viewer.doc.slots.borrow()[0].canvas.clone();
+        let recolor_menu =
+            viewer.open_annotation_menu(recolor_mark.clone(), &recolor_anchor, 20.0, 20.0);
+        let menu_labels = button_labels(recolor_menu.upcast_ref::<gtk::Widget>());
+        let color_position = menu_labels
+            .iter()
+            .position(|label| label == "Cambiar color…")
+            .unwrap_or_else(|| panic!("el menú ofrece cambiar el color: {menu_labels:?}"));
+        let delete_position = menu_labels
+            .iter()
+            .position(|label| label == "Eliminar")
+            .unwrap_or_else(|| panic!("el menú ofrece Eliminar: {menu_labels:?}"));
+        assert!(
+            color_position < delete_position,
+            "cambiar el color va arriba de Eliminar: {menu_labels:?}"
+        );
+        recolor_menu.popdown();
+
+        // El conjunto de color no queda pendiente: se descarta y el documento de
+        // la prueba vuelve a estar sin anotaciones.
+        viewer.discard_edits();
+        assert!(viewer.annot.edits.borrow().is_empty());
+        assert!(!viewer.has_pending_marks());
+        assert!(viewer.selected_ids().is_empty());
+
         // Pulsar la herramienta abre el selector de color del sistema. Es la
         // única parte del flujo que no se puede probar sin un clic real, así que
         // se comprueba que la ventana del selector aparezca.
@@ -3357,6 +3548,22 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             child = current.next_sibling();
         }
         None
+    }
+
+    /// Etiquetas de los botones de un menú, en el orden en que se ofrecen.
+    fn button_labels(widget: &gtk::Widget) -> Vec<String> {
+        let mut found = Vec::new();
+        if let Some(button) = widget.downcast_ref::<gtk::Button>()
+            && let Some(label) = button.label()
+        {
+            found.push(label.to_string());
+        }
+        let mut child = widget.first_child();
+        while let Some(current) = child {
+            found.extend(button_labels(&current));
+            child = current.next_sibling();
+        }
+        found
     }
 
     /// Busca el primer `GtkSpinButton` dentro del árbol del diálogo o popover.
