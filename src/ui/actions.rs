@@ -7,7 +7,7 @@ use gtk::gio;
 
 /// Keyboard shortcuts bound to the window actions. Declared as data so the
 /// display test can prove every trigger string actually parses.
-pub const SHORTCUTS: [(&str, &str); 47] = [
+pub const SHORTCUTS: [(&str, &str); 48] = [
     ("<Control>plus", "win.zoom-in"),
     ("<Control>equal", "win.zoom-in"),
     ("<Control>minus", "win.zoom-out"),
@@ -57,6 +57,8 @@ pub const SHORTCUTS: [(&str, &str); 47] = [
     ("<Control><Alt>e", "win.draw-ellipse"),
     ("<Control><Alt>l", "win.draw-line"),
     ("<Control><Alt>f", "win.draw-arrow"),
+    // Nota adhesiva: el clic siguiente crea el icono y abre su hilo.
+    ("<Control><Alt>n", "win.sticky-note"),
     ("<Control>s", "win.save-annotations"),
     ("<Control><Shift>s", "win.save-annotations-as"),
     // Sin `<Control>`: es la tecla de borrar la nota elegida. El visor la maneja
@@ -65,7 +67,7 @@ pub const SHORTCUTS: [(&str, &str); 47] = [
 ];
 
 /// Human-readable shortcut list shown by Help > Atajos de teclado.
-pub const SHORTCUT_HELP: [(&str, &str); 34] = [
+pub const SHORTCUT_HELP: [(&str, &str); 35] = [
     ("Ctrl+O", "Abrir un PDF"),
     ("Ctrl+P", "Imprimir"),
     ("Ctrl+F", "Buscar en el documento"),
@@ -91,6 +93,7 @@ pub const SHORTCUT_HELP: [(&str, &str); 34] = [
     ("Ctrl+Alt+E", "Dibujar una elipse"),
     ("Ctrl+Alt+L", "Dibujar una línea"),
     ("Ctrl+Alt+F", "Dibujar una flecha"),
+    ("Ctrl+Alt+N", "Insertar una nota adhesiva con su hilo de respuestas"),
     ("Ctrl+S / Ctrl+Shift+S", "Guardar los marcados / guardar como"),
     ("Ctrl+Shift+C", "Copiar el texto de la página actual"),
     ("Ctrl+G / Ctrl+Shift+G", "Siguiente / anterior coincidencia"),
@@ -130,6 +133,7 @@ pub fn build_menu_bar() -> gtk::PopoverMenuBar {
     edit_menu.append(Some("Tachar"), Some("win.strikeout"));
     edit_menu.append(Some("Insertar texto…"), Some("win.insert-text"));
     edit_menu.append(Some("Insertar imagen…"), Some("win.insert-image"));
+    edit_menu.append(Some("Nota adhesiva"), Some("win.sticky-note"));
     edit_menu.append(Some("Lápiz"), Some("win.draw-ink"));
     edit_menu.append(Some("Rectángulo"), Some("win.draw-rectangle"));
     edit_menu.append(Some("Elipse"), Some("win.draw-ellipse"));

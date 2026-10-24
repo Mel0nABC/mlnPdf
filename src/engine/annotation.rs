@@ -574,6 +574,96 @@ impl TextNote {
     }
 }
 
+/// Lado del icono de una nota adhesiva, en puntos: es lo que se ve sobre la
+/// página y lo que se agarra con el ratón.
+pub const STICKY_SIDE: f64 = 18.0;
+
+/// Un comentario de una nota adhesiva: el texto de la nota o el de una de sus
+/// respuestas. Cada uno lleva su propio identificador porque en el PDF es una
+/// anotación `/Text` con su propio `/NM`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StickyComment {
+    /// `/NM` con el que se reconoce su objeto en el archivo.
+    pub id: String,
+    pub text: String,
+}
+
+/// Una nota adhesiva: el icono sobre la página y su hilo de comentarios. En
+/// memoria es una sola anotación; en el archivo, una `/Text` por comentario,
+/// encadenadas por `/IRT`.
+///
+/// `at` es la esquina superior izquierda del icono en puntos PDF con el origen
+/// arriba a la izquierda, el mismo espacio que la selección y las notas.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StickyNote {
+    pub page: usize,
+    pub at: (f64, f64),
+    pub width: f64,
+    pub height: f64,
+    /// Color RGB con componentes en `0..=1`, como los toma `/C`.
+    pub color: [f64; 3],
+    /// Comentarios en orden: el primero es el texto de la nota y los demás son
+    /// sus respuestas.
+    pub comments: Vec<StickyComment>,
+}
+
+impl StickyNote {
+    /// Nota nueva: el icono de `STICKY_SIDE` puntos en `at`, con su color y sin
+    /// ningún comentario. El color se recorta a `0..=1`, que es lo que admite
+    /// `/C`.
+    pub fn new(page: usize, at: (f64, f64), color: [f64; 3]) -> Self {
+        Self {
+            page,
+            at,
+            width: STICKY_SIDE,
+            height: STICKY_SIDE,
+            color: color.map(|component| component.clamp(0.0, 1.0)),
+            comments: Vec::new(),
+        }
+    }
+
+    /// Caja del icono en el espacio de la selección: `(x1, y1, x2, y2)`.
+    pub fn rect(&self) -> Rect {
+        (
+            self.at.0,
+            self.at.1,
+            self.at.0 + self.width,
+            self.at.1 + self.height,
+        )
+    }
+
+    /// True cuando `point` cae sobre el icono, con la tolerancia en puntos del
+    /// PDF que deja agarrarlo desde su borde.
+    pub fn contains(&self, point: (f64, f64), tolerance: f64) -> bool {
+        let (x1, y1, x2, y2) = self.rect();
+        point.0 >= x1 - tolerance
+            && point.0 <= x2 + tolerance
+            && point.1 >= y1 - tolerance
+            && point.1 <= y2 + tolerance
+    }
+
+    /// Mueve la nota `delta` puntos, en el espacio de la página. El color y el
+    /// hilo de comentarios no cambian.
+    // El arrastre del visor mueve la nota cambiando su esquina; esta API existe
+    // para las pruebas de geometría y para cualquier gesto que la reutilice.
+    #[allow(dead_code)]
+    pub fn moved(&self, delta: (f64, f64)) -> Self {
+        let mut moved = self.clone();
+        moved.at = (self.at.0 + delta.0, self.at.1 + delta.1);
+        moved
+    }
+
+    /// True cuando ningún comentario tiene texto: una nota así no se escribe.
+    pub fn is_empty(&self) -> bool {
+        self.comments.iter().all(|comment| comment.text.trim().is_empty())
+    }
+
+    /// Respuestas del hilo, sin contar el comentario raíz.
+    pub fn replies(&self) -> usize {
+        self.comments.len().saturating_sub(1)
+    }
+}
+
 /// Píxeles de una imagen ya decodificados, en el orden que espera cairo para una
 /// superficie `ARGB32`: BGRA con el alfa ya multiplicado, cuatro bytes por píxel
 /// y las filas seguidas, sin relleno.
@@ -853,6 +943,8 @@ pub enum Annotation {
     Ink(InkStroke),
     /// Forma geométrica: rectángulo, elipse, línea o flecha.
     Shape(Shape),
+    /// Nota adhesiva con su hilo de respuestas.
+    Sticky(StickyNote),
 }
 
 impl Annotation {
@@ -864,12 +956,13 @@ impl Annotation {
             Self::Image(image) => image.page,
             Self::Ink(stroke) => stroke.page,
             Self::Shape(shape) => shape.page,
+            Self::Sticky(sticky) => sticky.page,
         }
     }
 
     /// True cuando no hay nada que escribir: una nota sin texto, un marcado
-    /// sin rectángulos, una imagen sin caja, un trazo sin puntos o una forma
-    /// sin lados.
+    /// sin rectángulos, una imagen sin caja, un trazo sin puntos, una forma
+    /// sin lados o una nota adhesiva sin ningún comentario con texto.
     pub fn is_empty(&self) -> bool {
         match self {
             Self::Mark(mark) => mark.is_empty(),
@@ -877,6 +970,25 @@ impl Annotation {
             Self::Image(image) => image.width <= 0.0 || image.height <= 0.0,
             Self::Ink(stroke) => stroke.is_empty(),
             Self::Shape(shape) => shape.is_empty(),
+            Self::Sticky(sticky) => sticky.is_empty(),
+        }
+    }
+
+    /// Identificadores propios de la variante, además del identificador del par
+    /// `(id, Annotation)`.
+    ///
+    /// Una nota adhesiva es una sola anotación en memoria pero varias en el PDF,
+    /// y cada comentario lleva su `/NM`: esos son los que hay que quitar o
+    /// reemplazar al guardar. Las demás variantes usan solo el id del par, así
+    /// que devuelven una lista vacía.
+    pub fn annotation_ids(&self) -> Vec<&str> {
+        match self {
+            Self::Sticky(sticky) => sticky
+                .comments
+                .iter()
+                .map(|comment| comment.id.as_str())
+                .collect(),
+            _ => Vec::new(),
         }
     }
 }
@@ -943,6 +1055,17 @@ pub fn image_appearance(image: &ImageNote, page: PageBox) -> ImageAppearance {
 pub fn image_rect(image: &ImageNote, page: PageBox) -> Rect {
     let corner = image.at;
     let opposite = (image.at.0 + image.width, image.at.1 + image.height);
+    let (x1, y1) = user_point(corner, page);
+    let (x2, y2) = user_point(opposite, page);
+    (x1.min(x2), y1.min(y2), x1.max(x2), y1.max(y2))
+}
+
+/// `/Rect` del icono de una nota adhesiva: su caja, en el espacio de usuario del
+/// archivo. Cada comentario del hilo escribe el mismo `/Rect`, porque todos se
+/// dibujan y se agarran en el mismo icono.
+pub fn sticky_rect(sticky: &StickyNote, page: PageBox) -> Rect {
+    let corner = sticky.at;
+    let opposite = (sticky.at.0 + sticky.width, sticky.at.1 + sticky.height);
     let (x1, y1) = user_point(corner, page);
     let (x2, y2) = user_point(opposite, page);
     (x1.min(x2), y1.min(y2), x1.max(x2), y1.max(y2))
@@ -2104,5 +2227,103 @@ mod tests {
             short_arrow.is_empty(),
             "una flecha de largo cero no tiene punta"
         );
+    }
+
+    /// Comentario de una nota adhesiva, para las pruebas.
+    fn comment(id: &str, text: &str) -> StickyComment {
+        StickyComment {
+            id: id.to_string(),
+            text: text.to_string(),
+        }
+    }
+
+    /// Nota adhesiva con su hilo, para las pruebas.
+    fn sticky(comments: Vec<StickyComment>) -> StickyNote {
+        StickyNote {
+            page: 0,
+            at: (10.0, 20.0),
+            width: STICKY_SIDE,
+            height: STICKY_SIDE,
+            color: NOTE_COLOR,
+            comments,
+        }
+    }
+
+    #[test]
+    fn a_sticky_note_starts_with_the_icon_side_and_no_comments() {
+        let fresh = StickyNote::new(3, (10.0, 20.0), NOTE_COLOR);
+        assert_eq!(fresh.page, 3);
+        assert_eq!(fresh.at, (10.0, 20.0), "la esquina es donde se hizo clic");
+        assert_eq!(
+            (fresh.width, fresh.height),
+            (STICKY_SIDE, STICKY_SIDE),
+            "el icono mide STICKY_SIDE puntos de lado"
+        );
+        assert_eq!(fresh.color, NOTE_COLOR, "nace con el color por omisión");
+        assert!(fresh.comments.is_empty());
+        assert_eq!(
+            StickyNote::new(0, (0.0, 0.0), [-0.5, 0.5, 2.0]).color,
+            [0.0, 0.5, 1.0],
+            "el color se recorta a 0..=1, como pide /C"
+        );
+    }
+
+    #[test]
+    fn a_sticky_note_is_hit_inside_its_icon_and_moves_with_it() {
+        let note = sticky(vec![comment("mlnpdf-c1", "Nota")]);
+        assert_eq!(
+            note.rect(),
+            (10.0, 20.0, 28.0, 38.0),
+            "la caja del icono es la que se dibuja y se agarra"
+        );
+        assert!(note.contains((19.0, 29.0), 0.0), "dentro del icono");
+        assert!(
+            note.contains((9.0, 30.0), 2.0),
+            "la tolerancia llega al borde"
+        );
+        assert!(!note.contains((5.0, 30.0), 2.0), "más lejos ya no");
+
+        let moved = note.moved((4.0, -6.0));
+        assert_eq!(moved.rect(), (14.0, 14.0, 32.0, 32.0));
+        assert_eq!(moved.comments, note.comments, "mover no toca el hilo");
+        assert_eq!(moved.page, note.page);
+        assert_eq!((moved.width, moved.height), (note.width, note.height));
+    }
+
+    #[test]
+    fn a_sticky_note_without_text_is_empty_and_lists_every_comment() {
+        let empty = Annotation::Sticky(sticky(vec![comment("mlnpdf-c1", "  "), comment("mlnpdf-c2", "")]));
+        assert_eq!(empty.page(), 0);
+        assert!(empty.is_empty(), "sin texto no hay nada que escribir");
+        assert_eq!(
+            empty.annotation_ids(),
+            vec!["mlnpdf-c1", "mlnpdf-c2"],
+            "cada comentario es una anotación con su /NM"
+        );
+
+        let filled = Annotation::Sticky(sticky(vec![
+            comment("mlnpdf-c1", "Nota"),
+            comment("mlnpdf-c2", "Respuesta"),
+        ]));
+        assert!(!filled.is_empty());
+        assert_eq!(filled.annotation_ids(), vec!["mlnpdf-c1", "mlnpdf-c2"]);
+        assert_eq!(filled.page(), 0);
+    }
+
+    #[test]
+    fn only_a_sticky_note_lists_comment_identifiers() {
+        let mark = Annotation::Mark(TextMark::underline(
+            0,
+            vec![line(20.0, 30.0)],
+            (NOTE_COLOR[0], NOTE_COLOR[1], NOTE_COLOR[2]),
+        ));
+        let note = Annotation::Note(note("Hola"));
+        let stroke = Annotation::Ink(ink(&[(10.0, 10.0), (20.0, 20.0)]));
+        for other in [mark, note, stroke] {
+            assert!(
+                other.annotation_ids().is_empty(),
+                "el identificador de las demás variantes es el del par: {other:?}"
+            );
+        }
     }
 }

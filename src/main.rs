@@ -32,7 +32,8 @@ mod tests {
     use crate::engine::render::render_page_surface;
     use crate::engine::annotation::{
         Annotation, Corner, FontChoice, IMAGE_BOX_FRACTION, ImageNote, ImagePixels, MarkKind,
-        NOTE_COLOR, STROKE_MAX_WIDTH, STROKE_MIN_WIDTH, ShapeKind, TextMark, TextNote, TextRun,
+        NOTE_COLOR, STICKY_SIDE, STROKE_MAX_WIDTH, STROKE_MIN_WIDTH, ShapeKind, TextMark, TextNote,
+        TextRun,
     };
     use crate::services::annotations::{open_for_editing, read_annotations, write_annotations};
     use crate::ui::shell::*;
@@ -365,6 +366,14 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         assert!(
             edit_labels.iter().any(|label| label == "Insertar imagen…"),
             "el menú Edit ofrece insertar imagen junto al texto: {edit_labels:?}"
+        );
+        assert!(
+            edit_labels.iter().any(|label| label == "Nota adhesiva"),
+            "el menú Edit ofrece la nota adhesiva: {edit_labels:?}"
+        );
+        assert!(
+            SHORTCUTS.contains(&("<Control><Alt>n", "win.sticky-note")),
+            "la nota adhesiva tiene su atajo, Ctrl+Alt+N"
         );
         // Las dos acciones que operan sobre la nota elegida van después de Rehacer.
         let rehacer = edit_labels
@@ -2439,6 +2448,177 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             viewer.stroke_tool_active().is_none(),
             "no queda ninguna herramienta de dibujo armada"
         );
+
+        // S2: nota adhesiva con hilo de respuestas. El diálogo es modal, así que
+        // se arma la herramienta con el mismo botón del popover que el lector
+        // pulsa y después se llaman las mismas funciones que el clic y el aceptar
+        // del diálogo.
+        let sticky_button =
+            labeled_button(stroke_popover.upcast_ref::<gtk::Widget>(), "Nota adhesiva")
+                .expect("el popover de dibujo ofrece la nota adhesiva");
+        assert_eq!(
+            sticky_button.tooltip_text().as_deref(),
+            Some("Nota adhesiva (Ctrl+Alt+N)"),
+            "la herramienta se anuncia con su atajo"
+        );
+        sticky_button.emit_by_name::<()>("clicked", &[]);
+        assert!(
+            viewer.sticky_tool_active(),
+            "pulsar la herramienta arma la nota adhesiva"
+        );
+        assert!(
+            viewer.stroke_tool_active().is_none(),
+            "armarla desarma el lápiz y las formas"
+        );
+        viewer.set_hand_mode(true);
+        assert!(
+            !viewer.sticky_tool_active(),
+            "el modo mano también desarma la nota adhesiva"
+        );
+        viewer.set_hand_mode(false);
+        viewer.set_sticky_tool(true);
+
+        let sticky_zoom = viewer.view.zoom.get();
+        assert!(sticky_zoom > 0.0, "hay un zoom con el que pasar a puntos");
+        let sticky_id = viewer
+            .insert_sticky_note(0, 60.0 * sticky_zoom, 120.0 * sticky_zoom)
+            .expect("el clic con la herramienta armada crea la nota");
+        assert!(
+            !viewer.sticky_tool_active(),
+            "colocar la nota desarma la herramienta"
+        );
+        assert_eq!(
+            viewer.annot.selected.borrow().as_deref(),
+            Some(sticky_id.as_str()),
+            "la nota nueva queda elegida"
+        );
+        let fresh = viewer.sticky(&sticky_id).expect("la nota está en la lista");
+        assert!(fresh.comments.is_empty(), "nace sin comentarios");
+        assert_eq!(
+            (fresh.at, fresh.width, fresh.height),
+            ((60.0, 120.0), STICKY_SIDE, STICKY_SIDE),
+            "el icono queda donde se hizo clic, con su lado de {STICKY_SIDE} puntos"
+        );
+
+        // Aceptar el diálogo: el primer texto es la nota y el segundo, la
+        // respuesta que agregó «Responder».
+        assert!(
+            viewer.apply_sticky_comments(
+                &sticky_id,
+                &["Texto de la nota".to_string(), "Primera respuesta".to_string()],
+            ),
+            "el hilo que deja el diálogo se guarda"
+        );
+        assert_eq!(
+            viewer.annot.edits.borrow().len(),
+            1,
+            "una nota es una sola anotación en memoria"
+        );
+        let thread = viewer.sticky(&sticky_id).expect("sigue siendo una nota adhesiva");
+        assert_eq!(thread.comments.len(), 2, "la nota y su respuesta");
+        assert_eq!(thread.comments[0].text, "Texto de la nota");
+        assert_eq!(thread.comments[1].text, "Primera respuesta");
+        assert_eq!(thread.replies(), 1, "una respuesta en el hilo");
+        assert!(
+            viewer.has_pending_marks(),
+            "la nota queda pendiente de guardar"
+        );
+
+        // El icono se pinta en la capa, dentro de su caja y no como un punto.
+        let sticky_side = 400usize;
+        let sticky_pixels = annotation_pixels(&viewer, 0, sticky_side, sticky_side);
+        let painted = pixel_box(sticky_side, &sticky_pixels, |[red, green, blue]| {
+            red < 120 && green < 120 && blue < 120
+        })
+        .expect("el icono de la nota adhesiva se pinta en la capa");
+        let expected = (
+            (thread.at.0 * sticky_zoom) as usize,
+            (thread.at.1 * sticky_zoom) as usize,
+            ((thread.at.0 + STICKY_SIDE) * sticky_zoom) as usize,
+            ((thread.at.1 + STICKY_SIDE) * sticky_zoom) as usize,
+        );
+        assert!(
+            (painted.0 as f64 - expected.0 as f64).abs() <= 2.0
+                && (painted.1 as f64 - expected.1 as f64).abs() <= 2.0
+                && (painted.2 as f64 - expected.2 as f64).abs() <= 2.0
+                && (painted.3 as f64 - expected.3 as f64).abs() <= 2.0
+                && (painted.2 - painted.0) as f64 >= STICKY_SIDE * sticky_zoom - 2.0
+                && (painted.3 - painted.1) as f64 >= STICKY_SIDE * sticky_zoom - 2.0,
+            "el icono {painted:?} tiene que llenar su caja {expected:?}"
+        );
+
+        // `Supr` (el mismo camino del controlador de teclas) borra la nota entera
+        // con su hilo, y deshacer la devuelve completa.
+        viewer.select_annotation(Some(sticky_id.clone()));
+        assert!(
+            viewer.delete_selected_annotation(),
+            "Supr borra la nota elegida"
+        );
+        assert!(
+            viewer.annot.edits.borrow().is_empty(),
+            "la nota se va entera, con sus dos comentarios"
+        );
+        assert!(viewer.undo(), "deshacer la devuelve");
+        let restored = viewer
+            .sticky(&sticky_id)
+            .expect("deshacer repone la nota, no un resto suyo");
+        assert_eq!(restored.comments.len(), 2, "con su hilo completo");
+        assert_eq!(restored.comments[0].text, "Texto de la nota");
+        assert_eq!(restored.comments[1].text, "Primera respuesta");
+
+        // Guardar y reabrir: la nota vuelve como una sola anotación con sus dos
+        // comentarios en orden, escrita como dos `/Text` encadenadas.
+        let sticky_path = dir.join("sticky-ui.pdf");
+        std::fs::remove_file(&sticky_path).ok();
+        assert!(
+            viewer.save_pending_edits(&sticky_path),
+            "la nota se guarda en la copia"
+        );
+        assert_eq!(
+            written_annotations(&sticky_path),
+            2,
+            "en el archivo es una `/Text` por comentario"
+        );
+        assert_eq!(
+            written_subtypes(&sticky_path),
+            vec!["Text".to_string(), "Text".to_string()],
+            "las dos son /Text"
+        );
+        viewer.open(&sticky_path).expect("reabrir la copia guardada");
+        assert_eq!(
+            viewer.annot.edits.borrow().len(),
+            1,
+            "al reabrir, la nota vuelve como una sola anotación"
+        );
+        let back = match &viewer.annot.edits.borrow()[0].value {
+            Annotation::Sticky(sticky) => sticky.clone(),
+            other => panic!("se esperaba una nota adhesiva y se leyó {other:?}"),
+        };
+        assert_eq!(
+            back.comments.iter().map(|comment| comment.text.as_str()).collect::<Vec<_>>(),
+            vec!["Texto de la nota", "Primera respuesta"],
+            "los comentarios vuelven en orden"
+        );
+        assert!(
+            back.contains(
+                (back.at.0 + STICKY_SIDE / 2.0, back.at.1 + STICKY_SIDE / 2.0),
+                0.0
+            ),
+            "y el icono vuelve donde estaba"
+        );
+        assert!(
+            !viewer.has_pending_marks(),
+            "lo reabierto coincide con el archivo"
+        );
+        std::fs::remove_file(&sticky_path).ok();
+
+        // Y el estado vuelve al documento de la prueba, sin anotaciones.
+        viewer.open(&two_path).expect("volver al documento de la prueba");
+        assert!(
+            viewer.annot.edits.borrow().is_empty(),
+            "el documento de la prueba sigue sin anotaciones"
+        );
+        assert!(!viewer.sticky_tool_active());
 
         // Pulsar la herramienta abre el selector de color del sistema. Es la
         // única parte del flujo que no se puede probar sin un clic real, así que

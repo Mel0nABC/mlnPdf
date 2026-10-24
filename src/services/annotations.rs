@@ -11,9 +11,9 @@ use lopdf::{Dictionary, Document, Object, ObjectId, Stream};
 
 use crate::engine::annotation::{
     Annotation, FontChoice, ImageAppearance, ImageNote, ImagePixels, InkStroke, MarkKind, NOTE_COLOR,
-    PageBox, Rect, Shape, ShapeKind, TextMark, TextNote, TextRun, bounds_rect, clamp_stroke_width,
-    image_appearance, mark_quads, note_rect, parse_da, quads_to_rects, user_point,
-    user_rect_to_display, user_to_display,
+    PageBox, Rect, Shape, ShapeKind, StickyComment, StickyNote, TextMark, TextNote, TextRun,
+    bounds_rect, clamp_stroke_width, image_appearance, mark_quads, note_rect, parse_da,
+    quads_to_rects, sticky_rect, user_point, user_rect_to_display, user_to_display,
 };
 
 /// Prefijo de `/NM` que distingue una anotación propia de la de otro programa.
@@ -41,6 +41,11 @@ const COLOR_SLACK: usize = 64;
 /// archivo sin `/NM`, o con un `/NM` que no está en `persisted`, es de otro
 /// programa: no se toca.
 ///
+/// Una nota adhesiva es una sola anotación en memoria pero varias en el archivo,
+/// una por comentario. Por eso las bajas incluyen también los identificadores de
+/// `Annotation::annotation_ids`: borrar una respuesta o la nota entera quita todos
+/// sus objetos, y ninguno queda huérfano.
+///
 /// `source` es el archivo que hay que editar y no se toca hasta que el nuevo
 /// documento está completo en el disco. Cuando `target` es el mismo archivo que
 /// `source`, el guardado es atómico: primero el temporal, después el reemplazo.
@@ -67,10 +72,35 @@ pub fn write_annotations(
     let unchanged = |left: &(String, Annotation), right: &(String, Annotation)| {
         left.0 == right.0 && left.1 == right.1
     };
+    // Los identificadores que el archivo tiene para una anotación: el del par y,
+    // en una nota adhesiva, el de cada comentario.
+    let ids_of = |entry: &(String, Annotation)| -> Vec<String> {
+        let mut ids = vec![entry.0.clone()];
+        ids.extend(entry.1.annotation_ids().into_iter().map(str::to_string));
+        ids
+    };
+    // Un comentario sigue vigente mientras aparezca en `annotation_ids` de alguna
+    // anotación actual: su objeto no se toca en las bajas. El id del par, en
+    // cambio, se quita siempre que su valor cambió, porque el objeto escrito lleva
+    // el valor viejo y la escritura de abajo lo reemplaza. Así borrar una respuesta
+    // quita solo su objeto, borrar la nota quita todos los del hilo y editar el
+    // texto no duplica nada.
+    let live: std::collections::HashSet<String> = current.iter().flat_map(ids_of).collect();
     let removals: Vec<String> = persisted
         .iter()
         .filter(|entry| !current.iter().any(|other| unchanged(entry, other)))
-        .map(|(id, _)| id.clone())
+        .flat_map(|entry| {
+            let mut ids = vec![entry.0.clone()];
+            ids.extend(
+                entry
+                    .1
+                    .annotation_ids()
+                    .into_iter()
+                    .filter(|id| !live.contains(*id))
+                    .map(str::to_string),
+            );
+            ids
+        })
         .collect();
     // Y lo que hay que escribir: lo nuevo y lo que cambió.
     let upserts: Vec<&(String, Annotation)> = current
@@ -89,6 +119,16 @@ pub fn write_annotations(
             continue;
         };
         let page_box = page_box(&document, page_id)?;
+        // Una nota adhesiva son varias `/Text` con un `/NM` cada una: se quitan
+        // las que tenían sus mismos identificadores y se vuelven a escribir, así
+        // editar el texto reemplaza sus objetos en vez de duplicarlos.
+        if let Annotation::Sticky(sticky) = annotation {
+            let mut ids = vec![id.clone()];
+            ids.extend(sticky.comments.iter().map(|comment| comment.id.clone()));
+            drop_annotations(&mut document, &ids);
+            written += sticky_dictionaries(&mut document, page_id, sticky, page_box)?;
+            continue;
+        }
         let object = match annotation {
             Annotation::Mark(mark) => {
                 let quads = mark_quads(&mark.rects, page_box);
@@ -101,12 +141,70 @@ pub fn write_annotations(
             Annotation::Image(image) => image_dictionary(&mut document, image, page_box, id)?,
             Annotation::Ink(stroke) => ink_dictionary(stroke, page_box, id),
             Annotation::Shape(shape) => shape_dictionary(shape, page_box, id),
+            Annotation::Sticky(_) => continue,
         };
         push_annotation(&mut document, page_id, object)?;
         written += 1;
     }
 
     save_atomically(&mut document, target)?;
+    Ok(written)
+}
+
+/// Escribe una nota adhesiva como N anotaciones `/Text`, una por comentario, y
+/// devuelve cuántas escribió. El comentario raíz no lleva `/IRT`; cada respuesta
+/// apunta con `/IRT` al objeto de la anterior y se declara como respuesta con
+/// `/RT /R`, que es lo que hace que el hilo se lea en orden en cualquier lector.
+///
+/// Las anotaciones se agregan al documento con `try_add_object` para conocer su
+/// `ObjectId` —lo necesita el `/IRT` de la siguiente— y de `/Annots` cuelga una
+/// referencia, no el diccionario.
+fn sticky_dictionaries(
+    document: &mut Document,
+    page_id: ObjectId,
+    sticky: &StickyNote,
+    page: PageBox,
+) -> Result<u32, String> {
+    let rect = sticky_rect(sticky, page);
+    let mut previous: Option<ObjectId> = None;
+    let mut written = 0;
+
+    for comment in &sticky.comments {
+        let mut dictionary = Dictionary::new();
+        dictionary.set("Type", Object::Name(b"Annot".to_vec()));
+        dictionary.set("Subtype", Object::Name(b"Text".to_vec()));
+        set_identifier(&mut dictionary, &comment.id);
+        dictionary.set(
+            "Rect",
+            Object::Array(vec![real(rect.0), real(rect.1), real(rect.2), real(rect.3)]),
+        );
+        dictionary.set("Contents", contents(&comment.text));
+        // `/Name /Comment` es el icono con el que el lector la muestra, y `/C` su
+        // color; `/F 4` la imprime y un `/Border` vacío evita el marco.
+        dictionary.set("Name", Object::Name(b"Comment".to_vec()));
+        dictionary.set("C", color_array(sticky.color));
+        dictionary.set("F", Object::Integer(4));
+        dictionary.set(
+            "Border",
+            Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(0),
+            ]),
+        );
+        if let Some(parent) = previous {
+            dictionary.set("IRT", Object::Reference(parent));
+            dictionary.set("RT", Object::Name(b"R".to_vec()));
+        }
+
+        let object_id = document
+            .try_add_object(Object::Dictionary(dictionary))
+            .map_err(|error| format!("no se pudo agregar la nota adhesiva al PDF: {error}"))?;
+        push_annotation(document, page_id, Object::Reference(object_id))?;
+        previous = Some(object_id);
+        written += 1;
+    }
+
     Ok(written)
 }
 
@@ -748,10 +846,10 @@ fn temporary_path(target: &Path) -> PathBuf {
 /// Lee del archivo las anotaciones propias y las devuelve como anotaciones en
 /// memoria, en orden de página y de aparición, con su `/NM`.
 ///
-/// Se reconstruyen los cinco tipos que escribe el visor —subrayado, resaltado,
-/// tachado, nota de texto e imagen— y solo esos: una anotación sin `/NM` o con un
-/// `/NM` ajeno es de otro programa, así que no entra en la lista y nunca se
-/// reescribe.
+/// Se reconstruyen los tipos que escribe el visor —subrayado, resaltado, tachado,
+/// nota de texto, imagen, trazo, forma y nota adhesiva— y solo esos: una anotación
+/// sin `/NM` o con un `/NM` ajeno es de otro programa, así que no entra en la
+/// lista y nunca se reescribe.
 ///
 /// Un PDF protegido devuelve una lista vacía en vez de un error: en ese archivo
 /// no se pueden escribir anotaciones, así que no hay nada que reconstruir y el
@@ -784,6 +882,12 @@ fn owned_annotations(document: &Document) -> Vec<(String, Annotation)> {
             continue;
         };
         let page = number.saturating_sub(1) as usize;
+
+        // La página se lee entera antes de armar la salida: una nota adhesiva son
+        // varias `/Text` sueltas que solo se vuelven una anotación cuando se
+        // agrupan por su `/IRT`.
+        let mut single: Vec<Option<(String, Annotation)>> = Vec::new();
+        let mut comments: Vec<(usize, StickyCommentRead)> = Vec::new();
         for object in page_annotations(document, page_id) {
             let Some(id) = annotation_name(document, &object) else {
                 continue;
@@ -794,13 +898,153 @@ fn owned_annotations(document: &Document) -> Vec<(String, Annotation)> {
             let Some(dictionary) = annotation_dictionary(document, &object) else {
                 continue;
             };
+            if subtype_of(document, dictionary) == Some(b"Text".as_slice()) {
+                if let Some(comment) = read_sticky_comment(document, dictionary, page, id, page_box)
+                {
+                    comments.push((single.len(), comment));
+                    single.push(None);
+                }
+                continue;
+            }
             let Some(annotation) = read_annotation(document, dictionary, page, page_box) else {
                 continue;
             };
-            annotations.push((id, annotation));
+            single.push(Some((id, annotation)));
+        }
+
+        // Cada nota adhesiva se emite donde apareció su comentario raíz; las
+        // respuestas ya están dentro de ella.
+        let mut placed = sticky_groups(&comments);
+        for (position, entry) in single.into_iter().enumerate() {
+            if let Some(entry) = entry {
+                annotations.push(entry);
+            }
+            if let Some(sticky) = placed.remove(&position) {
+                annotations.push(sticky);
+            }
         }
     }
     annotations
+}
+
+/// Comentario leído de una `/Text`: su `/NM`, su texto, su color, la caja del
+/// icono y el comentario al que responde, si lo declara.
+struct StickyCommentRead {
+    page: usize,
+    id: String,
+    text: String,
+    color: [f64; 3],
+    rect: Rect,
+    parent: Option<String>,
+}
+
+/// `Subtype` de la anotación, resolviendo la referencia si el diccionario está en
+/// otro objeto.
+fn subtype_of<'a>(document: &'a Document, dictionary: &'a Dictionary) -> Option<&'a [u8]> {
+    resolve(document, dictionary.get(b"Subtype").ok()?)?
+        .as_name()
+        .ok()
+}
+
+/// Agrupa los comentarios de una página en notas adhesivas: el primero es el que
+/// no tiene `/IRT` (o cuyo `/IRT` no apunta a ningún comentario propio de la
+/// página) y las respuestas se ordenan por el orden en que aparecen en `/Annots`.
+///
+/// Devuelve, por cada nota, la posición de su comentario raíz en la página —que es
+/// donde la nota se emite— y la anotación armada, con el `/NM` de la raíz como
+/// identificador del par.
+///
+/// Un `/IRT` que apunta a algo que no reconocemos deja el comentario como raíz, en
+/// vez de perder la nota entera cuando su padre desapareció. Un hilo circular
+/// —imposible de escribir desde acá, posible en un archivo ajeno— se saltea para
+/// que la lectura no se cuelgue.
+fn sticky_groups(
+    comments: &[(usize, StickyCommentRead)],
+) -> std::collections::HashMap<usize, (String, Annotation)> {
+    let index_of: std::collections::HashMap<&str, usize> = comments
+        .iter()
+        .enumerate()
+        .map(|(index, (_, comment))| (comment.id.as_str(), index))
+        .collect();
+
+    let root_of = |index: usize| -> Option<usize> {
+        let mut seen = vec![false; comments.len()];
+        let mut current = index;
+        loop {
+            if seen[current] {
+                return None;
+            }
+            seen[current] = true;
+            let Some(parent) = comments[current].1.parent.as_deref() else {
+                return Some(current);
+            };
+            match index_of.get(parent) {
+                Some(&up) => current = up,
+                None => return Some(current),
+            }
+        }
+    };
+
+    let mut groups = std::collections::HashMap::new();
+    for (index, (position, comment)) in comments.iter().enumerate() {
+        if root_of(index) != Some(index) {
+            continue;
+        }
+        let mut members: Vec<usize> = (0..comments.len())
+            .filter(|other| root_of(*other) == Some(index))
+            .collect();
+        // La raíz primero y las respuestas en el orden en que aparecen en
+        // `/Annots`.
+        members.sort_by_key(|other| (*other != index, *other));
+        let sticky = StickyNote {
+            page: comment.page,
+            at: (comment.rect.0, comment.rect.1),
+            width: comment.rect.2 - comment.rect.0,
+            height: comment.rect.3 - comment.rect.1,
+            color: comment.color,
+            comments: members
+                .iter()
+                .map(|other| StickyComment {
+                    id: comments[*other].1.id.clone(),
+                    text: comments[*other].1.text.clone(),
+                })
+                .collect(),
+        };
+        groups.insert(
+            *position,
+            (comment.id.clone(), Annotation::Sticky(sticky)),
+        );
+    }
+    groups
+}
+
+/// Comentario de una nota adhesiva leído de su `/Rect`, su `/Contents`, su `/C` y
+/// su `/IRT`. `None` cuando le falta la caja: sin ella no se puede volver a
+/// dibujar ni agarrar.
+fn read_sticky_comment(
+    document: &Document,
+    dictionary: &Dictionary,
+    page: usize,
+    id: String,
+    page_box: PageBox,
+) -> Option<StickyCommentRead> {
+    let rect = user_rect_to_display(rect_of(document, dictionary, b"Rect")?, page_box);
+    let parent = dictionary
+        .get(b"IRT")
+        .ok()
+        .and_then(|value| resolve(document, value))
+        .and_then(|value| value.as_dict().ok())
+        .and_then(|irt| irt.get(b"NM").ok())
+        .and_then(|value| value.as_str().ok())
+        .map(|bytes| String::from_utf8_lossy(bytes).into_owned());
+    Some(StickyCommentRead {
+        page,
+        id,
+        text: contents_text(dictionary).unwrap_or_default(),
+        color: color_of(document, dictionary),
+        rect,
+        parent,
+    })
 }
 
 /// Abre el archivo para editarlo: devuelve las anotaciones propias que trae y,
@@ -835,7 +1079,16 @@ pub fn open_for_editing(
         return Ok((Vec::new(), None));
     }
 
-    let ids: Vec<String> = annotations.iter().map(|(id, _)| id.clone()).collect();
+    let ids: Vec<String> = annotations
+        .iter()
+        .flat_map(|(id, annotation)| {
+            // Una nota adhesiva tiene un objeto por comentario: hay que sacarlos
+            // todos o la copia los seguiría mostrando.
+            let mut ids = vec![id.clone()];
+            ids.extend(annotation.annotation_ids().into_iter().map(str::to_string));
+            ids
+        })
+        .collect();
     drop_annotations(&mut document, &ids);
 
     let mut bytes = Vec::new();
@@ -871,6 +1124,9 @@ fn annotation_dictionary<'a>(document: &'a Document, object: &'a Object) -> Opti
 /// Reconstruye una anotación propia desde su diccionario. `None` cuando el tipo
 /// no es de los que el visor reconstruye o cuando le falta un dato sin el cual no
 /// se podría volver a editar.
+///
+/// Las `/Text` no se leen acá: cada una es un comentario y solo forman una nota
+/// adhesiva cuando `owned_annotations` las agrupa por su `/IRT`.
 fn read_annotation(
     document: &Document,
     dictionary: &Dictionary,
@@ -1253,7 +1509,7 @@ fn contents_text(dictionary: &Dictionary) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::annotation::BaseFont;
+    use crate::engine::annotation::{BaseFont, STICKY_SIDE};
     use lopdf::{Stream, dictionary};
 
     /// Directorio de trabajo de las pruebas, dentro del proyecto.
@@ -2546,6 +2802,17 @@ mod tests {
         }
     }
 
+    /// Compara un color leído con el que se pidió guardar: el archivo guarda reales
+    /// de 32 bits, así que la diferencia se mide en centésimas.
+    fn assert_same_color(got: [f64; 3], want: [f64; 3]) {
+        for (got, want) in got.iter().zip(&want) {
+            assert!(
+                (got - want).abs() <= 0.01,
+                "el color leído {got:?} no es el guardado {want:?}"
+            );
+        }
+    }
+
     /// Escribe `annotations` en un archivo nuevo y las vuelve a leer del archivo,
     /// que es lo que hace el visor al reabrir el PDF. Devuelve la ruta del archivo
     /// escrito y lo leído.
@@ -3378,5 +3645,338 @@ mod tests {
             );
             assert_eq!(back.color, want.color, "mismo color");
         }
+    }
+
+    /// Comentario de una nota adhesiva, para las pruebas.
+    fn comment(id: &str, text: &str) -> StickyComment {
+        StickyComment {
+            id: id.to_string(),
+            text: text.to_string(),
+        }
+    }
+
+    /// Nota adhesiva con su comentario raíz y dos respuestas encadenadas.
+    fn sticky_with_replies() -> StickyNote {
+        StickyNote {
+            page: 0,
+            at: (20.0, 30.0),
+            width: STICKY_SIDE,
+            height: STICKY_SIDE,
+            color: [1.0, 0.9, 0.3],
+            comments: vec![
+                comment("mlnpdf-prueba-nota", "Comentario raíz"),
+                comment("mlnpdf-prueba-respuesta-1", "Primera respuesta"),
+                comment("mlnpdf-prueba-respuesta-2", "Segunda respuesta"),
+            ],
+        }
+    }
+
+    /// `/NM` de una anotación escrita, como cadena.
+    fn name_of(annotation: &Dictionary) -> String {
+        String::from_utf8(
+            annotation
+                .get(b"NM")
+                .and_then(Object::as_str)
+                .expect("la anotación lleva su /NM")
+                .to_vec(),
+        )
+        .expect("un /NM ASCII es UTF-8 válido")
+    }
+
+    #[test]
+    fn a_sticky_note_is_written_as_one_text_annotation_per_comment() {
+        let source = scratch("sticky.pdf");
+        let target = scratch("sticky-out.pdf");
+        std::fs::write(&source, fixture([0.0, 0.0, 200.0, 100.0], 0)).expect("escribir el PDF");
+
+        let written = write_fresh(
+            &source,
+            &target,
+            &[Annotation::Sticky(sticky_with_replies())],
+        )
+        .expect("la nota adhesiva tiene que escribirse");
+        assert_eq!(written, 3, "una anotación del PDF por comentario");
+
+        let document = Document::load(&target).expect("el archivo escrito tiene que cargarse");
+        let page_id = *document.get_pages().get(&1).expect("página 1");
+        let annotations = document.get_page_annotations(page_id).expect("anotaciones");
+        assert_eq!(annotations.len(), 3, "tres /Text para una sola nota");
+
+        let root = annotations[0];
+        assert_eq!(
+            root.get(b"Subtype").and_then(Object::as_name).expect("Subtype"),
+            b"Text",
+            "cada comentario es una anotación /Text"
+        );
+        assert_eq!(
+            root.get(b"Type").and_then(Object::as_name).expect("Type"),
+            b"Annot"
+        );
+        assert_eq!(
+            numbers(root, b"Rect"),
+            vec![20.0, 52.0, 38.0, 70.0],
+            "el icono va en el espacio de usuario, con su lado de 18 puntos"
+        );
+        assert_eq!(contents_text(root), "Comentario raíz");
+        assert_eq!(
+            root.get(b"Name").and_then(Object::as_name).expect("Name"),
+            b"Comment",
+            "el lector dibuja el icono de comentario"
+        );
+        let color = numbers(root, b"C");
+        assert_same_color([color[0], color[1], color[2]], [1.0, 0.9, 0.3]);
+        assert_eq!(
+            root.get(b"F").and_then(Object::as_i64).expect("F"),
+            4,
+            "la anotación se imprime"
+        );
+        assert_eq!(
+            numbers(root, b"Border"),
+            vec![0.0, 0.0, 0.0],
+            "/Border sin ancho: una nota, no una caja de anotación"
+        );
+        assert_eq!(name_of(root), "mlnpdf-prueba-nota");
+        assert!(
+            root.get(b"IRT").is_err(),
+            "el comentario raíz no responde a nadie"
+        );
+
+        // Las respuestas se encadenan: cada una apunta al objeto de la anterior y
+        // se declara como respuesta con /RT /R.
+        for (index, text) in ["Primera respuesta", "Segunda respuesta"]
+            .into_iter()
+            .enumerate()
+        {
+            let reply = annotations[index + 1];
+            assert_eq!(contents_text(reply), text);
+            assert_eq!(
+                reply.get(b"Name").and_then(Object::as_name).expect("Name"),
+                b"Comment"
+            );
+            assert_eq!(numbers(reply, b"Rect"), numbers(root, b"Rect"), "mismo icono");
+            assert_eq!(name_of(reply), format!("mlnpdf-prueba-respuesta-{}", index + 1));
+            assert_eq!(
+                reply.get(b"RT").and_then(Object::as_name).expect("RT"),
+                b"R",
+                "la respuesta se declara como tal"
+            );
+            let parent = resolve(
+                &document,
+                reply.get(b"IRT").expect("la respuesta lleva su /IRT"),
+            )
+            .and_then(|value| value.as_dict().ok())
+            .expect("el /IRT tiene que apuntar al objeto de la respuesta anterior");
+            assert_eq!(
+                name_of(parent),
+                name_of(annotations[index]),
+                "/IRT apunta a la anotación anterior de la cadena"
+            );
+        }
+
+        let bytes = std::fs::read(&target).expect("leer el resultado");
+        let document = poppler::Document::from_data(&bytes, None).expect("poppler abre el PDF");
+        assert_eq!(document.n_pages(), 1, "el PDF sigue siendo válido para poppler");
+    }
+
+    #[test]
+    fn deleting_a_sticky_note_removes_every_object_of_its_thread() {
+        let source = scratch("sticky-delete.pdf");
+        let path = scratch("sticky-delete-same.pdf");
+        std::fs::write(&source, fixture([0.0, 0.0, 200.0, 100.0], 0)).expect("escribir el PDF");
+
+        // El identificador del par coincide con el /NM del comentario raíz, que es
+        // con el que la nota vuelve del archivo.
+        let current = vec![owned(
+            "mlnpdf-prueba-nota",
+            Annotation::Sticky(sticky_with_replies()),
+        )];
+        assert_eq!(
+            write_annotations(&source, &path, &current, &[]).expect("escribir la nota"),
+            3
+        );
+        assert_eq!(written_annotations(&path).len(), 3);
+
+        assert_eq!(
+            write_annotations(&path, &path, &[], &current).expect("borrar la nota entera"),
+            3,
+            "se quitan los tres objetos del hilo"
+        );
+        assert!(
+            written_annotations(&path).is_empty(),
+            "/Annots queda sin ninguna de las tres /Text: {:?}",
+            written_annotations(&path)
+        );
+        assert!(
+            poppler::Document::from_data(&std::fs::read(&path).expect("leer"), None).is_ok(),
+            "el PDF sigue abriéndose después de borrar"
+        );
+    }
+
+    #[test]
+    fn editing_a_sticky_comment_does_not_duplicate_its_objects() {
+        let source = scratch("sticky-edit.pdf");
+        let path = scratch("sticky-edit-same.pdf");
+        std::fs::write(&source, fixture([0.0, 0.0, 200.0, 100.0], 0)).expect("escribir el PDF");
+
+        let before = sticky_with_replies();
+        let persisted = vec![owned(
+            "mlnpdf-prueba-nota",
+            Annotation::Sticky(before.clone()),
+        )];
+        write_annotations(&source, &path, &persisted, &[]).expect("escribir la nota");
+        assert_eq!(written_annotations(&path).len(), 3);
+
+        let mut after = before;
+        after.comments[0].text = "Comentario editado".to_string();
+        let current = vec![owned("mlnpdf-prueba-nota", Annotation::Sticky(after))];
+        write_annotations(&path, &path, &current, &persisted).expect("editar el comentario");
+
+        let annotations = written_annotations(&path);
+        assert_eq!(
+            annotations.len(),
+            3,
+            "editar el texto reemplaza los objetos, no los duplica: {annotations:?}"
+        );
+        assert_eq!(
+            annotations[0].2, "Comentario editado",
+            "el objeto de la raíz lleva el texto nuevo"
+        );
+        assert_eq!(
+            annotations[1].2, "Primera respuesta",
+            "las respuestas siguen en su lugar"
+        );
+        assert_eq!(annotations[2].2, "Segunda respuesta");
+    }
+
+    #[test]
+    fn poppler_paints_the_written_sticky_icon() {
+        // El icono de una /Text lo dibuja el lector: poppler tiene que pintarlo
+        // sin que el visor ponga nada encima.
+        let source = scratch("sticky-painted.pdf");
+        let target = scratch("sticky-painted-out.pdf");
+        std::fs::write(&source, fixture([0.0, 0.0, 300.0, 200.0], 0)).expect("escribir el PDF");
+
+        let sticky = StickyNote {
+            page: 0,
+            at: (100.0, 80.0),
+            width: STICKY_SIDE,
+            height: STICKY_SIDE,
+            color: [1.0, 0.0, 0.0],
+            comments: vec![comment("mlnpdf-prueba-nota", "Icono")],
+        };
+        write_fresh(&source, &target, &[Annotation::Sticky(sticky)])
+            .expect("la nota adhesiva tiene que escribirse");
+
+        let size = (300.0, 200.0);
+        assert_eq!(
+            painted_pixels(&std::fs::read(&source).expect("original"), size),
+            0,
+            "la página vacía no tiene nada pintado"
+        );
+        assert!(
+            painted_pixels(&std::fs::read(&target).expect("resultado"), size) > 0,
+            "poppler dibuja el icono de la nota adhesiva"
+        );
+    }
+
+    /// Cuenta los píxeles de la página que no son papel: es lo que pinta poppler
+    /// de una anotación que no toca el contenido del documento.
+    fn painted_pixels(bytes: &[u8], size: (f64, f64)) -> usize {
+        let document = poppler::Document::from_data(bytes, None).expect("poppler abre el PDF");
+        let page = document.page(0).expect("página 0");
+        let mut surface = cairo::ImageSurface::create(
+            cairo::Format::ARgb32,
+            size.0.ceil() as i32,
+            size.1.ceil() as i32,
+        )
+        .expect("crear la superficie");
+        {
+            let context = cairo::Context::new(&surface).expect("contexto");
+            context.set_source_rgb(1.0, 1.0, 1.0);
+            context.paint().expect("fondo blanco");
+            page.render(&context);
+        }
+        surface.flush();
+
+        let stride = usize::try_from(surface.stride()).expect("stride");
+        let (width, height) = (surface.width() as usize, surface.height() as usize);
+        let data = surface.data().expect("píxeles");
+        let mut painted = 0;
+        for row in 0..height {
+            for column in 0..width {
+                let offset = row * stride + column * 4;
+                let (blue, green, red) = (data[offset], data[offset + 1], data[offset + 2]);
+                if red < 250 || green < 250 || blue < 250 {
+                    painted += 1;
+                }
+            }
+        }
+        painted
+    }
+
+    #[test]
+    fn a_sticky_note_comes_back_with_its_comments_in_order() {
+        let sticky = sticky_with_replies();
+        let current = vec![owned(
+            "mlnpdf-ida-adhesiva",
+            Annotation::Sticky(sticky.clone()),
+        )];
+
+        let (_, read) = round_trip(
+            "rt-sticky",
+            fixture([0.0, 0.0, 200.0, 100.0], 0),
+            &current,
+        );
+        assert_eq!(read.len(), 1, "una nota en memoria: {read:?}");
+        let Annotation::Sticky(back) = &read[0].1 else {
+            panic!("se esperaba una nota adhesiva y se leyó {:?}", read[0].1);
+        };
+        assert_eq!(
+            read[0].0, "mlnpdf-prueba-nota",
+            "la nota vuelve con el /NM de su comentario raíz"
+        );
+        assert_eq!(back.page, 0);
+        assert_same_color(back.color, sticky.color);
+        assert_same_rect(back.rect(), sticky.rect());
+        assert_eq!(back.comments.len(), 3, "la raíz y sus dos respuestas");
+        for (got, want) in back.comments.iter().zip(&sticky.comments) {
+            assert_eq!(got.id, want.id, "cada comentario conserva su /NM");
+            assert_eq!(got.text, want.text, "y su texto");
+        }
+        assert_eq!(
+            back.comments.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(),
+            vec!["Comentario raíz", "Primera respuesta", "Segunda respuesta"],
+            "las respuestas vuelven en el orden en que se escribieron"
+        );
+    }
+
+    #[test]
+    fn a_sticky_note_without_replies_comes_back_with_one_comment() {
+        let sticky = StickyNote {
+            page: 0,
+            at: (60.0, 20.0),
+            width: STICKY_SIDE,
+            height: STICKY_SIDE,
+            color: [0.2, 0.4, 0.8],
+            comments: vec![comment("mlnpdf-prueba-sola", "Solo la nota")],
+        };
+        let current = vec![owned(
+            "mlnpdf-prueba-sola",
+            Annotation::Sticky(sticky.clone()),
+        )];
+
+        let (_, read) = round_trip(
+            "rt-sticky-alone",
+            fixture([0.0, 0.0, 200.0, 100.0], 0),
+            &current,
+        );
+        assert_eq!(read.len(), 1, "vuelve la nota: {read:?}");
+        let Annotation::Sticky(back) = &read[0].1 else {
+            panic!("se esperaba una nota adhesiva y se leyó {:?}", read[0].1);
+        };
+        assert_eq!(back.comments.len(), 1, "sin respuestas queda el comentario raíz");
+        assert_eq!(back.comments[0].text, "Solo la nota");
+        assert_same_color(back.color, sticky.color);
+        assert_same_rect(back.rect(), sticky.rect());
     }
 }

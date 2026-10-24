@@ -391,6 +391,9 @@ pub(crate) struct AnnotationState {
     pub(crate)     stroke_drag: RefCell<Option<StrokeDrag>>,
     /// Herramienta «insertar texto» armada: el próximo clic coloca la nota.
     pub(crate)     text_tool: Cell<bool>,
+    /// Herramienta «nota adhesiva» armada: el próximo clic crea el icono y abre
+    /// su diálogo.
+    pub(crate)     sticky_tool: Cell<bool>,
     /// Texto y fuente que dejó el diálogo, esperando ese clic.
     pub(crate)     draft: RefCell<Option<TextDraft>>,
     /// Superficies de cairo ya armadas con los píxeles de cada imagen, por
@@ -483,6 +486,8 @@ pub(crate) struct InteractionState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HitKind {
     Note,
+    /// Una nota adhesiva: su icono abre el diálogo del hilo.
+    Sticky,
     Image,
     Mark,
     /// Un trazo del lápiz o una forma de las de dibujo.
@@ -569,8 +574,9 @@ impl Viewer {
         accessible_label(&image_button, "Insertar imagen en la página");
 
         // Quinta herramienta: dibujar. Un solo botón abre el popover con el
-        // lápiz, las cuatro formas, el grosor libre y el color.
-        let (stroke_button, stroke_tools, stroke_width, stroke_color) = build_stroke_menu();
+        // lápiz, las cuatro formas, el grosor libre, el color y la nota adhesiva.
+        let (stroke_button, stroke_tools, stroke_width, stroke_color, sticky_button) =
+            build_stroke_menu();
 
         let title = gtk::Label::new(Some(WINDOW_TITLE));
 
@@ -800,6 +806,7 @@ impl Viewer {
                 stroke_tool: RefCell::new(None),
                 stroke_drag: RefCell::new(None),
                 text_tool: Cell::new(false),
+                sticky_tool: Cell::new(false),
                 draft: RefCell::new(None),
                 image_surfaces: RefCell::new(HashMap::new()),
             },
@@ -882,6 +889,22 @@ impl Viewer {
                     popover.popdown();
                 }
                 viewer.start_stroke_tool(kind);
+            });
+        }
+        {
+            // La nota adhesiva se arma igual: el siguiente clic sobre la página
+            // crea el icono y abre su diálogo.
+            let weak = Rc::downgrade(&viewer);
+            sticky_button.connect_clicked(move |_| {
+                let Some(viewer) = weak.upgrade() else {
+                    return;
+                };
+                if let Some(popover) = viewer.ui.stroke_button.popover()
+                    && popover.is_visible()
+                {
+                    popover.popdown();
+                }
+                viewer.set_sticky_tool(true);
             });
         }
         for index in 0..viewer.ui.navs.len() {
@@ -1154,6 +1177,7 @@ impl Viewer {
             viewer.toggle_mark_mode(MarkKind::StrikeOut);
         });
         Self::install_action(viewer, "insert-text", |viewer| viewer.prompt_text_note());
+        Self::install_action(viewer, "sticky-note", |viewer| viewer.toggle_sticky_tool());
         Self::install_action(viewer, "insert-image", |viewer| viewer.prompt_insert_image());
         Self::install_action(viewer, "draw-ink", |viewer| {
             viewer.start_stroke_tool(StrokeKind::Ink);
@@ -2064,6 +2088,7 @@ impl Viewer {
         if active {
             // Las herramientas no pueden estar activas a la vez.
             self.set_text_tool(false);
+            self.set_sticky_tool(false);
             self.set_mark_mode(MarkKind::Underline, false);
             self.set_mark_mode(MarkKind::Highlight, false);
             self.set_mark_mode(MarkKind::StrikeOut, false);
@@ -2088,6 +2113,9 @@ impl Viewer {
             self.apply_hand_cursor(Some("crosshair"));
         } else if self.active_mark_tool().is_some() || self.text_tool_active() {
             self.apply_hand_cursor(Some("text"));
+        } else if self.sticky_tool_active() {
+            // La nota adhesiva se coloca con un clic: el puntero dice dónde.
+            self.apply_hand_cursor(Some("pointer"));
         } else {
             self.apply_hand_cursor(None);
             // A drag interrupted by Escape can leave the window cursor behind.
@@ -2159,6 +2187,8 @@ impl Viewer {
             }
             // Y la de insertar texto también: una sola herramienta armada.
             self.set_text_tool(false);
+            // Y la nota adhesiva, que también se coloca con un clic.
+            self.set_sticky_tool(false);
             // Y el dibujo, que también se queda con el arrastre.
             self.clear_stroke_tool();
         }
@@ -2206,6 +2236,7 @@ impl Viewer {
             self.set_mark_mode(MarkKind::Underline, false);
             self.set_mark_mode(MarkKind::Highlight, false);
             self.set_mark_mode(MarkKind::StrikeOut, false);
+            self.set_sticky_tool(false);
             self.clear_stroke_tool();
         }
         self.annot.text_tool.set(active);
@@ -2213,6 +2244,33 @@ impl Viewer {
             self.ui.text_button.set_active(active);
         }
         self.refresh_page_cursor();
+    }
+
+    /// True cuando la herramienta «nota adhesiva» está armada.
+    pub(crate) fn sticky_tool_active(&self) -> bool {
+        self.annot.sticky_tool.get()
+    }
+
+    /// Arma o desarma la herramienta «nota adhesiva»: el siguiente clic sobre la
+    /// página crea el icono en ese punto y abre su diálogo. Es excluyente con el
+    /// modo mano y con las demás herramientas.
+    pub(crate) fn set_sticky_tool(&self, active: bool) {
+        let active = active && self.doc.document.borrow().is_some();
+        if active {
+            self.set_hand_mode(false);
+            self.set_text_tool(false);
+            self.set_mark_mode(MarkKind::Underline, false);
+            self.set_mark_mode(MarkKind::Highlight, false);
+            self.set_mark_mode(MarkKind::StrikeOut, false);
+            self.clear_stroke_tool();
+        }
+        self.annot.sticky_tool.set(active);
+        self.refresh_page_cursor();
+    }
+
+    /// Atajo y menú: el mismo camino que el botón del popover.
+    pub(crate) fn toggle_sticky_tool(&self) {
+        self.set_sticky_tool(!self.sticky_tool_active());
     }
 
     /// Herramienta de dibujo armada, si hay alguna, con su color y su grosor.
@@ -2245,6 +2303,7 @@ impl Viewer {
         self.set_mark_mode(MarkKind::Highlight, false);
         self.set_mark_mode(MarkKind::StrikeOut, false);
         self.set_text_tool(false);
+        self.set_sticky_tool(false);
 
         // El grosor y el color salen de los controles del popover, que conservan
         // lo último que se eligió para el trazo siguiente.
@@ -2308,6 +2367,163 @@ impl Viewer {
     /// herramienta queda armada para el clic que fija la esquina.
     pub(crate) fn prompt_text_note(self: &Rc<Self>) {
         self.prompt_note_text(None);
+    }
+
+    /// Crea una nota adhesiva con el icono en el punto `(x, y)` de la página y la
+    /// deja elegida, todavía sin comentarios. Devuelve su identificador.
+    ///
+    /// No empuja instantánea: si el diálogo se cancela y la nota quedó sin texto
+    /// ni respuestas, se quita sin dejar un paso de deshacer que no cambió nada.
+    /// Al aceptar, el hilo se guarda con `begin_edit`.
+    pub(crate) fn insert_sticky_note(&self, page: usize, x: f64, y: f64) -> Option<String> {
+        if self.doc.document.borrow().is_none() {
+            return None;
+        }
+        let point = self.view_to_pdf(page, x, y)?;
+        let size = self.doc.page_sizes.borrow().get(page).copied()?;
+        // El icono se queda dentro de la página aunque el clic caiga en el borde.
+        let at = (
+            point.0.clamp(0.0, (size.0 - STICKY_SIDE).max(0.0)),
+            point.1.clamp(0.0, (size.1 - STICKY_SIDE).max(0.0)),
+        );
+        let id = self.new_id();
+        self.annot.edits.borrow_mut().push(Edit {
+            id: id.clone(),
+            value: Annotation::Sticky(StickyNote::new(page, at, NOTE_COLOR)),
+        });
+        self.select_annotation(Some(id.clone()));
+        self.set_sticky_tool(false);
+        self.queue_page_draw(page);
+        Some(id)
+    }
+
+    /// Lo que hace el clic con la herramienta armada: crea la nota en ese punto y
+    /// abre su diálogo, que es donde se escribe el comentario raíz y se agregan
+    /// las respuestas.
+    pub(crate) fn start_sticky_note(self: &Rc<Self>, page: usize, x: f64, y: f64) {
+        let Some(id) = self.insert_sticky_note(page, x, y) else {
+            return;
+        };
+        // El diálogo se abre cuando el gesto del clic ya terminó: presentar un modal
+        // mientras la página tiene el grab deja la ventana detrás de la página.
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
+            let Some(viewer) = weak.upgrade() else {
+                return;
+            };
+            let Some(sticky) = viewer.sticky(&id) else {
+                return;
+            };
+            viewer.prompt_sticky_note(Some((id, sticky)));
+        });
+    }
+
+    /// Guarda el hilo que dejó el diálogo: el primer texto es el comentario de la
+    /// nota y los demás son sus respuestas. Las respuestas en blanco no se
+    /// guardan, y el comentario raíz se conserva aunque esté vacío porque es el
+    /// que abre el hilo.
+    ///
+    /// Cada comentario conserva su identificador mientras siga en su posición, así
+    /// editar el texto reemplaza los objetos que ya existían. La instantánea para
+    /// deshacer se empuja una sola vez, antes de tocar la lista.
+    pub(crate) fn apply_sticky_comments(&self, id: &str, texts: &[String]) -> bool {
+        let Some(sticky) = self.sticky(id) else {
+            return false;
+        };
+        let mut comments: Vec<StickyComment> = Vec::new();
+        for (position, text) in texts.iter().enumerate() {
+            if position > 0 && text.trim().is_empty() {
+                continue;
+            }
+            let comment_id = sticky
+                .comments
+                .get(position)
+                .map(|comment| comment.id.clone())
+                .unwrap_or_else(|| self.new_id());
+            comments.push(StickyComment {
+                id: comment_id,
+                text: text.clone(),
+            });
+        }
+        if comments.is_empty() {
+            comments.push(StickyComment {
+                id: self.new_id(),
+                text: String::new(),
+            });
+        }
+
+        self.begin_edit();
+        {
+            let mut edits = self.annot.edits.borrow_mut();
+            let Some(edit) = edits.iter_mut().find(|edit| edit.id == id) else {
+                return false;
+            };
+            let Annotation::Sticky(value) = &mut edit.value else {
+                return false;
+            };
+            value.comments = comments;
+        }
+        self.queue_page_draw(sticky.page);
+        true
+    }
+
+    /// Quita una nota adhesiva que quedó sin ningún comentario con texto, sin
+    /// dejar instantánea: es el descarte de una nota que se creó y nunca llegó a
+    /// escribirse, así que no hay cambio que deshacer.
+    pub(crate) fn discard_empty_sticky(&self, id: &str) -> bool {
+        let Some(sticky) = self.sticky(id) else {
+            return false;
+        };
+        if !sticky.is_empty() {
+            return false;
+        }
+        self.annot.edits.borrow_mut().retain(|edit| edit.id != id);
+        if self.annot.selected.borrow().as_deref() == Some(id) {
+            self.select_annotation(None);
+        }
+        self.refresh_edit_actions();
+        self.queue_page_draw(sticky.page);
+        true
+    }
+
+    /// Copia de la nota adhesiva `id`, si esa anotación existe y es una nota
+    /// adhesiva.
+    pub(crate) fn sticky(&self, id: &str) -> Option<StickyNote> {
+        self.annot
+            .edits
+            .borrow()
+            .iter()
+            .find(|edit| edit.id == id)
+            .and_then(|edit| match &edit.value {
+                Annotation::Sticky(sticky) => Some(sticky.clone()),
+                Annotation::Mark(_)
+                | Annotation::Note(_)
+                | Annotation::Image(_)
+                | Annotation::Ink(_)
+                | Annotation::Shape(_) => None,
+            })
+    }
+
+    /// Nota adhesiva bajo el punto `(x, y)` de la vista, si hay alguna. Se busca
+    /// sobre el icono, que es lo que se ve y lo que se puede agarrar; la última
+    /// dibujada gana.
+    pub(crate) fn sticky_at(&self, page: usize, x: f64, y: f64) -> Option<String> {
+        let point = self.view_to_pdf(page, x, y)?;
+        let zoom = self.view.zoom.get();
+        let tolerance = if zoom > 0.0 {
+            NOTE_HIT_TOLERANCE / zoom
+        } else {
+            0.0
+        };
+        let edits = self.annot.edits.borrow();
+        edits.iter().rev().find_map(|edit| match &edit.value {
+            Annotation::Sticky(sticky)
+                if sticky.page == page && sticky.contains(point, tolerance) =>
+            {
+                Some(edit.id.clone())
+            }
+            _ => None,
+        })
     }
 
     /// Selector de archivos de la herramienta de imagen: lo elegido entra en la
@@ -2475,10 +2691,149 @@ impl Viewer {
         let Some(id) = self.annot.selected.borrow().clone() else {
             return;
         };
-        let Some(note) = self.note(&id) else {
+        if let Some(note) = self.note(&id) {
+            self.prompt_note_text(Some((id, note)));
+            return;
+        }
+        // Una nota adhesiva se edita con su propio diálogo: el texto es un hilo.
+        if self.sticky(&id).is_some() {
+            self.prompt_sticky_note_edit();
+        }
+    }
+
+    /// Diálogo del hilo de la nota adhesiva elegida, con lo que ya tiene
+    /// precargado. Lo usa el doble clic, el menú contextual y la acción de editar.
+    pub(crate) fn prompt_sticky_note_edit(self: &Rc<Self>) {
+        let Some(id) = self.annot.selected.borrow().clone() else {
             return;
         };
-        self.prompt_note_text(Some((id, note)));
+        let Some(sticky) = self.sticky(&id) else {
+            return;
+        };
+        self.prompt_sticky_note(Some((id, sticky)));
+    }
+
+    /// Diálogo de la nota adhesiva: un editor para el comentario raíz, uno por
+    /// respuesta y el botón «Responder» que agrega la siguiente, con `Aceptar` y
+    /// `Cancelar`. Al aceptar, el hilo se guarda de una sola vez.
+    fn prompt_sticky_note(self: &Rc<Self>, editing: Option<(String, StickyNote)>) {
+        if self.doc.document.borrow().is_none() {
+            return;
+        }
+        let Some((target, sticky)) = editing else {
+            return;
+        };
+
+        let window = gtk::Window::builder()
+            .title("Nota adhesiva")
+            .modal(true)
+            .transient_for(&self.ui.window)
+            .default_width(460)
+            .build();
+
+        let root = gtk::TextView::builder()
+            .wrap_mode(gtk::WrapMode::Word)
+            .build();
+        accessible_label(&root, "Comentario de la nota");
+        let root_scroller = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .min_content_height(80)
+            .child(&root)
+            .build();
+        let root_text = sticky
+            .comments
+            .first()
+            .map(|comment| comment.text.as_str())
+            .unwrap_or_default();
+        root.buffer().set_text(root_text);
+
+        // Una respuesta por editor, en el orden del hilo, y el botón que agrega la
+        // siguiente al final de la lista.
+        let replies = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        let reply_views: Rc<RefCell<Vec<gtk::TextView>>> = Rc::new(RefCell::new(Vec::new()));
+        for comment in sticky.comments.iter().skip(1) {
+            append_sticky_reply(&replies, &reply_views, &comment.text);
+        }
+
+        let reply_button = gtk::Button::with_label("Responder");
+        reply_button.set_halign(gtk::Align::Start);
+        {
+            let replies = replies.clone();
+            let reply_views = reply_views.clone();
+            reply_button.connect_clicked(move |_| {
+                append_sticky_reply(&replies, &reply_views, "");
+                if let Some(view) = reply_views.borrow().last() {
+                    view.grab_focus();
+                }
+            });
+        }
+
+        let accept = gtk::Button::with_label("Aceptar");
+        accept.add_css_class("suggested-action");
+        let cancel = gtk::Button::with_label("Cancelar");
+
+        let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        buttons.set_halign(gtk::Align::End);
+        buttons.append(&cancel);
+        buttons.append(&accept);
+
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        content.set_margin_top(14);
+        content.set_margin_bottom(14);
+        content.set_margin_start(14);
+        content.set_margin_end(14);
+        content.append(&gtk::Label::new(Some("Comentario")));
+        content.append(&root_scroller);
+        content.append(&gtk::Label::new(Some("Respuestas")));
+        content.append(&replies);
+        content.append(&reply_button);
+        content.append(&buttons);
+        window.set_child(Some(&content));
+        window.set_default_widget(Some(&accept));
+
+        let weak = Rc::downgrade(self);
+        let window_ref = window.clone();
+        let target_ref = target.clone();
+        let root_ref = root.clone();
+        let reply_views_ref = reply_views.clone();
+        accept.connect_clicked(move |_| {
+            let mut texts = vec![text_view_text(&root_ref)];
+            for view in reply_views_ref.borrow().iter() {
+                texts.push(text_view_text(view));
+            }
+            Viewer::close_modal(&window_ref);
+            if let Some(viewer) = weak.upgrade() {
+                viewer.apply_sticky_comments(&target_ref, &texts);
+            }
+        });
+
+        let weak = Rc::downgrade(self);
+        let window_ref = window.clone();
+        let target_ref = target.clone();
+        cancel.connect_clicked(move |_| {
+            Viewer::close_modal(&window_ref);
+            if let Some(viewer) = weak.upgrade() {
+                viewer.discard_empty_sticky(&target_ref);
+            }
+        });
+
+        // Esc cierra el diálogo y descarta la nota vacía, como Cancelar.
+        let weak = Rc::downgrade(self);
+        let window_ref = window.clone();
+        let keys = gtk::EventControllerKey::new();
+        keys.connect_key_pressed(move |_, keyval, _, _| {
+            if keyval != gdk::Key::Escape {
+                return glib::Propagation::Proceed;
+            }
+            Viewer::close_modal(&window_ref);
+            if let Some(viewer) = weak.upgrade() {
+                viewer.discard_empty_sticky(&target);
+            }
+            glib::Propagation::Stop
+        });
+        window.add_controller(keys);
+
+        window.present();
     }
 
     /// El diálogo de la nota, en sus dos usos: insertar una nueva (`None`) o
@@ -3136,6 +3491,7 @@ impl Viewer {
         self.annot.image_drag.borrow_mut().take();
         self.annot.stroke_drag.borrow_mut().take();
         self.annot.stroke_tool.borrow_mut().take();
+        self.annot.sticky_tool.set(false);
         self.annot.hover.borrow_mut().take();
         *self.annot.selected.borrow_mut() = None;
         self.set_text_tool(false);
@@ -3250,7 +3606,8 @@ impl Viewer {
                 Annotation::Mark(_)
                 | Annotation::Image(_)
                 | Annotation::Ink(_)
-                | Annotation::Shape(_) => None,
+                | Annotation::Shape(_)
+                | Annotation::Sticky(_) => None,
             })
     }
 
@@ -3266,7 +3623,8 @@ impl Viewer {
                 Annotation::Mark(_)
                 | Annotation::Note(_)
                 | Annotation::Ink(_)
-                | Annotation::Shape(_) => None,
+                | Annotation::Shape(_)
+                | Annotation::Sticky(_) => None,
             })
     }
 
@@ -3300,15 +3658,13 @@ impl Viewer {
     }
 
     /// Habilita las acciones de la anotación elegida: editar solo si es una nota
-    /// de texto, borrar siempre que haya algo elegido.
+    /// de texto o una nota adhesiva, borrar siempre que haya algo elegido.
     fn refresh_edit_actions(&self) {
         let selected = self.annot.selected.borrow().clone();
         let is_note = selected.as_ref().is_some_and(|id| {
-            self.annot
-                .edits
-                .borrow()
-                .iter()
-                .any(|edit| edit.id == *id && matches!(edit.value, Annotation::Note(_)))
+            self.annot.edits.borrow().iter().any(|edit| {
+                edit.id == *id && matches!(edit.value, Annotation::Note(_) | Annotation::Sticky(_))
+            })
         });
         for (name, enabled) in [("note-edit", is_note), ("note-delete", selected.is_some())] {
             let action = self
@@ -3346,10 +3702,17 @@ impl Viewer {
     /// Empieza a arrastrar la nota que está bajo `(x, y)` y devuelve si el gesto
     /// es un arrastre de nota: si lo es, no hay selección de texto.
     pub(crate) fn note_drag_begin(&self, page: usize, x: f64, y: f64) -> bool {
-        let Some(id) = self.note_at(page, x, y) else {
+        let Some(id) = self
+            .note_at(page, x, y)
+            .or_else(|| self.sticky_at(page, x, y))
+        else {
             return false;
         };
-        let Some(origin) = self.note(id.as_str()).map(|note| note.at) else {
+        let Some(origin) = self
+            .note(&id)
+            .map(|note| note.at)
+            .or_else(|| self.sticky(&id).map(|sticky| sticky.at))
+        else {
             return false;
         };
         let zoom = self.view.zoom.get();
@@ -3472,7 +3835,16 @@ impl Viewer {
                 note.at = at;
                 true
             }
-            Annotation::Mark(_) | Annotation::Image(_) | Annotation::Ink(_) | Annotation::Shape(_) => false,
+            // Una nota adhesiva se mueve igual: cambia su icono de página.
+            Annotation::Sticky(sticky) => {
+                sticky.page = page;
+                sticky.at = at;
+                true
+            }
+            Annotation::Mark(_)
+            | Annotation::Image(_)
+            | Annotation::Ink(_)
+            | Annotation::Shape(_) => false,
         }
     }
 
@@ -3732,16 +4104,18 @@ impl Viewer {
         if self.input.hand_mode.get()
             || self.active_mark_tool().is_some()
             || self.text_tool_active()
+            || self.sticky_tool_active()
             || self.stroke_tool_active().is_some()
         {
             return;
         }
         // Las asas de la imagen elegida ganan sobre lo demás: son el tirador que
-        // se ve. Después la nota, que se apila encima de la imagen, y al final el
-        // interior de la imagen.
+        // se ve. Después la nota, que se apila encima de la imagen, la nota
+        // adhesiva y al final el interior de la imagen.
         let current = self
             .image_handle_cursor_hit(page, x, y)
             .or_else(|| self.note_cursor_hit(page, x, y))
+            .or_else(|| self.sticky_cursor_hit(page, x, y))
             .or_else(|| self.image_cursor_hit(page, x, y));
         let mut hover = self.annot.hover.borrow_mut();
         if *hover == current {
@@ -3817,6 +4191,12 @@ impl Viewer {
         })
     }
 
+    /// Nota adhesiva bajo el puntero, con el cursor que le corresponde: es un
+    /// icono que se abre con un clic.
+    fn sticky_cursor_hit(&self, page: usize, x: f64, y: f64) -> Option<(String, &'static str)> {
+        self.sticky_at(page, x, y).map(|id| (id, "pointer"))
+    }
+
     /// Pone el cursor en todas las capas de la página. El lienzo de la selección
     /// es el widget que recibe el puntero y heredar el cursor del `Overlay` no se
     /// refresca mientras el puntero sigue dentro: hay que fijarlo en el lienzo.
@@ -3862,8 +4242,13 @@ impl Viewer {
 
         // Sólo una nota tiene texto que editar; un marcado solo se borra.
         let is_note = self.note(&id).is_some();
-        if is_note {
-            let edit = context_menu_button("Editar texto");
+        let is_sticky = self.sticky(&id).is_some();
+        if is_note || is_sticky {
+            let edit = context_menu_button(if is_sticky {
+                "Editar comentario"
+            } else {
+                "Editar texto"
+            });
             {
                 let weak = Rc::downgrade(self);
                 let popover_ref = popover.downgrade();
@@ -4006,6 +4391,11 @@ impl Viewer {
                 }
                 Annotation::Shape(shape) => {
                     draw_shape(context, shape, size, rotation, zoom);
+                    continue;
+                }
+                Annotation::Sticky(sticky) => {
+                    let chosen = selected.as_deref() == Some(edit.id.as_str());
+                    draw_sticky(context, sticky, size, rotation, zoom, chosen);
                     continue;
                 }
             };
@@ -4198,6 +4588,10 @@ impl Viewer {
         }
         if self.text_tool_active() {
             self.set_text_tool(false);
+            return glib::Propagation::Stop;
+        }
+        if self.sticky_tool_active() {
+            self.set_sticky_tool(false);
             return glib::Propagation::Stop;
         }
         if self.input.hand_mode.get() {
@@ -4909,6 +5303,13 @@ impl Viewer {
                 viewer.insert_text_note(page, x, y);
                 return;
             }
+            // La nota adhesiva también se coloca con un clic: el gesto entero es
+            // ese clic, que crea el icono y abre su diálogo.
+            if viewer.sticky_tool_active() {
+                gesture.set_state(gtk::EventSequenceState::Denied);
+                viewer.start_sticky_note(page, x, y);
+                return;
+            }
             // Con el lápiz o una forma armada el arrastre entero es el trazo, y
             // va antes que la selección de texto: así dibujar nunca selecciona.
             if viewer.stroke_tool_active().is_some() {
@@ -4981,11 +5382,12 @@ impl Viewer {
                 return;
             }
             // La nota gana sobre lo demás por ser lo más chico y lo que se edita;
-            // después la imagen, que tapa lo que tenga debajo, y al final el
-            // marcado y el trazo.
+            // después la nota adhesiva, la imagen, que tapa lo que tenga debajo, y
+            // al final el marcado y el trazo.
             let hit = viewer
                 .note_at(page, x, y)
                 .map(|id| (id, HitKind::Note))
+                .or_else(|| viewer.sticky_at(page, x, y).map(|id| (id, HitKind::Sticky)))
                 .or_else(|| viewer.image_at(page, x, y).map(|id| (id, HitKind::Image)))
                 .or_else(|| viewer.mark_at(page, x, y).map(|id| (id, HitKind::Mark)))
                 .or_else(|| viewer.stroke_at(page, x, y).map(|id| (id, HitKind::Stroke)));
@@ -5001,8 +5403,12 @@ impl Viewer {
                     viewer.select_annotation(Some(id));
                     // El doble clic abre el editor solo para una nota y fuera de
                     // las herramientas de marcado, donde el clic arma un marcado.
-                    if kind == HitKind::Note && presses >= 2 && viewer.active_mark_tool().is_none() {
-                        viewer.prompt_note_edit();
+                    if presses >= 2 && viewer.active_mark_tool().is_none() {
+                        match kind {
+                            HitKind::Note => viewer.prompt_note_edit(),
+                            HitKind::Sticky => viewer.prompt_sticky_note_edit(),
+                            HitKind::Image | HitKind::Mark | HitKind::Stroke => {}
+                        }
                     }
                 }
                 (gdk::BUTTON_PRIMARY, None) => {
@@ -7405,6 +7811,140 @@ fn draw_image_selection(
     let _ = context.restore();
 }
 
+/// Agrega una respuesta al diálogo de la nota adhesiva: su etiqueta y un editor
+/// con el texto que ya tenía. Los editores se guardan en `views` para leerlos al
+/// aceptar, en el mismo orden en que se ven.
+fn append_sticky_reply(
+    replies: &gtk::Box,
+    views: &Rc<RefCell<Vec<gtk::TextView>>>,
+    text: &str,
+) {
+    let label = gtk::Label::new(Some("Respuesta"));
+    label.set_xalign(0.0);
+    let view = gtk::TextView::builder()
+        .wrap_mode(gtk::WrapMode::Word)
+        .build();
+    accessible_label(&view, "Respuesta de la nota");
+    view.buffer().set_text(text);
+    let frame = gtk::Frame::new(None);
+    frame.set_child(Some(&view));
+    let row = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    row.append(&label);
+    row.append(&frame);
+    replies.append(&row);
+    views.borrow_mut().push(view);
+}
+
+/// Texto completo de un editor del diálogo.
+fn text_view_text(view: &gtk::TextView) -> String {
+    let buffer = view.buffer();
+    buffer
+        .text(&buffer.start_iter(), &buffer.end_iter(), true)
+        .to_string()
+}
+
+/// Pinta el icono de una nota adhesiva: el cuadrado del color de la nota con la
+/// esquina superior derecha doblada y, si tiene respuestas, la cuenta en su
+/// esquinita. La nota elegida lleva el mismo contorno punteado que las demás.
+fn draw_sticky(
+    context: &cairo::Context,
+    sticky: &StickyNote,
+    page: (f64, f64),
+    rotation: i32,
+    zoom: f64,
+    selected: bool,
+) {
+    let rect = sticky.rect();
+    let corners = [
+        forward_rotation((rect.0, rect.1), page, rotation),
+        forward_rotation((rect.2, rect.1), page, rotation),
+        forward_rotation((rect.2, rect.3), page, rotation),
+        forward_rotation((rect.0, rect.3), page, rotation),
+    ];
+    let fold = (rect.2 - rect.0) * 0.35;
+    let folded = [
+        forward_rotation((rect.2, rect.1), page, rotation),
+        forward_rotation((rect.2 - fold, rect.1), page, rotation),
+        forward_rotation((rect.2, rect.1 + fold), page, rotation),
+    ];
+
+    let _ = context.save();
+    // La nota: un cuadrado del color elegido, acostado con la página.
+    context.move_to(corners[0].0 * zoom, corners[0].1 * zoom);
+    for corner in &corners[1..] {
+        context.line_to(corner.0 * zoom, corner.1 * zoom);
+    }
+    context.close_path();
+    context.set_source_rgba(sticky.color[0], sticky.color[1], sticky.color[2], 1.0);
+    let _ = context.fill();
+
+    // La esquina doblada: un triángulo más oscuro sobre el vértice superior
+    // derecho, que es lo que hace que el cuadrado se lea como una nota.
+    let shade = 0.72;
+    context.move_to(folded[0].0 * zoom, folded[0].1 * zoom);
+    for corner in &folded[1..] {
+        context.line_to(corner.0 * zoom, corner.1 * zoom);
+    }
+    context.close_path();
+    context.set_source_rgba(
+        sticky.color[0] * shade,
+        sticky.color[1] * shade,
+        sticky.color[2] * shade,
+        1.0,
+    );
+    let _ = context.fill();
+
+    // Contorno tenue: separa el icono del papel y de una página de color parecido.
+    context.set_line_width((0.8 * zoom).max(1.0));
+    context.set_source_rgba(0.0, 0.0, 0.0, 0.45);
+    context.move_to(corners[0].0 * zoom, corners[0].1 * zoom);
+    for corner in &corners[1..] {
+        context.line_to(corner.0 * zoom, corner.1 * zoom);
+    }
+    context.close_path();
+    let _ = context.stroke();
+
+    // La cuenta de respuestas, en la esquina inferior derecha y en el color que
+    // más contrasta con el de la nota.
+    let replies = sticky.replies();
+    if replies > 0 {
+        let layout = pangocairo::functions::create_layout(context);
+        pangocairo::functions::context_set_resolution(&layout.context(), 72.0);
+        let mut font = pango::FontDescription::new();
+        font.set_family("Sans");
+        font.set_weight(pango::Weight::Bold);
+        let size = (STICKY_SIDE * 0.38 * zoom).max(4.0);
+        font.set_absolute_size(size * f64::from(pango::SCALE));
+        layout.set_font_description(Some(&font));
+        layout.set_text(&replies.to_string());
+        let (text_width, text_height) = layout.pixel_size();
+        let luminance =
+            0.299 * sticky.color[0] + 0.587 * sticky.color[1] + 0.114 * sticky.color[2];
+        let ink = if luminance > 0.55 { 0.0 } else { 1.0 };
+        context.set_source_rgba(ink, ink, ink, 0.9);
+        let corner = corners[2];
+        context.move_to(
+            corner.0 * zoom - f64::from(text_width) - 1.0 * zoom,
+            corner.1 * zoom - f64::from(text_height) - 0.5 * zoom,
+        );
+        pangocairo::functions::show_layout(context, &layout);
+    }
+
+    if selected {
+        let dash = (4.0 * zoom).max(2.0);
+        context.set_dash(&[dash, dash * 0.75], 0.0);
+        context.set_line_width((1.0 * zoom).max(1.0));
+        context.set_source_rgba(0.20, 0.45, 0.95, 0.9);
+        context.move_to(corners[0].0 * zoom, corners[0].1 * zoom);
+        for corner in &corners[1..] {
+            context.line_to(corner.0 * zoom, corner.1 * zoom);
+        }
+        context.close_path();
+        let _ = context.stroke();
+    }
+    let _ = context.restore();
+}
+
 /// Pinta una nota con pangocairo: cada tramo con su fuente y su color, escalado
 /// por el zoom y girado con la vista como el resto de la capa. La nota elegida
 /// lleva además un contorno punteado, que es lo que dice cuál responde a `Supr`
@@ -7723,6 +8263,7 @@ fn build_stroke_menu() -> (
     [gtk::Button; 5],
     gtk::SpinButton,
     gtk::ColorDialogButton,
+    gtk::Button,
 ) {
     let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
     content.set_margin_top(8);
@@ -7779,6 +8320,15 @@ fn build_stroke_menu() -> (
     content.append(&tools);
     content.append(&settings);
 
+    // La nota adhesiva comparte este popover: no es un trazo, pero también se
+    // coloca con un clic sobre la página y es otra forma de anotar.
+    let sticky = gtk::Button::with_label("Nota adhesiva");
+    sticky.add_css_class("flat");
+    sticky.set_tooltip_text(Some("Nota adhesiva (Ctrl+Alt+N)"));
+    sticky.set_halign(gtk::Align::Start);
+    accessible_label(&sticky, "Insertar una nota adhesiva en la página");
+    content.append(&sticky);
+
     let popover = gtk::Popover::new();
     popover.set_child(Some(&content));
 
@@ -7790,7 +8340,7 @@ fn build_stroke_menu() -> (
         .build();
     accessible_label(&button, "Dibujar y formas");
 
-    (button, buttons, width, color)
+    (button, buttons, width, color, sticky)
 }
 
 fn toolbar_gap(width: i32) -> gtk::Box {
