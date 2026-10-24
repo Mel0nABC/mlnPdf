@@ -1069,6 +1069,28 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             Some((note_id.clone(), "move")),
             "la banda exterior del borde también muestra el cursor de mover"
         );
+        // La tolerancia del clic coincide con esa banda: donde el cursor dice
+        // mover, el clic agarra la nota; un poco más allá, no.
+        assert_eq!(
+            viewer.note_at(
+                0,
+                current_note.at.0 - 2.0,
+                current_note.at.1 + current_note.height / 2.0
+            )
+            .as_deref(),
+            Some(note_id.as_str()),
+            "el borde exterior sigue siendo clicable"
+        );
+        assert!(
+            viewer
+                .note_at(
+                    0,
+                    current_note.at.0 - 4.0,
+                    current_note.at.1 + current_note.height / 2.0
+                )
+                .is_none(),
+            "más allá de la tolerancia ya no es la nota"
+        );
         viewer.update_note_cursor(
             0,
             current_note.at.0 + current_note.width / 2.0,

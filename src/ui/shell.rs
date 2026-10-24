@@ -56,10 +56,15 @@ pub(crate) const HIGHLIGHT_ALPHA: f64 = 0.4;
 /// into the four-arrow move cursor, measured towards the inside of the note.
 const NOTE_CURSOR_BORDER: f64 = 5.0;
 
-/// How far outside the note rectangle the move cursor still applies. El trazo
-/// del contorno queda a caballo del borde y el puntero suele apoyarse un poco
-/// afuera.
-const NOTE_CURSOR_REACH: f64 = 12.0;
+/// How far outside the note rectangle the move cursor still applies: just the
+/// stroke of the selection box, which straddles the border. Más allá el icono
+/// prometería una zona que el clic no agarra.
+const NOTE_CURSOR_REACH: f64 = 2.0;
+
+/// Tolerance of the click/drag hit test around the note, in logical pixels. It
+/// matches the outer band of the move cursor, so clicking where the cursor says
+/// "move" selects and drags the note.
+const NOTE_HIT_TOLERANCE: f64 = 2.0;
 
 /// Width of the thumbnails in the side panel, in logical pixels.
 const THUMB_WIDTH: i32 = 120;
@@ -2636,9 +2641,17 @@ impl Viewer {
     /// última dibujada gana.
     pub(crate) fn note_at(&self, page: usize, x: f64, y: f64) -> Option<String> {
         let point = self.view_to_pdf(page, x, y)?;
+        let zoom = self.view.zoom.get();
+        let tolerance = if zoom > 0.0 {
+            NOTE_HIT_TOLERANCE / zoom
+        } else {
+            0.0
+        };
         let edits = self.annot.edits.borrow();
         edits.iter().rev().find_map(|edit| match &edit.value {
-            Annotation::Note(note) if note.page == page && note_contains(note, point) => {
+            Annotation::Note(note)
+                if note.page == page && note_contains(note, point, tolerance) =>
+            {
                 Some(edit.id.clone())
             }
             _ => None,
@@ -5728,9 +5741,12 @@ fn changed_pages(before: &[Edit], after: &[Edit]) -> Vec<usize> {
 
 /// True cuando `point`, en puntos PDF con el origen arriba a la izquierda, cae
 /// dentro del rectángulo de la nota.
-fn note_contains(note: &TextNote, point: (f64, f64)) -> bool {
+fn note_contains(note: &TextNote, point: (f64, f64), tolerance: f64) -> bool {
     let (x, y) = point;
-    x >= note.at.0 && x <= note.at.0 + note.width && y >= note.at.1 && y <= note.at.1 + note.height
+    x >= note.at.0 - tolerance
+        && x <= note.at.0 + note.width + tolerance
+        && y >= note.at.1 - tolerance
+        && y <= note.at.1 + note.height + tolerance
 }
 
 /// Descripción de Pango de la fuente de la nota, escalada por `zoom`. El tamaño
@@ -6580,46 +6596,42 @@ mod tests {
         let rect = note_view_rect(&note, (200.0, 200.0), 0);
 
         assert_eq!(
-            cursor_in_note_band(rect, (60.0, 20.0), 5.0, 12.0),
+            cursor_in_note_band(rect, (60.0, 20.0), 5.0, 2.0),
             Some("text")
         );
         assert_eq!(
-            cursor_in_note_band(rect, (12.0, 20.0), 5.0, 12.0),
+            cursor_in_note_band(rect, (12.0, 20.0), 5.0, 2.0),
             Some("move")
         );
         assert_eq!(
-            cursor_in_note_band(rect, (60.0, 29.0), 5.0, 12.0),
+            cursor_in_note_band(rect, (60.0, 29.0), 5.0, 2.0),
             Some("move")
         );
-        // La banda alcanza 2 y 6 px afuera, donde cae el trazo y el puntero.
+        // La banda alcanza 2 px afuera, donde cae el trazo; más lejos no.
         assert_eq!(
-            cursor_in_note_band(rect, (8.0, 20.0), 5.0, 12.0),
+            cursor_in_note_band(rect, (8.0, 20.0), 5.0, 2.0),
             Some("move")
         );
-        assert_eq!(
-            cursor_in_note_band(rect, (4.0, 20.0), 5.0, 12.0),
-            Some("move")
-        );
-        assert_eq!(cursor_in_note_band(rect, (-5.0, 20.0), 5.0, 12.0), None);
+        assert_eq!(cursor_in_note_band(rect, (4.0, 20.0), 5.0, 2.0), None);
 
-        // A 200 % la banda sigue midiendo 5 px hacia adentro y 12 hacia afuera.
+        // A 200 % la banda sigue midiendo 5 px hacia adentro y 2 hacia afuera.
         assert_eq!(
-            cursor_in_note_band(rect, (60.0, 20.0), 2.5, 6.0),
+            cursor_in_note_band(rect, (60.0, 20.0), 2.5, 1.0),
             Some("text")
         );
         assert_eq!(
-            cursor_in_note_band(rect, (12.0, 20.0), 2.5, 6.0),
+            cursor_in_note_band(rect, (12.0, 20.0), 2.5, 1.0),
             Some("move")
         );
         assert_eq!(
-            cursor_in_note_band(rect, (16.0, 20.0), 2.5, 6.0),
+            cursor_in_note_band(rect, (16.0, 20.0), 2.5, 1.0),
             Some("text")
         );
         assert_eq!(
-            cursor_in_note_band(rect, (6.0, 20.0), 2.5, 6.0),
+            cursor_in_note_band(rect, (9.5, 20.0), 2.5, 1.0),
             Some("move")
         );
-        assert_eq!(cursor_in_note_band(rect, (2.0, 20.0), 2.5, 6.0), None);
+        assert_eq!(cursor_in_note_band(rect, (8.5, 20.0), 2.5, 1.0), None);
     }
 
     #[test]
@@ -6634,11 +6646,11 @@ mod tests {
         // Con /Rotate 90 la caja va de (70,10) a (90,110) en la vista.
         let rect = note_view_rect(&note, (200.0, 100.0), 90);
         assert_eq!(
-            cursor_in_note_band(rect, (80.0, 60.0), 5.0, 12.0),
+            cursor_in_note_band(rect, (80.0, 60.0), 5.0, 2.0),
             Some("text")
         );
         assert_eq!(
-            cursor_in_note_band(rect, (71.0, 60.0), 5.0, 12.0),
+            cursor_in_note_band(rect, (71.0, 60.0), 5.0, 2.0),
             Some("move")
         );
     }
