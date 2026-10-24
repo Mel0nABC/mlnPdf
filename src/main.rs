@@ -213,8 +213,9 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         );
         assert_eq!(viewer.ui.title.label(), WINDOW_TITLE, "no document, no title");
 
-        // The toolbar keeps the search, the page controls and the zoom in one
-        // group, a fixed gap apart, instead of spreading them to the edges.
+        // La barra deja el zoom y las herramientas a la izquierda, un hueco fijo
+        // aparte de la gestión de páginas, y la búsqueda pegada a su derecha, en
+        // vez de repartirlo todo hasta los bordes.
         let controls = viewer.ui.chrome[1]
             .first_child()
             .expect("the toolbar holds the control group");
@@ -229,27 +230,19 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         };
         assert_eq!(
             children.len(),
-            11,
-            "búsqueda, hueco, páginas, hueco, zoom, subrayar, resaltar, tachar, insertar texto, \
-             insertar imagen y dibujar"
+            10,
+            "zoom, subrayar, resaltar, tachar, insertar texto, insertar imagen, dibujar, hueco, \
+             páginas y búsqueda"
         );
-        for gap in [&children[1], &children[3]] {
-            assert_eq!(
-                gap.size_request().0,
-                TOOLBAR_GAP,
-                "cada separación pide los {TOOLBAR_GAP} px"
-            );
-        }
-        assert_ne!(
-            children[2].size_request().0,
-            TOOLBAR_GAP,
-            "el bloque de páginas no es una separación"
+        assert!(
+            !children[0].is::<gtk::ToggleButton>(),
+            "el bloque de zoom abre la barra y no es una herramienta"
         );
         for (index, name) in [
-            (5, "el subrayado"),
-            (6, "el resaltado"),
-            (7, "el tachado"),
-            (8, "insertar texto"),
+            (1, "el subrayado"),
+            (2, "el resaltado"),
+            (3, "el tachado"),
+            (4, "insertar texto"),
         ] {
             assert!(
                 children[index].is::<gtk::ToggleButton>(),
@@ -257,7 +250,7 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             );
         }
         assert_eq!(
-            children[7].tooltip_text().as_deref(),
+            children[3].tooltip_text().as_deref(),
             Some("Tachar (Ctrl+Alt+U)"),
             "la herramienta de tachar se anuncia con su atajo"
         );
@@ -265,7 +258,7 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         // Pango dibuja la línea con el grosor de la fuente y apenas se ve, así que
         // el icono se pinta a mano en un área de dibujo del tamaño del botón.
         assert!(
-            children[7]
+            children[3]
                 .clone()
                 .downcast::<gtk::ToggleButton>()
                 .expect("el tachado es un ToggleButton")
@@ -274,26 +267,67 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             "el icono de tachar es un área de dibujo, no una etiqueta con markup"
         );
         assert_eq!(
-            children[8].tooltip_text().as_deref(),
+            children[4].tooltip_text().as_deref(),
             Some("Insertar texto (Ctrl+T)"),
             "la herramienta de texto se anuncia con su atajo"
         );
         // Insertar imagen no es un modo que quede armado: es un botón normal con
         // icono que abre el selector de archivos en el acto.
         assert!(
-            !children[9].is::<gtk::ToggleButton>() && children[9].is::<gtk::Button>(),
+            !children[5].is::<gtk::ToggleButton>() && children[5].is::<gtk::Button>(),
             "insertar imagen es un botón normal, no una herramienta armada"
         );
         assert_eq!(
-            children[9].tooltip_text().as_deref(),
+            children[5].tooltip_text().as_deref(),
             Some("Insertar imagen (Ctrl+Shift+I)"),
             "el botón de imagen se anuncia con su atajo"
+        );
+        // La separación es una sola, entre las herramientas y las páginas, y la
+        // pide el layout, no el espacio que sobra.
+        assert_eq!(
+            children[7].size_request().0,
+            TOOLBAR_GAP,
+            "la única separación pide los {TOOLBAR_GAP} px"
+        );
+        assert_ne!(
+            children[8].size_request().0,
+            TOOLBAR_GAP,
+            "el bloque de páginas no es una separación"
+        );
+        // La búsqueda queda pegada al lado derecho de las páginas: su bloque
+        // arranca con el icono y sigue el campo, sin hueco entre medio.
+        let search_box = children[9]
+            .clone()
+            .downcast::<gtk::Box>()
+            .expect("la búsqueda es su propio bloque al final de la barra");
+        let search_icon = search_box
+            .first_child()
+            .expect("el bloque de búsqueda empieza con su icono");
+        assert_eq!(
+            search_icon
+                .clone()
+                .downcast::<gtk::Image>()
+                .ok()
+                .and_then(|icon| icon.icon_name())
+                .as_deref(),
+            Some("system-search-symbolic"),
+            "el icono de búsqueda sigue a la izquierda del campo"
+        );
+        assert_eq!(
+            search_icon.next_sibling(),
+            Some(viewer.ui.search_entry.clone().upcast::<gtk::Widget>()),
+            "el campo de búsqueda va justo después del icono"
+        );
+        assert_eq!(
+            viewer.ui.search_entry.width_chars(),
+            24,
+            "el campo de búsqueda es más largo que antes (18 caracteres)"
         );
 
         // S3 y S4: el botón de dibujar abre un popover con las cinco herramientas,
         // el grosor libre en puntos y el color. Elegir una herramienta la arma y
         // el popover se cierra; el grosor y el color se recuerdan.
-        let stroke_menu = children[10]
+        let stroke_menu = children[6]
             .clone()
             .downcast::<gtk::MenuButton>()
             .expect("el botón de dibujar es un MenuButton con su popover");

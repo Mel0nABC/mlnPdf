@@ -131,8 +131,8 @@ const IMAGE_HANDLE_SIZE: f64 = 7.0;
 /// Width of the thumbnails in the side panel, in logical pixels.
 const THUMB_WIDTH: i32 = 120;
 
-/// Distance between the page controls and the search and zoom groups in the
-/// toolbar, in logical pixels.
+/// Distancia en píxeles lógicos entre la gestión de páginas y el grupo de zoom y
+/// herramientas de la barra superior.
 pub(crate) const TOOLBAR_GAP: i32 = 100;
 
 /// Time between two fling frames: a 60 Hz redraw, the same cadence as the
@@ -757,7 +757,7 @@ impl Viewer {
         bottom_nav.root.set_margin_bottom(6);
 
         let search_entry = gtk::Entry::builder()
-            .width_chars(18)
+            .width_chars(24)
             .placeholder_text("Buscar")
             .tooltip_text("Buscar en el documento (Ctrl+F)")
             .build();
@@ -770,16 +770,12 @@ impl Viewer {
         search_box.append(&search_status);
         accessible_label(&search_entry, "Buscar en el documento");
 
-        // Search and zoom flank the page controls, one fixed gap away on each
-        // side, so the three read as a single group instead of being pushed to
-        // the edges of the bar by the free space.
+        // El zoom y las herramientas abren la barra; un hueco fijo los separa de
+        // la gestión de páginas y la búsqueda queda pegada a su derecha, así que
+        // los dos grupos se leen como un bloque y no se reparten hasta los bordes.
         let controls = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         controls.set_halign(gtk::Align::Center);
         controls.set_hexpand(true);
-        controls.append(&search_box);
-        controls.append(&toolbar_gap(TOOLBAR_GAP));
-        controls.append(&toolbar_nav.root);
-        controls.append(&toolbar_gap(TOOLBAR_GAP));
         controls.append(&zoom_box);
         controls.append(&tools[0].button);
         controls.append(&tools[1].button);
@@ -787,6 +783,9 @@ impl Viewer {
         controls.append(&text_button);
         controls.append(&image_button);
         controls.append(&stroke_button);
+        controls.append(&toolbar_gap(TOOLBAR_GAP));
+        controls.append(&toolbar_nav.root);
+        controls.append(&search_box);
 
         // Secondary toolbar: the group stays centred, whatever the window width.
         let toolbar = gtk::Box::builder()
@@ -9828,8 +9827,8 @@ fn thumbnail_row_page(row: &gtk::Widget) -> Option<usize> {
     number.parse::<usize>().ok()?.checked_sub(1)
 }
 
-/// Fixed-width spacer for the toolbar: the two gaps that separate the search,
-/// the page controls and the zoom, so the distance between them is a number of
+/// Fixed-width spacer for the toolbar: the gap that separates the zoom and the
+/// tools from the page controls, so the distance between them is a number of
 /// the layout and not of the leftover space.
 /// Lo que distingue a una herramienta de marcado de la otra al construirla.
 struct MarkToolSpec {
