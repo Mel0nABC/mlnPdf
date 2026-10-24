@@ -157,10 +157,21 @@ fn note_dictionary(note: &TextNote, page: PageBox, id: &str) -> Object {
         "Rect",
         Object::Array(vec![real(rect.0), real(rect.1), real(rect.2), real(rect.3)]),
     );
-    dictionary.set("Contents", contents(&note.text));
+    dictionary.set("Contents", contents(&note.text()));
+    // Una nota `/FreeText` solo tiene un `/DA`, así que el primer tramo decide
+    // la fuente y el color con los que el lector pinta todo el texto.
+    let fallback = FontChoice {
+        family: "Sans".to_string(),
+        size: 12.0,
+        bold: false,
+        italic: false,
+    };
     dictionary.set(
         "DA",
-        Object::String(da_string(&note.font).into_bytes(), lopdf::StringFormat::Literal),
+        Object::String(
+            da_string(note.font().unwrap_or(&fallback), note.color()).into_bytes(),
+            lopdf::StringFormat::Literal,
+        ),
     );
     // Print flag without a border and left-aligned text: la nota es texto suelto
     // sobre la página, no una caja de anotación.
@@ -178,15 +189,22 @@ fn note_dictionary(note: &TextNote, page: PageBox, id: &str) -> Object {
 }
 
 /// `/DA` de la nota: la fuente base en notación abreviada, su tamaño en puntos
-/// con un decimal y el color negro.
-fn da_string(font: &FontChoice) -> String {
+/// con un decimal y el color del primer tramo como operador `rg`.
+fn da_string(font: &FontChoice, color: [f64; 3]) -> String {
     let size = if font.size.is_finite() && font.size > 0.0 {
         font.size
     } else {
         // Un tamaño inválido no puede dejar la nota sin fuente.
         12.0
     };
-    format!("{} {size:.1} Tf 0 g", font.da_name())
+    let [red, green, blue] = color.map(|component| {
+        if component.is_finite() {
+            component.clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    });
+    format!("{} {size:.1} Tf {red:.3} {green:.3} {blue:.3} rg", font.da_name())
 }
 
 /// `/Contents`: literal PDF cuando el texto es ASCII y hexadecimal UTF-16BE con
@@ -443,7 +461,7 @@ fn temporary_path(target: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::annotation::TextMark;
+    use crate::engine::annotation::{TextMark, TextRun};
     use lopdf::{Stream, dictionary};
 
     /// Directorio de trabajo de las pruebas, dentro del proyecto.
@@ -918,19 +936,22 @@ mod tests {
         let target = scratch("note-painted-out.pdf");
         std::fs::write(&source, fixture([0.0, 0.0, 300.0, 200.0], 0)).expect("escribir el PDF");
 
-        let note = TextNote {
-            page: 0,
-            at: (40.0, 60.0),
-            width: 120.0,
-            height: 18.0,
-            text: "Texto insertado".to_string(),
-            font: FontChoice {
-                family: "Sans".to_string(),
-                size: 14.0,
-                bold: false,
-                italic: false,
-            },
-        };
+        let note = TextNote::new(
+            0,
+            (40.0, 60.0),
+            120.0,
+            18.0,
+            vec![TextRun {
+                text: "Texto insertado".to_string(),
+                font: FontChoice {
+                    family: "Sans".to_string(),
+                    size: 14.0,
+                    bold: false,
+                    italic: false,
+                },
+                color: [0.0, 0.0, 0.0],
+            }],
+        );
 
         write_fresh(&source, &target, &[Annotation::Note(note)]).expect("escribir la nota");
 
@@ -1137,32 +1158,38 @@ mod tests {
 
         // Una nota con acentos y paréntesis (cadena hexadecimal UTF-16BE) y otra
         // sólo ASCII (literal), para cubrir las dos formas de `/Contents`.
-        let accented = TextNote {
-            page: 0,
-            at: (20.0, 10.0),
-            width: 60.0,
-            height: 15.0,
-            text: "Nota (con) paréntesis \\ y acentos: ñandú".to_string(),
-            font: FontChoice {
-                family: "Noto Sans Mono".to_string(),
-                size: 12.0,
-                bold: true,
-                italic: false,
-            },
-        };
-        let plain = TextNote {
-            page: 0,
-            at: (100.0, 50.0),
-            width: 50.0,
-            height: 12.0,
-            text: "Cita (texto) sin acentos".to_string(),
-            font: FontChoice {
-                family: "Liberation Serif".to_string(),
-                size: 10.0,
-                bold: false,
-                italic: true,
-            },
-        };
+        let accented = TextNote::new(
+            0,
+            (20.0, 10.0),
+            60.0,
+            15.0,
+            vec![TextRun {
+                text: "Nota (con) paréntesis \\ y acentos: ñandú".to_string(),
+                font: FontChoice {
+                    family: "Noto Sans Mono".to_string(),
+                    size: 12.0,
+                    bold: true,
+                    italic: false,
+                },
+                color: [0.0, 0.0, 0.0],
+            }],
+        );
+        let plain = TextNote::new(
+            0,
+            (100.0, 50.0),
+            50.0,
+            12.0,
+            vec![TextRun {
+                text: "Cita (texto) sin acentos".to_string(),
+                font: FontChoice {
+                    family: "Liberation Serif".to_string(),
+                    size: 10.0,
+                    bold: false,
+                    italic: true,
+                },
+                color: [0.0, 0.0, 0.0],
+            }],
+        );
 
         let written = write_fresh(
             &source,
@@ -1195,10 +1222,10 @@ mod tests {
             vec![20.0, 75.0, 80.0, 90.0],
             "el rectángulo va de la esquina superior izquierda a la opuesta, en espacio de usuario"
         );
-        assert_eq!(contents_text(note), accented.text, "el texto viaja entero");
+        assert_eq!(contents_text(note), accented.text(), "el texto viaja entero");
         assert_eq!(
             text_of(note, b"DA"),
-            "CoBo 12.0 Tf 0 g",
+            "CoBo 12.0 Tf 0.000 0.000 0.000 rg",
             "la fuente base abreviada, su tamaño y el color negro"
         );
         assert!(
@@ -1216,15 +1243,84 @@ mod tests {
             "el texto va alineado a la izquierda"
         );
 
-        assert_eq!(contents_text(annotations[1]), plain.text);
+        assert_eq!(contents_text(annotations[1]), plain.text());
         assert_eq!(
             text_of(annotations[1], b"DA"),
-            "TiIt 10.0 Tf 0 g"
+            "TiIt 10.0 Tf 0.000 0.000 0.000 rg"
         );
 
         let bytes = std::fs::read(&target).expect("leer el resultado");
         let document = poppler::Document::from_data(&bytes, None).expect("poppler abre el PDF");
         assert_eq!(document.n_pages(), 1, "el PDF sigue siendo válido para poppler");
+    }
+
+    #[test]
+    fn a_colored_note_writes_its_color_in_the_default_appearance() {
+        let source = scratch("note-color.pdf");
+        let target = scratch("note-color-out.pdf");
+        std::fs::write(&source, fixture([0.0, 0.0, 200.0, 100.0], 0)).expect("escribir el PDF");
+
+        let colored = TextNote::new(
+            0,
+            (20.0, 10.0),
+            60.0,
+            15.0,
+            vec![TextRun {
+                text: "Rojo".to_string(),
+                font: FontChoice {
+                    family: "DejaVu Sans".to_string(),
+                    size: 12.0,
+                    bold: true,
+                    italic: false,
+                },
+                color: [1.0, 0.25, 0.0],
+            }],
+        );
+        // Un color fuera del rango válido se recorta: `/DA` solo admite 0..=1.
+        let clamped = TextNote::new(
+            0,
+            (100.0, 50.0),
+            40.0,
+            12.0,
+            vec![TextRun {
+                text: "Fuera".to_string(),
+                font: FontChoice {
+                    family: "DejaVu Sans".to_string(),
+                    size: 10.0,
+                    bold: false,
+                    italic: false,
+                },
+                color: [-0.5, 0.5, 2.0],
+            }],
+        );
+
+        write_fresh(
+            &source,
+            &target,
+            &[Annotation::Note(colored), Annotation::Note(clamped)],
+        )
+        .expect("las notas con color tienen que escribirse");
+
+        let document = Document::load(&target).expect("el archivo escrito tiene que cargarse");
+        let page_id = *document.get_pages().get(&1).expect("página 1");
+        let annotations = document.get_page_annotations(page_id).expect("anotaciones");
+        assert_eq!(annotations.len(), 2);
+
+        assert_eq!(
+            contents_text(annotations[0]),
+            "Rojo",
+            "el texto no cambia al elegir color"
+        );
+        assert_eq!(
+            text_of(annotations[0], b"DA"),
+            "HeBo 12.0 Tf 1.000 0.250 0.000 rg",
+            "el color del primer tramo viaja en /DA"
+        );
+        assert_eq!(
+            text_of(annotations[1], b"DA"),
+            "Helv 10.0 Tf 0.000 0.500 1.000 rg",
+            "las componentes fuera de rango se recortan"
+        );
     }
 
     /// Anotación propia con su identificador, como la escribe el visor: el `/NM`
@@ -1235,19 +1331,22 @@ mod tests {
 
     /// Nota de texto con un recuadro conocido, para las pruebas de edición.
     fn note_with(text: &str) -> Annotation {
-        Annotation::Note(TextNote {
-            page: 0,
-            at: (20.0, 10.0),
-            width: 60.0,
-            height: 15.0,
-            text: text.to_string(),
-            font: FontChoice {
-                family: "Sans".to_string(),
-                size: 12.0,
-                bold: false,
-                italic: false,
-            },
-        })
+        Annotation::Note(TextNote::new(
+            0,
+            (20.0, 10.0),
+            60.0,
+            15.0,
+            vec![TextRun {
+                text: text.to_string(),
+                font: FontChoice {
+                    family: "Sans".to_string(),
+                    size: 12.0,
+                    bold: false,
+                    italic: false,
+                },
+                color: [0.0, 0.0, 0.0],
+            }],
+        ))
     }
 
     /// Resumen de las anotaciones de la página 1: `(subtype, /NM, texto)`.

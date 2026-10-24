@@ -86,8 +86,74 @@ pub fn widest_row_width(sizes: &[(f64, f64)], spread: bool, cover_alone: bool) -
     widest
 }
 
-/// Last page whose top edge is at or above `position`, i.e. the page covering the
-/// middle of the viewport.
+/// Ancho de toda la columna de páginas en coordenadas de contenido, márgenes
+/// incluidos.
+///
+/// Los márgenes son píxeles lógicos fijos y no escalan con el zoom, así que el
+/// ancho no es simplemente el de la página por el zoom.
+pub fn content_width(
+    sizes: &[(f64, f64)],
+    zoom: f64,
+    spread: bool,
+    cover_alone: bool,
+) -> f64 {
+    if sizes.is_empty() {
+        return 0.0;
+    }
+    widest_row_width(sizes, spread, cover_alone) * zoom + 2.0 * f64::from(PAGE_GAP)
+}
+
+/// Borde izquierdo de `page` en coordenadas de contenido, es decir, desde el
+/// borde izquierdo de la columna de páginas: el margen, el desplazamiento de
+/// centrado de la fila y las páginas anteriores de esa fila.
+///
+/// Es el mapeo inverso que necesita el zoom anclado al puntero: las páginas se
+/// agrupan en filas centradas en la más ancha, y una página dentro de una fila se
+/// desplaza por los anchos de las anteriores más las separaciones.
+pub fn page_left(
+    sizes: &[(f64, f64)],
+    zoom: f64,
+    spread: bool,
+    cover_alone: bool,
+    page: usize,
+) -> Option<f64> {
+    if page >= sizes.len() {
+        return None;
+    }
+    let layout = PageLayout::build(sizes, zoom, spread, cover_alone);
+    let row = layout.rows.get(*layout.row_of_page.get(page)?)?;
+    let widest = widest_row_width(sizes, spread, cover_alone) * zoom;
+    let row_width = row
+        .pages
+        .iter()
+        .map(|other| sizes[*other].0 * zoom)
+        .sum::<f64>()
+        + f64::from(PAGE_GAP) * (row.pages.len() as f64 - 1.0);
+
+    let mut left = f64::from(PAGE_GAP) + (widest - row_width) / 2.0;
+    for other in &row.pages {
+        if *other == page {
+            break;
+        }
+        left += sizes[*other].0 * zoom + f64::from(PAGE_GAP);
+    }
+    Some(left)
+}
+
+/// Alto de toda la columna de páginas en coordenadas de contenido, márgenes
+/// incluidos.
+///
+/// Es el rango de scroll que necesita el ajuste vertical antes de que el toolkit
+/// vuelva a maquetar las páginas redimensionadas, y es lo que permite que un zoom
+/// animado mantenga el ancla en su primer fotograma en vez de recortarse al rango
+/// anterior.
+pub fn content_height(layout: &PageLayout) -> f64 {
+    let Some(last_row) = layout.rows.len().checked_sub(1) else {
+        return 0.0;
+    };
+    layout.row_offset(last_row) + layout.rows[last_row].height + f64::from(PAGE_GAP)
+}
+
 /// Vertical layout of the rendered pages: normally one page per row, two when
 /// the spread view is on. Everything that needs page geometry asks here, so the
 /// single- and two-page views share one model.
@@ -289,5 +355,70 @@ mod tests {
         assert_eq!(layout.page_count(), 0);
         assert_eq!(layout.page_offset(0), 0.0);
         assert_eq!(layout.max_row_height(), 0.0);
+    }
+
+    #[test]
+    fn the_content_is_the_widest_row_plus_the_fixed_margins() {
+        // Los márgenes no escalan con el zoom: solo la fila.
+        assert_eq!(content_width(&[(200.0, 100.0)], 1.0, false, false), 224.0);
+        assert_eq!(content_width(&[(200.0, 100.0)], 0.5, false, false), 124.0);
+        assert_eq!(
+            content_width(&[(200.0, 100.0), (100.0, 100.0)], 1.0, true, false),
+            336.0,
+            "200 + 12 + 100, más los dos márgenes"
+        );
+        assert_eq!(content_width(&[], 1.0, true, true), 0.0);
+    }
+
+    #[test]
+    fn a_single_page_starts_after_the_margin() {
+        let sizes = [(200.0, 100.0)];
+        assert_eq!(page_left(&sizes, 1.0, false, false, 0), Some(12.0));
+        assert_eq!(page_left(&sizes, 2.0, false, false, 0), Some(12.0));
+        assert_eq!(page_left(&sizes, 1.0, false, false, 1), None);
+    }
+
+    #[test]
+    fn a_spread_page_is_offset_by_the_pages_before_it() {
+        let sizes = [(200.0, 100.0), (100.0, 100.0)];
+        assert_eq!(page_left(&sizes, 1.0, true, false, 0), Some(12.0));
+        assert_eq!(
+            page_left(&sizes, 1.0, true, false, 1),
+            Some(224.0),
+            "margen + 200 + separación"
+        );
+        assert_eq!(page_left(&sizes, 2.0, true, false, 1), Some(430.0));
+    }
+
+    #[test]
+    fn a_narrower_row_is_centred_inside_the_widest_one() {
+        // La segunda fila tiene una sola página de 100 sobre una columna de 412:
+        // se centra en (412 - 100) / 2 = 156 y suma el margen.
+        let sizes = [(300.0, 100.0), (100.0, 100.0), (100.0, 100.0)];
+        assert_eq!(page_left(&sizes, 1.0, true, false, 2), Some(168.0));
+
+        // Sin vista de dos páginas la columna la marca la página más ancha.
+        assert_eq!(page_left(&sizes, 1.0, false, false, 1), Some(112.0));
+    }
+
+    #[test]
+    fn the_separate_cover_is_centred_against_the_widest_row() {
+        let sizes = [(200.0, 100.0), (200.0, 100.0), (100.0, 100.0)];
+        assert_eq!(page_left(&sizes, 1.0, true, true, 0), Some(68.0));
+        assert_eq!(page_left(&sizes, 1.0, true, true, 1), Some(12.0));
+        assert_eq!(page_left(&sizes, 1.0, true, true, 2), Some(224.0));
+    }
+
+    #[test]
+    fn the_content_height_includes_both_margins_and_every_gap() {
+        let sizes = [(200.0, 100.0), (200.0, 300.0), (200.0, 150.0)];
+        let layout = PageLayout::build(&sizes, 1.0, false, false);
+        // 12 + 100 + 12 + 300 + 12 + 150 + 12
+        assert_eq!(content_height(&layout), 598.0);
+
+        let zoomed = PageLayout::build(&sizes, 2.0, false, false);
+        assert_eq!(content_height(&zoomed), 12.0 + 200.0 + 12.0 + 600.0 + 12.0 + 300.0 + 12.0);
+
+        assert_eq!(content_height(&PageLayout::build(&[], 1.0, false, false)), 0.0);
     }
 }

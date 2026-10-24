@@ -225,6 +225,9 @@ pub(crate) struct AnnotationState {
     pub(crate)     note_drag: RefCell<Option<NoteDrag>>,
     /// Nota bajo el puntero, para no reescribir el cursor en cada movimiento.
     pub(crate)     hover: RefCell<Option<String>>,
+    /// «Mover con el ratón» armado desde el menú contextual: el cursor de mover
+    /// se mantiene y `Esc` lo desarma.
+    pub(crate)     move_armed: Cell<bool>,
     pub(crate)     underline: Cell<MarkTool>,
     pub(crate)     highlight: Cell<MarkTool>,
     /// Herramienta «insertar texto» armada: el próximo clic coloca la nota.
@@ -237,8 +240,7 @@ pub(crate) struct AnnotationState {
 /// diálogo, esperando el clic que fija la esquina de la nota.
 #[derive(Clone, Debug)]
 pub(crate) struct TextDraft {
-    pub(crate) text: String,
-    pub(crate) font: FontChoice,
+    pub(crate) runs: Vec<TextRun>,
 }
 
 /// Arrastre de una nota en curso: qué nota, desde dónde se agarró en la vista y
@@ -286,6 +288,22 @@ pub(crate) struct InteractionState {
     /// Bumped whenever a zoom is started or cancelled, so frames scheduled for
     /// an older transition stop instead of fighting the current one.
     pub(crate)     zoom_generation: Cell<u64>,
+    /// Última posición del puntero sobre la zona de páginas, en píxeles del
+    /// viewport. `None` cuando el puntero está fuera de las páginas, para que el
+    /// zoom por botón o teclado caiga al centro del viewport.
+    pub(crate)     pointer: Cell<Option<(f64, f64)>>,
+}
+
+/// Punto del documento que se mantiene bajo el puntero mientras cambia el zoom.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ZoomAnchor {
+    /// Página sobre la que está el puntero.
+    page: usize,
+    /// Punto dentro de esa página en puntos de la vista (rotación aplicada, zoom 1).
+    point: (f64, f64),
+    /// Posición dentro del viewport en la que tiene que quedarse ese punto, en
+    /// píxeles lógicos.
+    viewport: (f64, f64),
 }
 
 /// One smooth-zoom transition in progress.
@@ -293,8 +311,9 @@ pub(crate) struct InteractionState {
 pub(crate) struct ZoomAnimation {
     from: f64,
     to: f64,
-    /// Page kept in place while the geometry changes.
-    anchor: usize,
+    /// Punto del documento retenido bajo el puntero (o el centro del viewport)
+    /// mientras cambia la geometría.
+    anchor: Option<ZoomAnchor>,
     started: std::time::Instant,
     generation: u64,
 }
@@ -547,6 +566,7 @@ impl Viewer {
                 id_prefix: format!("mlnpdf-{}-{}", std::process::id(), session_nanos()),
                 note_drag: RefCell::new(None),
                 hover: RefCell::new(None),
+                move_armed: Cell::new(false),
                 underline: Cell::new(MarkTool {
                     color: UNDERLINE_COLOR,
                     active: false,
@@ -573,6 +593,7 @@ impl Viewer {
                 centering_thumbnails: Cell::new(false),
                 zoom_animation: Cell::new(None),
                 zoom_generation: Cell::new(0),
+                pointer: Cell::new(None),
             },
             me: RefCell::new(std::rc::Weak::new()),
         });
@@ -742,9 +763,7 @@ impl Viewer {
                     return;
                 }
                 let index = selection.selected() as usize;
-                if index != viewer.current_page() {
-                    viewer.goto_page(index);
-                }
+                viewer.goto_page_centered(index);
             });
         }
 
@@ -752,6 +771,7 @@ impl Viewer {
         Self::install_note_keys(&viewer);
         Self::install_ctrl_scroll(&viewer);
         Self::install_page_sync(&viewer);
+        Self::install_pointer_tracking(&viewer);
         Self::install_copy_shortcut(&viewer);
         Self::install_escape(&viewer);
         Self::install_hand_pan(&viewer);
@@ -963,6 +983,27 @@ impl Viewer {
         });
 
         viewer.ui.window.add_controller(keys);
+    }
+
+    /// Recuerda dónde está el puntero sobre la zona de páginas. El zoom lo usa
+    /// para dejar quieto el punto que hay debajo, y se limpia cuando el puntero
+    /// sale de las páginas para que el zoom de la barra o del teclado use su
+    /// ancla por omisión.
+    pub(crate) fn install_pointer_tracking(viewer: &Rc<Self>) {
+        let motion = gtk::EventControllerMotion::new();
+        let weak = Rc::downgrade(viewer);
+        motion.connect_motion(move |_, x, y| {
+            if let Some(viewer) = weak.upgrade() {
+                viewer.input.pointer.set(Some((x, y)));
+            }
+        });
+        let weak = Rc::downgrade(viewer);
+        motion.connect_leave(move |_| {
+            if let Some(viewer) = weak.upgrade() {
+                viewer.input.pointer.set(None);
+            }
+        });
+        viewer.ui.scroller.add_controller(motion);
     }
 
     pub(crate) fn install_ctrl_scroll(viewer: &Rc<Self>) {
@@ -1221,7 +1262,7 @@ impl Viewer {
         self.input.zoom_animation.set(Some(ZoomAnimation {
             from: self.view.zoom.get(),
             to: target,
-            anchor: self.current_page(),
+            anchor: self.zoom_anchor(),
             started: std::time::Instant::now(),
             generation,
         }));
@@ -1264,15 +1305,102 @@ impl Viewer {
         }
     }
 
-    /// Applies one frame: geometry at `zoom` with the anchored page held in
-    /// place; textures are rasterized only on the final frame.
-    fn show_zoom_step(&self, zoom: f64, anchor: usize, final_frame: bool) {
+    /// Aplica un fotograma: geometría en `zoom` con el punto del documento bajo
+    /// el puntero (o el centro del viewport) retenido; las texturas solo se
+    /// rasterizan en el último fotograma.
+    fn show_zoom_step(&self, zoom: f64, anchor: Option<ZoomAnchor>, final_frame: bool) {
         self.view.zoom.set(zoom);
         self.relayout_for_zoom(zoom);
-        self.jump_to_page(anchor);
+        if let Some(anchor) = anchor {
+            self.scroll_to_zoom_anchor(&anchor, zoom);
+        }
         if final_frame {
             self.refresh_visible();
         }
+    }
+
+    /// Punto del documento que el zoom tiene que dejar quieto: el que está bajo
+    /// el puntero cuando el puntero está sobre las páginas, o el centro del
+    /// viewport en caso contrario.
+    fn zoom_anchor(&self) -> Option<ZoomAnchor> {
+        let layout = self.doc.layout.borrow();
+        if layout.page_count() == 0 {
+            return None;
+        }
+        let zoom = self.view.zoom.get();
+        if zoom <= 0.0 {
+            return None;
+        }
+        let sizes = self.oriented_sizes();
+        let spread = self.view.spread.get();
+        let cover = self.view.cover_alone.get();
+        let horizontal = self.ui.scroller.hadjustment();
+        let vertical = self.ui.scroller.vadjustment();
+
+        let viewport = match self.input.pointer.get() {
+            Some(point) => point,
+            None => (
+                horizontal.page_size() / 2.0,
+                vertical.page_size() / 2.0,
+            ),
+        };
+        // Coordenadas de contenido: el valor del scroll más la posición del
+        // puntero, menos el desplazamiento de centrado que tiene la caja de
+        // páginas cuando es más estrecha que el viewport (está centrada con
+        // `halign`).
+        let content_y = vertical.value() + viewport.1;
+        let column = content_width(&sizes, zoom, spread, cover);
+        let child_left = ((horizontal.page_size() - column) / 2.0).max(0.0);
+        let content_x = horizontal.value() + viewport.0 - child_left;
+
+        let page = layout.page_at(content_y);
+        let left = page_left(&sizes, zoom, spread, cover, page)?;
+        let top = layout.page_offset(page);
+        let (width, height) = *sizes.get(page)?;
+
+        Some(ZoomAnchor {
+            page,
+            point: (
+                ((content_x - left) / zoom).clamp(0.0, width),
+                ((content_y - top) / zoom).clamp(0.0, height),
+            ),
+            viewport,
+        })
+    }
+
+    /// Desplaza para que `anchor.point` vuelva a quedar bajo `anchor.viewport`
+    /// en `zoom`. Los desplazamientos de página y los márgenes se leen de la
+    /// geometría nueva, así que las separaciones fijas no hacen derivar el punto
+    /// anclado.
+    fn scroll_to_zoom_anchor(&self, anchor: &ZoomAnchor, zoom: f64) {
+        let sizes = self.oriented_sizes();
+        let (spread, cover) = (self.view.spread.get(), self.view.cover_alone.get());
+        let Some(left) = page_left(&sizes, zoom, spread, cover, anchor.page) else {
+            return;
+        };
+        let (top, height) = {
+            let layout = self.doc.layout.borrow();
+            (layout.page_offset(anchor.page), content_height(&layout))
+        };
+
+        let horizontal = self.ui.scroller.hadjustment();
+        let vertical = self.ui.scroller.vadjustment();
+        let column = content_width(&sizes, zoom, spread, cover);
+        let child_left = ((horizontal.page_size() - column) / 2.0).max(0.0);
+        let want_x = child_left + left + anchor.point.0 * zoom - anchor.viewport.0;
+        let want_y = top + anchor.point.1 * zoom - anchor.viewport.1;
+
+        // Los widgets de página se redimensionaron en este fotograma, pero el
+        // toolkit actualiza los ajustes en el siguiente paso de maquetación.
+        // Publicar aquí el rango nuevo evita que el ancla se recorte a los
+        // límites del zoom anterior; después la ventana con scroll calcula el
+        // mismo rango con las páginas ya maquetadas.
+        horizontal.set_upper(column.max(horizontal.page_size()));
+        vertical.set_upper(height.max(vertical.page_size()));
+        horizontal.set_value(want_x);
+        vertical.set_value(want_y);
+        self.nav.current.set(anchor.page);
+        self.set_indicator(anchor.page);
     }
 
     /// Rebuilds the page geometry for `zoom` without dropping the textures that
@@ -1306,14 +1434,30 @@ impl Viewer {
     /// change, which is what a layout change (spread, cover, rotation) needs.
     /// User zoom goes through [`Self::set_zoom`], which eases instead.
     pub(crate) fn apply_zoom(&self, zoom: f64) {
+        let anchor = self.zoom_anchor();
+        let page = self.current_page();
+        self.apply_zoom_place(zoom, anchor, page);
+    }
+
+    /// Reajusta la geometría (dos páginas, portada, cambio de tamaño del
+    /// viewport) sin seguir al puntero: esos cambios rehacen las filas, así que lo
+    /// que tiene que quedarse quieto es la página actual.
+    fn apply_zoom_keep_page(&self, zoom: f64) {
+        let page = self.current_page();
+        self.apply_zoom_place(zoom, None, page);
+    }
+
+    fn apply_zoom_place(&self, zoom: f64, anchor: Option<ZoomAnchor>, page: usize) {
         let clamped = zoom.clamp(ZOOM_STEPS[0], ZOOM_STEPS[ZOOM_STEPS.len() - 1]);
-        let anchor = self.current_page();
 
         self.view.zoom.set(clamped);
         self.ui.zoom_label.set_label(&zoom_text(clamped));
 
         match self.render() {
-            Ok(()) => self.jump_to_page(anchor),
+            Ok(()) => match anchor {
+                Some(anchor) => self.scroll_to_zoom_anchor(&anchor, clamped),
+                None => self.jump_to_page(page),
+            },
             Err(message) => show_error(&self.ui.window, "No se pudo cambiar el zoom.", &message),
         }
     }
@@ -1757,13 +1901,14 @@ impl Viewer {
     /// Recibe lo que dejó el diálogo: si hay texto, guarda el borrador y arma la
     /// herramienta para que el próximo clic fije la esquina de la nota. Sin
     /// texto no se inserta nada y la herramienta queda desarmada.
-    pub(crate) fn apply_text_draft(&self, text: String, font: FontChoice) {
+    pub(crate) fn apply_text_draft(&self, runs: Vec<TextRun>) {
+        let text: String = runs.iter().map(|run| run.text.as_str()).collect();
         if text.trim().is_empty() {
             self.annot.draft.borrow_mut().take();
             self.set_text_tool(false);
             return;
         }
-        *self.annot.draft.borrow_mut() = Some(TextDraft { text, font });
+        *self.annot.draft.borrow_mut() = Some(TextDraft { runs });
         self.set_text_tool(true);
     }
 
@@ -1777,20 +1922,14 @@ impl Viewer {
         let Some(draft) = self.annot.draft.borrow().clone() else {
             return false;
         };
-        if draft.text.trim().is_empty() {
+        let text: String = draft.runs.iter().map(|run| run.text.as_str()).collect();
+        if text.trim().is_empty() {
             self.set_text_tool(false);
             return false;
         }
 
-        let (width, height) = measure_text(&draft.text, &draft.font);
-        let note = TextNote {
-            page,
-            at,
-            width,
-            height,
-            text: draft.text,
-            font: draft.font,
-        };
+        let (width, height) = measure_text(&draft.runs);
+        let note = TextNote::new(page, at, width, height, draft.runs);
         self.begin_edit();
         let id = self.new_id();
         self.annot.edits.borrow_mut().push(Edit {
@@ -1811,8 +1950,8 @@ impl Viewer {
         self.prompt_note_text(None);
     }
 
-    /// Diálogo para cambiar el texto y la fuente de la nota elegida, con lo que ya
-    /// tiene precargado. `Cancelar` no cambia nada.
+    /// Diálogo para cambiar el texto, la fuente y el color de la nota elegida,
+    /// con lo que ya tiene precargado. `Cancelar` no cambia nada.
     pub(crate) fn prompt_note_edit(self: &Rc<Self>) {
         let Some(id) = self.annot.selected.borrow().clone() else {
             return;
@@ -1824,7 +1963,7 @@ impl Viewer {
     }
 
     /// El diálogo de la nota, en sus dos usos: insertar una nueva (`None`) o
-    /// editar una existente (`Some`), que llega con su texto y su fuente.
+    /// editar una existente (`Some`), que llega con su texto y sus tramos.
     fn prompt_note_text(self: &Rc<Self>, editing: Option<(String, TextNote)>) {
         // Sin documento no hay página donde insertar: la herramienta está tan
         // inactiva como las de marcado.
@@ -1841,37 +1980,167 @@ impl Viewer {
             .default_width(420)
             .build();
 
-        let entry = gtk::Entry::builder()
-            .placeholder_text("Texto de la nota")
-            .activates_default(true)
+        // Editor multilínea: la nota se ajusta y cada tramo conserva su estilo
+        // mientras se edita.
+        let text_view = gtk::TextView::builder()
+            .wrap_mode(gtk::WrapMode::Word)
             .build();
-        accessible_label(&entry, "Texto de la nota");
+        accessible_label(&text_view, "Texto de la nota");
+        let scroller = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .min_content_height(90)
+            .child(&text_view)
+            .build();
+        let buffer = text_view.buffer();
 
-        // El selector de fuente de GTK, con lo que ya tiene la nota o «Sans 12»
-        // como punto de partida.
+        // Punto de partida: el primer tramo de la nota, o «Sans 12» negro cuando
+        // es nueva. Los caracteres sin etiqueta toman este mismo estilo.
+        let (base_font, base_color) = match &editing {
+            Some((_, note)) => (
+                note.font().cloned().unwrap_or_else(default_font_choice),
+                note.color(),
+            ),
+            None => (default_font_choice(), NOTE_COLOR),
+        };
+
+        // Cada estilo aplicado en el diálogo es una etiqueta guardada acá, así
+        // el paso de aceptar puede releer a qué tramo pertenece cada carácter.
+        let styles: Rc<RefCell<Vec<(gtk::TextTag, FontChoice, [f64; 3])>>> =
+            Rc::new(RefCell::new(Vec::new()));
+
+        // Los tramos que ya tiene la nota se siembran con su propia etiqueta, así
+        // editar el texto no pierde los estilos elegidos antes.
+        let text = match &editing {
+            Some((_, note)) => note.text(),
+            None => String::new(),
+        };
+        buffer.set_text(&text);
+        if let Some((_, note)) = &editing {
+            let mut start = 0;
+            for run in &note.runs {
+                let end = start + run.text.chars().count() as i32;
+                let from = buffer.iter_at_offset(start);
+                let to = buffer.iter_at_offset(end);
+                apply_note_style(&buffer, &styles, &run.font, run.color, &from, &to);
+                start = end;
+            }
+        }
+
         let font_dialog = gtk::FontDialog::builder()
             .title("Fuente de la nota")
             .modal(true)
             .build();
-        let initial = match &editing {
-            Some((_, note)) => font_description(&note.font, 1.0),
-            None => {
-                let mut initial = pango::FontDescription::new();
-                initial.set_family("Sans");
-                initial.set_size(12 * pango::SCALE);
-                initial
-            }
-        };
-        if let Some((_, note)) = &editing {
-            entry.set_text(&note.text);
-        }
         let font_button = gtk::FontDialogButton::builder()
             .dialog(&font_dialog)
-            .font_desc(&initial)
+            .font_desc(&font_description(&base_font, 1.0))
             .use_font(true)
             .use_size(true)
             .build();
         accessible_label(&font_button, "Fuente de la nota");
+
+        let color_dialog = gtk::ColorDialog::builder()
+            .title("Color del texto")
+            .modal(true)
+            .build();
+        let color_button = gtk::ColorDialogButton::builder()
+            .dialog(&color_dialog)
+            .rgba(&note_rgba(base_color))
+            .build();
+        color_button.set_tooltip_text(Some("Color del texto"));
+        accessible_label(&color_button, "Color del texto");
+
+        // Protege las actualizaciones de los botones mientras siguen a la
+        // selección: hacerlo no debe volver a aplicar un estilo a toda la
+        // selección.
+        let syncing = Rc::new(Cell::new(false));
+
+        // Se conectan después de fijar los valores iniciales: abrir el diálogo no
+        // puede reestilar el texto por sí solo. Un cambio se aplica a la selección,
+        // o a todo el texto cuando no hay selección. Cada botón cambia solo su
+        // atributo, así que recolorear una palabra conserva su fuente y viceversa.
+        {
+            let buffer = buffer.clone();
+            let styles = styles.clone();
+            let base_font = base_font.clone();
+            let syncing = syncing.clone();
+            font_button.connect_font_desc_notify(move |button| {
+                if syncing.get() {
+                    return;
+                }
+                let Some(description) = button.font_desc() else {
+                    return;
+                };
+                let (start, end) = note_style_range(&buffer);
+                restyle_note_range(
+                    &buffer,
+                    &styles,
+                    Some(font_choice(&description)),
+                    None,
+                    &base_font,
+                    base_color,
+                    &start,
+                    &end,
+                );
+            });
+        }
+        {
+            let buffer = buffer.clone();
+            let styles = styles.clone();
+            let base_font = base_font.clone();
+            let syncing = syncing.clone();
+            color_button.connect_rgba_notify(move |button| {
+                if syncing.get() {
+                    return;
+                }
+                let color = note_color(&button.rgba());
+                let (start, end) = note_style_range(&buffer);
+                restyle_note_range(
+                    &buffer,
+                    &styles,
+                    None,
+                    Some(color),
+                    &base_font,
+                    base_color,
+                    &start,
+                    &end,
+                );
+            });
+        }
+
+        // Los botones siguen el estilo del texto seleccionado (o del tramo del
+        // cursor), así elegir la misma fuente otra vez para otra palabra sí
+        // dispara el cambio.
+        {
+            let styles = styles.clone();
+            let syncing = syncing.clone();
+            let font_button = font_button.downgrade();
+            let color_button = color_button.downgrade();
+            let base_font = base_font.clone();
+            buffer.connect_mark_set(move |buffer, _, mark| {
+                if !matches!(
+                    mark.name().as_deref(),
+                    Some("insert") | Some("selection_bound")
+                ) {
+                    return;
+                }
+                let (Some(font_button), Some(color_button)) =
+                    (font_button.upgrade(), color_button.upgrade())
+                else {
+                    return;
+                };
+                let offset = if buffer.has_selection() {
+                    buffer.selection_bounds().map_or(0, |(start, _)| start.offset())
+                } else {
+                    buffer.iter_at_mark(mark).offset()
+                };
+                let (font, color) =
+                    note_style_at(buffer, &styles.borrow(), offset, &base_font, base_color);
+                syncing.set(true);
+                font_button.set_font_desc(&font_description(&font, 1.0));
+                color_button.set_rgba(&note_rgba(color));
+                syncing.set(false);
+            });
+        }
 
         let accept = gtk::Button::with_label(if inserting { "Insertar" } else { "Guardar" });
         accept.add_css_class("suggested-action");
@@ -1882,6 +2151,10 @@ impl Viewer {
         buttons.append(&cancel);
         buttons.append(&accept);
 
+        let style = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        style.append(&font_button);
+        style.append(&color_button);
+
         let content = gtk::Box::new(gtk::Orientation::Vertical, 10);
         content.set_margin_top(14);
         content.set_margin_bottom(14);
@@ -1890,34 +2163,30 @@ impl Viewer {
         content.append(&gtk::Label::new(Some(if inserting {
             "Texto a insertar en la página. Después, hacé clic en el lugar:"
         } else {
-            "Texto de la nota. Al guardar se vuelve a medir con esta fuente:"
+            "Texto de la nota. La fuente y el color se aplican a la selección:"
         })));
-        content.append(&entry);
-        content.append(&font_button);
+        content.append(&scroller);
+        content.append(&style);
         content.append(&buttons);
         window.set_child(Some(&content));
         window.set_default_widget(Some(&accept));
 
         let weak = Rc::downgrade(self);
-        let entry_ref = entry.clone();
-        let font_button_ref = font_button.clone();
+        let buffer_ref = buffer.clone();
+        let styles_ref = styles.clone();
+        let base_font_ref = base_font.clone();
         let window_ref = window.clone();
         accept.connect_clicked(move |_| {
             let Some(viewer) = weak.upgrade() else {
                 return;
             };
-            let text = entry_ref.text().to_string();
-            let font = font_button_ref
-                .font_desc()
-                .as_ref()
-                .map(font_choice)
-                .unwrap_or_else(default_font_choice);
+            let runs = note_runs(&buffer_ref, &styles_ref.borrow(), &base_font_ref, base_color);
             window_ref.close();
             match target.as_ref() {
                 Some(id) => {
-                    viewer.apply_note_text(id, text, font);
+                    viewer.apply_note_text(id, runs);
                 }
-                None => viewer.apply_text_draft(text, font),
+                None => viewer.apply_text_draft(runs),
             }
         });
 
@@ -2347,6 +2616,7 @@ impl Viewer {
         self.annot.note_drag.borrow_mut().take();
         self.annot.hover.borrow_mut().take();
         *self.annot.selected.borrow_mut() = None;
+        self.annot.move_armed.set(false);
         self.set_text_tool(false);
         self.set_mark_mode(MarkKind::Underline, false);
         self.set_mark_mode(MarkKind::Highlight, false);
@@ -2446,6 +2716,7 @@ impl Viewer {
         self.begin_edit();
         self.annot.edits.borrow_mut().retain(|edit| edit.id != id);
         *self.annot.selected.borrow_mut() = None;
+        self.annot.move_armed.set(false);
         self.refresh_note_actions();
         self.queue_page_draw(page);
         self.ui
@@ -2550,17 +2821,18 @@ impl Viewer {
         self.annot.note_drag.borrow_mut().take().is_some()
     }
 
-    /// Cambia el texto y la fuente de la nota `id`, la vuelve a medir y la
+    /// Cambia el texto de la nota `id` con sus tramos, la vuelve a medir y la
     /// redibuja. Un texto en blanco no la borra: una nota sin texto no se puede
     /// leer ni volver a editar.
-    pub(crate) fn apply_note_text(&self, id: &str, text: String, font: FontChoice) -> bool {
+    pub(crate) fn apply_note_text(&self, id: &str, runs: Vec<TextRun>) -> bool {
+        let text: String = runs.iter().map(|run| run.text.as_str()).collect();
         if text.trim().is_empty() {
             return false;
         }
         let Some(note) = self.note(id) else {
             return false;
         };
-        let (width, height) = measure_text(&text, &font);
+        let (width, height) = measure_text(&runs);
         self.begin_edit();
         {
             let mut edits = self.annot.edits.borrow_mut();
@@ -2570,8 +2842,7 @@ impl Viewer {
             let Annotation::Note(value) = &mut edit.value else {
                 return false;
             };
-            value.text = text;
-            value.font = font;
+            value.runs = runs;
             value.width = width;
             value.height = height;
         }
@@ -2579,9 +2850,9 @@ impl Viewer {
         true
     }
 
-    /// Cursor de la capa de la página: `grab` sobre una nota, porque se puede
-    /// arrastrar. El modo mano y las herramientas armadas mandan: mientras alguno
-    /// esté activo, el cursor es el suyo.
+    /// Cursor de la capa de la página: el de mover (cuatro flechas) sobre una
+    /// nota, porque se puede arrastrar. El modo mano y las herramientas armadas
+    /// mandan: mientras alguno esté activo, el cursor es el suyo.
     pub(crate) fn update_note_cursor(&self, page: usize, x: f64, y: f64, overlay: &gtk::Overlay) {
         if self.input.hand_mode.get()
             || self.active_mark_tool().is_some()
@@ -2595,7 +2866,7 @@ impl Viewer {
             return;
         }
         let cursor = if hit.is_some() {
-            gdk::Cursor::from_name("grab", None)
+            gdk::Cursor::from_name("move", None)
         } else {
             None
         };
@@ -2609,16 +2880,64 @@ impl Viewer {
         overlay.set_cursor(None::<&gdk::Cursor>);
     }
 
-    /// Menú contextual de la nota: editar el texto o borrarla. `Mover con el
-    /// ratón` contesta cómo se mueve sin ofrecer un camino aparte, así que va sin
-    /// acción y queda insensible.
-    pub(crate) fn open_note_menu(&self, anchor: &gtk::DrawingArea, x: f64, y: f64) {
+    /// Menú contextual de la nota: editar el texto, borrarla o armar el movimiento
+    /// con el cursor de cuatro flechas. Las acciones son propias del popover: un
+    /// menú colgado de la página no siempre resuelve las acciones de la ventana, y
+    /// el diálogo tiene que abrirse después de que el menú se cierre.
+    pub(crate) fn open_note_menu(
+        self: &Rc<Self>,
+        id: String,
+        anchor: &gtk::DrawingArea,
+        x: f64,
+        y: f64,
+    ) -> gtk::PopoverMenu {
         let menu = gio::Menu::new();
-        menu.append(Some("Editar texto"), Some("win.note-edit"));
-        menu.append(Some("Borrar"), Some("win.note-delete"));
-        menu.append(Some("Mover con el ratón"), None::<&str>);
+        menu.append(Some("Editar texto"), Some("note.edit"));
+        menu.append(Some("Borrar"), Some("note.delete"));
+        menu.append(Some("Mover con el ratón"), Some("note.move"));
+
+        let actions = gio::SimpleActionGroup::new();
+
+        let edit = gio::SimpleAction::new("edit", None);
+        {
+            let weak = Rc::downgrade(self);
+            edit.connect_activate(move |_, _| {
+                // Presentar el modal mientras el popover todavía tiene el grab
+                // deja la ventana detrás del menú; se abre cuando ya se cerró.
+                let weak = weak.clone();
+                glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
+                    if let Some(viewer) = weak.upgrade() {
+                        viewer.prompt_note_edit();
+                    }
+                });
+            });
+        }
+        actions.add_action(&edit);
+
+        let delete = gio::SimpleAction::new("delete", None);
+        {
+            let weak = Rc::downgrade(self);
+            delete.connect_activate(move |_, _| {
+                if let Some(viewer) = weak.upgrade() {
+                    viewer.delete_selected_note();
+                }
+            });
+        }
+        actions.add_action(&delete);
+
+        let move_action = gio::SimpleAction::new("move", None);
+        {
+            let weak = Rc::downgrade(self);
+            move_action.connect_activate(move |_, _| {
+                if let Some(viewer) = weak.upgrade() {
+                    viewer.begin_note_move(&id);
+                }
+            });
+        }
+        actions.add_action(&move_action);
 
         let popover = gtk::PopoverMenu::from_model(Some(&menu));
+        popover.insert_action_group("note", Some(&actions));
         popover.set_has_arrow(false);
         // El menú cuelga de la página y se suelta al cerrarse: un popover sin padre
         // no se puede abrir, y dejarlo colgado acumularía widgets.
@@ -2627,6 +2946,33 @@ impl Viewer {
         let place = gdk::Rectangle::new(x as i32, y as i32, 1, 1);
         popover.set_pointing_to(Some(&place));
         popover.popup();
+        popover
+    }
+
+    /// «Mover con el ratón» desde el menú: elige la nota y pone el cursor de mover
+    /// sobre ella para que el siguiente arrastre la coloque. `Esc` lo desarma.
+    pub(crate) fn begin_note_move(&self, id: &str) -> bool {
+        if self.note(id).is_none() {
+            return false;
+        }
+        self.select_note(Some(id.to_string()));
+        self.annot.move_armed.set(true);
+        let Some(page) = self.edit_page(Some(id)) else {
+            return false;
+        };
+        let cursor = gdk::Cursor::from_name("move", None);
+        if let Some(slot) = self.doc.slots.borrow().get(page) {
+            slot.overlay.set_cursor(cursor.as_ref());
+            slot.canvas.set_cursor(cursor.as_ref());
+        }
+        true
+    }
+
+    /// Clicar una página suelta el foco de los campos de búsqueda y de número de
+    /// página: con el foco ahí, esas teclas editan el campo y `Supr` nunca llega
+    /// a la nota seleccionada.
+    pub(crate) fn release_text_focus(&self) {
+        gtk::prelude::GtkWindowExt::set_focus(&self.ui.window, None::<&gtk::Widget>);
     }
 
     /// `Supr` y `Retroceso` borran la nota elegida. El controlador va en fase de
@@ -2804,6 +3150,13 @@ impl Viewer {
         }
         if self.annot.selected.borrow().is_some() {
             self.select_note(None);
+            return glib::Propagation::Stop;
+        }
+        if self.annot.move_armed.replace(false) {
+            // «Mover con el ratón» queda desarmado y el cursor vuelve al normal
+            // hasta que el puntero vuelva a entrar en una nota.
+            self.annot.hover.borrow_mut().take();
+            self.apply_hand_cursor(None);
             return glib::Propagation::Stop;
         }
         glib::Propagation::Proceed
@@ -3028,6 +3381,34 @@ impl Viewer {
     pub(crate) fn goto_page(&self, index: usize) {
         let target = self.scroll_to_page(index);
         self.record_history(target);
+    }
+
+    /// Navegar desde una miniatura: la página completa queda centrada en el
+    /// viewport en vez de aterrizar con su borde superior arriba, que es lo que
+    /// espera el lector al elegir una página en la vista previa.
+    pub(crate) fn goto_page_centered(&self, index: usize) {
+        if let Some(target) = self.center_page(index) {
+            self.record_history(target);
+        }
+    }
+
+    /// Centra la fila de `index` en el viewport y devuelve la página en la que
+    /// quedó tras recortar a los límites de scroll del documento.
+    pub(crate) fn center_page(&self, index: usize) -> Option<usize> {
+        let layout = self.doc.layout.borrow();
+        if layout.page_count() == 0 {
+            return None;
+        }
+        let index = index.min(layout.page_count() - 1);
+        let middle = layout.page_offset(index) + layout.row_height(index) / 2.0;
+        drop(layout);
+
+        let adjustment = self.ui.scroller.vadjustment();
+        let maximum = (adjustment.upper() - adjustment.page_size()).max(0.0);
+        adjustment.set_value((middle - adjustment.page_size() / 2.0).clamp(0.0, maximum));
+        self.nav.current.set(index);
+        self.set_indicator(index);
+        Some(index)
     }
 
     /// Internal repositioning (zoom anchor, history replay): no history entry.
@@ -3440,6 +3821,10 @@ impl Viewer {
                 gesture.set_state(gtk::EventSequenceState::Denied);
                 return;
             }
+            // Clicar la página saca el foco de los campos: si se quedara en el
+            // buscador o en el número de página, `Supr` editaría ese campo y no
+            // borraría la nota elegida.
+            viewer.release_text_focus();
             // Con la herramienta de texto armada no hay selección: el gesto
             // entero es el clic que coloca la nota, y se niega para que el
             // arrastre no siga vivo.
@@ -3501,17 +3886,22 @@ impl Viewer {
             }
             match (gesture.current_button(), viewer.note_at(page, x, y)) {
                 (gdk::BUTTON_SECONDARY, Some(id)) => {
-                    viewer.select_note(Some(id));
-                    viewer.open_note_menu(&canvas_for_menu, x, y);
+                    viewer.release_text_focus();
+                    viewer.select_note(Some(id.clone()));
+                    viewer.open_note_menu(id, &canvas_for_menu, x, y);
                     gesture.set_state(gtk::EventSequenceState::Claimed);
                 }
                 (gdk::BUTTON_PRIMARY, Some(id)) => {
+                    viewer.release_text_focus();
                     viewer.select_note(Some(id));
                     if presses >= 2 {
                         viewer.prompt_note_edit();
                     }
                 }
-                (gdk::BUTTON_PRIMARY, None) => viewer.select_note(None),
+                (gdk::BUTTON_PRIMARY, None) => {
+                    viewer.release_text_focus();
+                    viewer.select_note(None);
+                }
                 _ => {}
             }
         });
@@ -4723,7 +5113,7 @@ impl Viewer {
     pub(crate) fn refit_view(&self) {
         let anchor = self.current_page();
         match self.fit_zoom_row() {
-            Some(zoom) => self.apply_zoom(zoom),
+            Some(zoom) => self.apply_zoom_keep_page(zoom),
             None => {
                 if let Err(message) = self.render() {
                     show_error(&self.ui.window, "No se pudo cambiar la vista.", &message);
@@ -5339,9 +5729,252 @@ fn default_font_choice() -> FontChoice {
     }
 }
 
-/// Mide el texto en puntos PDF con la fuente elegida. El layout se crea a tamaño
-/// real, sin zoom: el ancho de la nota es el que ocupa en la página.
-fn measure_text(text: &str, font: &FontChoice) -> (f64, f64) {
+/// Peso Pango de un tramo en negrita, en la escala que toma `TextTag::set_weight`.
+const NOTE_WEIGHT_BOLD: i32 = 700;
+
+/// Peso Pango de un tramo normal.
+const NOTE_WEIGHT_NORMAL: i32 = 400;
+
+/// Tamaño en puntos de un tramo, con «12» cuando el valor guardado no sirve.
+fn note_points(font: &FontChoice) -> f64 {
+    if font.size.is_finite() && font.size > 0.0 {
+        font.size
+    } else {
+        12.0
+    }
+}
+
+/// Color de un tramo como `gdk::RGBA`, recortado a `0..=1`.
+fn note_rgba(color: [f64; 3]) -> gdk::RGBA {
+    gdk::RGBA::new(
+        color[0].clamp(0.0, 1.0) as f32,
+        color[1].clamp(0.0, 1.0) as f32,
+        color[2].clamp(0.0, 1.0) as f32,
+        1.0,
+    )
+}
+
+/// Componentes `0..=1` de un color elegido en el diálogo.
+fn note_color(rgba: &gdk::RGBA) -> [f64; 3] {
+    [
+        f64::from(rgba.red()),
+        f64::from(rgba.green()),
+        f64::from(rgba.blue()),
+    ]
+}
+
+/// Rango al que se aplica un cambio de fuente o color: el texto seleccionado, o
+/// todo el texto cuando no hay selección.
+fn note_style_range(buffer: &gtk::TextBuffer) -> (gtk::TextIter, gtk::TextIter) {
+    buffer.selection_bounds().unwrap_or_else(|| buffer.bounds())
+}
+
+/// Estilo que ya tiene un carácter en el diálogo: la etiqueta guardada que lo
+/// cubre, o el estilo base cuando no tiene.
+fn note_style_at(
+    buffer: &gtk::TextBuffer,
+    styles: &[(gtk::TextTag, FontChoice, [f64; 3])],
+    offset: i32,
+    base_font: &FontChoice,
+    base_color: [f64; 3],
+) -> (FontChoice, [f64; 3]) {
+    let iter = buffer.iter_at_offset(offset);
+    styles
+        .iter()
+        .find(|(tag, _, _)| iter.has_tag(tag))
+        .map(|(_, font, color)| (font.clone(), *color))
+        .unwrap_or_else(|| (base_font.clone(), base_color))
+}
+
+/// Aplica `font` y `color` a `start..end` como una etiqueta guardada. Primero se
+/// quitan todas las etiquetas guardadas del rango, así la elección más nueva es la
+/// que lo cubre. Una etiqueta idéntica se reutiliza en vez de acumular nuevas, lo
+/// que mantiene chica la tabla mientras el diálogo está abierto.
+fn apply_note_style(
+    buffer: &gtk::TextBuffer,
+    styles: &Rc<RefCell<Vec<(gtk::TextTag, FontChoice, [f64; 3])>>>,
+    font: &FontChoice,
+    color: [f64; 3],
+    start: &gtk::TextIter,
+    end: &gtk::TextIter,
+) {
+    let color = color.map(|component| {
+        if component.is_finite() {
+            component.clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    });
+    let mut cache = styles.borrow_mut();
+    let existing = cache
+        .iter()
+        .find(|(_, cached_font, cached_color)| {
+            *cached_font == *font && *cached_color == color
+        })
+        .map(|(tag, _, _)| tag.clone());
+    for (tag, _, _) in cache.iter() {
+        buffer.remove_tag(tag, start, end);
+    }
+    let tag = match existing {
+        Some(tag) => tag,
+        None => {
+            let tag = buffer
+                .create_tag(Some(&format!("note-style-{}", cache.len())), &[])
+                .expect("the tag table accepts a new tag");
+            tag.set_family(Some(&font.family));
+            tag.set_size_points(note_points(font));
+            tag.set_weight(if font.bold {
+                NOTE_WEIGHT_BOLD
+            } else {
+                NOTE_WEIGHT_NORMAL
+            });
+            tag.set_style(if font.italic {
+                pango::Style::Italic
+            } else {
+                pango::Style::Normal
+            });
+            tag.set_foreground_rgba(Some(&note_rgba(color)));
+            cache.push((tag.clone(), font.clone(), color));
+            tag
+        }
+    };
+    buffer.apply_tag(&tag, start, end);
+}
+
+/// Reestila `start..end` cambiando solo los atributos elegidos: un cambio de color
+/// conserva la fuente de cada carácter y uno de fuente conserva su color. El rango
+/// se parte donde cambia el estilo actual, así una nota mixta no se reescribe como
+/// un tramo uniforme.
+#[allow(clippy::too_many_arguments)]
+fn restyle_note_range(
+    buffer: &gtk::TextBuffer,
+    styles: &Rc<RefCell<Vec<(gtk::TextTag, FontChoice, [f64; 3])>>>,
+    new_font: Option<FontChoice>,
+    new_color: Option<[f64; 3]>,
+    base_font: &FontChoice,
+    base_color: [f64; 3],
+    start: &gtk::TextIter,
+    end: &gtk::TextIter,
+) {
+    let mut cursor = start.offset();
+    let end_offset = end.offset();
+    while cursor < end_offset {
+        let (font, color) = note_style_at(buffer, &styles.borrow(), cursor, base_font, base_color);
+        let mut next = cursor + 1;
+        while next < end_offset
+            && note_style_at(buffer, &styles.borrow(), next, base_font, base_color)
+                == (font.clone(), color)
+        {
+            next += 1;
+        }
+        let target_font = new_font.clone().unwrap_or(font);
+        let target_color = new_color.unwrap_or(color);
+        apply_note_style(
+            buffer,
+            styles,
+            &target_font,
+            target_color,
+            &buffer.iter_at_offset(cursor),
+            &buffer.iter_at_offset(next),
+        );
+        cursor = next;
+    }
+}
+
+/// Relee el buffer como tramos: los caracteres cubiertos por la misma etiqueta se
+/// agrupan, y los que no tienen etiqueta toman el estilo base del diálogo. El
+/// salto de línea final implícito de GTK no forma parte de la nota y se recorta.
+fn note_runs(
+    buffer: &gtk::TextBuffer,
+    styles: &[(gtk::TextTag, FontChoice, [f64; 3])],
+    base_font: &FontChoice,
+    base_color: [f64; 3],
+) -> Vec<TextRun> {
+    let style_at = |offset: i32| note_style_at(buffer, styles, offset, base_font, base_color);
+
+    let (start, end) = buffer.bounds();
+    let end_offset = end.offset();
+    let mut cursor = start.offset();
+    let mut runs = Vec::new();
+    while cursor < end_offset {
+        let (font, color) = style_at(cursor);
+        let mut next = cursor + 1;
+        while next < end_offset && style_at(next) == (font.clone(), color) {
+            next += 1;
+        }
+        let text = buffer
+            .text(&buffer.iter_at_offset(cursor), &buffer.iter_at_offset(next), false)
+            .to_string();
+        runs.push(TextRun { text, font, color });
+        cursor = next;
+    }
+    // GTK always keeps one final newline that is not part of the note: strip
+    // exactly one, so a newline the reader typed is kept.
+    if let Some(last) = runs.last_mut() {
+        if let Some(stripped) = last.text.strip_suffix('\n') {
+            last.text = stripped.to_string();
+        }
+    }
+    runs.retain(|run| !run.text.is_empty());
+    runs
+}
+
+/// Un atributo Pango sobre el rango de bytes `start..end` del texto de la nota.
+fn ranged(attribute: impl Into<pango::Attribute>, start: u32, end: u32) -> pango::Attribute {
+    let mut attribute = attribute.into();
+    attribute.set_start_index(start);
+    attribute.set_end_index(end);
+    attribute
+}
+
+/// Atributos Pango de los tramos, en desplazamientos de byte sobre el texto
+/// concatenado. El tamaño se escala con `zoom` igual que `font_description`.
+fn note_attributes(runs: &[TextRun], zoom: f64) -> pango::AttrList {
+    let attributes = pango::AttrList::new();
+    let mut start = 0u32;
+    for run in runs {
+        let end = start + run.text.len() as u32;
+        if end > start {
+            let font = &run.font;
+            let size = (note_points(font) * zoom.clamp(0.01, 128.0) * f64::from(pango::SCALE))
+                .round()
+                .clamp(1.0, f64::from(i32::MAX / 2)) as i32;
+            let weight = if font.bold {
+                pango::Weight::Bold
+            } else {
+                pango::Weight::Normal
+            };
+            let style = if font.italic {
+                pango::Style::Italic
+            } else {
+                pango::Style::Normal
+            };
+            let [red, green, blue] = run.color.map(|component| {
+                let component = if component.is_finite() {
+                    component.clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                (component * 65535.0).round() as u16
+            });
+            attributes.insert(ranged(pango::AttrString::new_family(&font.family), start, end));
+            attributes.insert(ranged(pango::AttrSize::new_size_absolute(size), start, end));
+            attributes.insert(ranged(pango::AttrInt::new_weight(weight), start, end));
+            attributes.insert(ranged(pango::AttrInt::new_style(style), start, end));
+            attributes.insert(ranged(
+                pango::AttrColor::new_foreground(red, green, blue),
+                start,
+                end,
+            ));
+        }
+        start = end;
+    }
+    attributes
+}
+
+/// Mide el texto de los tramos en puntos PDF. El layout se crea a tamaño real,
+/// sin zoom: el ancho de la nota es el que ocupa en la página.
+fn measure_text(runs: &[TextRun]) -> (f64, f64) {
     // El contexto necesita el mapa de fuentes de pangocairo: `Context::new()` a
     // secas deja `font_map` en NULL y Pango no puede medir nada. A 72 dpi el
     // tamaño en puntos se mide directo en puntos PDF.
@@ -5349,8 +5982,9 @@ fn measure_text(text: &str, font: &FontChoice) -> (f64, f64) {
     context.set_font_map(Some(&pangocairo::FontMap::default()));
     pangocairo::functions::context_set_resolution(&context, 72.0);
     let layout = pango::Layout::new(&context);
-    layout.set_font_description(Some(&font_description(font, 1.0)));
-    layout.set_text(text);
+    let text: String = runs.iter().map(|run| run.text.as_str()).collect();
+    layout.set_text(&text);
+    layout.set_attributes(Some(&note_attributes(runs, 1.0)));
     let (_, logical) = layout.extents();
     let scale = f64::from(pango::SCALE);
     (
@@ -5359,9 +5993,10 @@ fn measure_text(text: &str, font: &FontChoice) -> (f64, f64) {
     )
 }
 
-/// Pinta una nota con pangocairo: texto negro, escalado por el zoom y girado con
-/// la vista como el resto de la capa. La nota elegida lleva además un contorno
-/// punteado, que es lo que dice cuál responde a `Supr` y al menú.
+/// Pinta una nota con pangocairo: cada tramo con su fuente y su color, escalado
+/// por el zoom y girado con la vista como el resto de la capa. La nota elegida
+/// lleva además un contorno punteado, que es lo que dice cuál responde a `Supr`
+/// y al menú.
 fn draw_note(
     context: &cairo::Context,
     note: &TextNote,
@@ -5374,18 +6009,17 @@ fn draw_note(
     // 72 dpi: el tamaño en puntos de la nota es el tamaño en unidades del
     // contexto, que ya están escaladas por el zoom.
     pangocairo::functions::context_set_resolution(&layout.context(), 72.0);
-    layout.set_font_description(Some(&font_description(&note.font, zoom)));
-    layout.set_text(&note.text);
+    let text = note.text();
+    layout.set_text(&text);
+    layout.set_attributes(Some(&note_attributes(&note.runs, zoom)));
 
     let (x, y) = forward_rotation(note.at, page, rotation);
     let _ = context.save();
     context.translate(x * zoom, y * zoom);
     context.rotate(view_angle(rotation));
-    context.set_source_rgba(0.0, 0.0, 0.0, 1.0);
-    // `at` es la esquina superior izquierda de la nota y cairo dibuja desde la
-    // línea base: se baja por la línea base de Pango, que ya viene escalada por
-    // el zoom, para que la pantalla y el `/Rect` que se escribe coincidan.
-    context.move_to(0.0, f64::from(layout.baseline()) / f64::from(pango::SCALE));
+    // `show_layout` puts the layout's top-left corner at the current point: the
+    // text starts exactly at `at`, so the dashed box can surround it.
+    context.move_to(0.0, 0.0);
     pangocairo::functions::show_layout(context, &layout);
 
     if selected {
@@ -5625,4 +6259,186 @@ pub(crate) fn looks_encrypted(message: &str) -> bool {
 #[cfg(test)]
 pub(crate) fn open_document(path: &Path) -> Result<poppler::Document, String> {
     open_document_with_password(path, None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Run with a known size and color, for the drawing and measuring tests.
+    fn run(text: &str, size: f64, color: [f64; 3]) -> TextRun {
+        TextRun {
+            text: text.to_string(),
+            font: FontChoice {
+                family: "Sans".to_string(),
+                size,
+                bold: false,
+                italic: false,
+            },
+            color,
+        }
+    }
+
+    /// Rasterizes the note layer on white and returns every pixel as `[r, g, b]`.
+    fn note_pixels(note: &TextNote, selected: bool) -> (usize, Vec<[u8; 3]>) {
+        let side = 200usize;
+        let mut surface =
+            cairo::ImageSurface::create(cairo::Format::ARgb32, side as i32, side as i32)
+                .expect("crear la superficie");
+        {
+            let context = cairo::Context::new(&surface).expect("contexto");
+            context.set_source_rgb(1.0, 1.0, 1.0);
+            context.paint().expect("fondo blanco");
+            draw_note(&context, note, (200.0, 200.0), 0, 1.0, selected);
+        }
+        surface.flush();
+
+        let stride = usize::try_from(surface.stride()).expect("stride");
+        let data = surface.data().expect("píxeles");
+        let mut pixels = Vec::with_capacity(side * side);
+        for row in 0..side {
+            for column in 0..side {
+                let offset = row * stride + column * 4;
+                pixels.push([data[offset + 2], data[offset + 1], data[offset]]);
+            }
+        }
+        (side, pixels)
+    }
+
+    /// Inclusive `(x0, y0, x1, y1)` box of the pixels `keep` accepts.
+    fn pixel_box(
+        side: usize,
+        pixels: &[[u8; 3]],
+        keep: impl Fn([u8; 3]) -> bool,
+    ) -> Option<(usize, usize, usize, usize)> {
+        let mut bounds: Option<(usize, usize, usize, usize)> = None;
+        for (index, pixel) in pixels.iter().copied().enumerate() {
+            if !keep(pixel) {
+                continue;
+            }
+            let (x, y) = (index % side, index / side);
+            bounds = Some(match bounds {
+                None => (x, y, x, y),
+                Some((x0, y0, x1, y1)) => (x0.min(x), y0.min(y), x1.max(x), y1.max(y)),
+            });
+        }
+        bounds
+    }
+
+    fn is_blue(pixel: [u8; 3]) -> bool {
+        let [red, green, blue] = pixel;
+        blue > 200 && red < 150 && green < 200
+    }
+
+    fn is_black(pixel: [u8; 3]) -> bool {
+        pixel[0] < 80 && pixel[1] < 80 && pixel[2] < 80
+    }
+
+    #[test]
+    fn a_selected_note_draws_its_text_inside_the_dashed_box() {
+        // The box is the measured size of the text, the same rectangle the click
+        // anchor and the `/Rect` use.
+        let runs = vec![run("Nota dentro de la caja", 12.0, NOTE_COLOR)];
+        let (width, height) = measure_text(&runs);
+        let note = TextNote::new(0, (10.0, 10.0), width, height, runs);
+        let (side, pixels) = note_pixels(&note, true);
+
+        let dashed = pixel_box(side, &pixels, is_blue).expect("el recuadro punteado se pinta");
+        let ink = pixel_box(side, &pixels, is_black).expect("el texto se pinta en negro");
+
+        assert!(
+            dashed.0 <= ink.0 && dashed.1 <= ink.1 && dashed.2 >= ink.2 && dashed.3 >= ink.3,
+            "el recuadro {dashed:?} tiene que rodear la tinta {ink:?}"
+        );
+        assert!(
+            ink.1 > dashed.1,
+            "el texto no puede quedar por encima del recuadro: tinta {ink:?}, caja {dashed:?}"
+        );
+    }
+
+    #[test]
+    fn a_note_with_two_runs_paints_each_run_in_its_own_color() {
+        let note = TextNote::new(
+            0,
+            (10.0, 10.0),
+            160.0,
+            20.0,
+            vec![
+                run("rojo ", 12.0, [1.0, 0.0, 0.0]),
+                run("verde", 12.0, [0.0, 0.6, 0.0]),
+            ],
+        );
+        let (_, pixels) = note_pixels(&note, false);
+
+        let red = pixels
+            .iter()
+            .filter(|pixel| pixel[0] > 150 && pixel[1] < 100 && pixel[2] < 100)
+            .count();
+        let green = pixels
+            .iter()
+            .filter(|pixel| pixel[1] > 100 && pixel[0] < 100 && pixel[2] < 100)
+            .count();
+
+        assert!(red > 0, "el primer tramo se pinta de rojo");
+        assert!(green > 0, "el segundo tramo se pinta de verde");
+    }
+
+    #[test]
+    fn a_single_run_keeps_the_size_the_font_description_gave() {
+        // The attributes replaced the layout's font description: a note with one
+        // run has to keep exactly the size it measured before.
+        let font = FontChoice {
+            family: "Sans".to_string(),
+            size: 12.0,
+            bold: true,
+            italic: true,
+        };
+        let context = pango::Context::new();
+        context.set_font_map(Some(&pangocairo::FontMap::default()));
+        pangocairo::functions::context_set_resolution(&context, 72.0);
+        let layout = pango::Layout::new(&context);
+        layout.set_font_description(Some(&font_description(&font, 1.0)));
+        layout.set_text("Nota");
+        let (_, logical) = layout.extents();
+        let scale = f64::from(pango::SCALE);
+        let expected = (
+            f64::from(logical.width()) / scale,
+            f64::from(logical.height()) / scale,
+        );
+
+        let measured = measure_text(&[TextRun {
+            text: "Nota".to_string(),
+            font,
+            color: NOTE_COLOR,
+        }]);
+        assert_eq!(measured, expected, "Pango mide igual por atributos que por descripción");
+    }
+
+    #[test]
+    fn measure_text_uses_the_style_of_every_run() {
+        let small = vec![run("MMMM", 12.0, NOTE_COLOR)];
+        let large = vec![run("MMMM", 24.0, NOTE_COLOR)];
+        let mixed = vec![
+            run("MMMM", 12.0, NOTE_COLOR),
+            run("MMMM", 24.0, NOTE_COLOR),
+        ];
+
+        let (small_width, small_height) = measure_text(&small);
+        let (large_width, _) = measure_text(&large);
+        let (mixed_width, mixed_height) = measure_text(&mixed);
+
+        assert!(
+            large_width > small_width,
+            "un tramo más grande mide más ancho: {large_width} > {small_width}"
+        );
+        assert!(
+            (mixed_width - (small_width + large_width)).abs() < 2.0,
+            "el ancho suma los dos tramos: {mixed_width} ~ {}",
+            small_width + large_width
+        );
+        assert!(
+            mixed_height > small_height,
+            "el alto lo decide el tramo más alto: {mixed_height} > {small_height}"
+        );
+    }
 }

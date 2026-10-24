@@ -181,6 +181,21 @@ impl FontChoice {
     }
 }
 
+/// Color con el que empieza toda nota: negro, el que tenía el texto antes de
+/// poder elegirlo.
+pub const NOTE_COLOR: [f64; 3] = [0.0, 0.0, 0.0];
+
+/// Un tramo del texto de la nota: caracteres consecutivos con la misma fuente y
+/// el mismo color. El texto de la nota es la concatenación de sus tramos, así que
+/// cambiar la fuente de una palabra no reescribe el resto.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextRun {
+    pub text: String,
+    pub font: FontChoice,
+    /// Color RGB con componentes en `0..=1`.
+    pub color: [f64; 3],
+}
+
 /// Una nota de texto insertada en la página.
 /// `at` es la esquina superior izquierda del texto en puntos PDF con el origen
 /// arriba a la izquierda (el mismo espacio que la selección).
@@ -190,8 +205,42 @@ pub struct TextNote {
     pub at: (f64, f64),
     pub width: f64,
     pub height: f64,
-    pub text: String,
-    pub font: FontChoice,
+    /// Tramos en orden de lectura; juntos forman el texto de la nota.
+    pub runs: Vec<TextRun>,
+}
+
+impl TextNote {
+    pub fn new(
+        page: usize,
+        at: (f64, f64),
+        width: f64,
+        height: f64,
+        runs: Vec<TextRun>,
+    ) -> Self {
+        Self {
+            page,
+            at,
+            width,
+            height,
+            runs,
+        }
+    }
+
+    /// Texto plano de la nota: los tramos concatenados.
+    pub fn text(&self) -> String {
+        self.runs.iter().map(|run| run.text.as_str()).collect()
+    }
+
+    /// Fuente del primer tramo, que es la que se escribe en el PDF: una
+    /// anotación `/FreeText` solo admite una fuente en su `/DA`.
+    pub fn font(&self) -> Option<&FontChoice> {
+        self.runs.first().map(|run| &run.font)
+    }
+
+    /// Color del primer tramo, con negro como respaldo.
+    pub fn color(&self) -> [f64; 3] {
+        self.runs.first().map_or(NOTE_COLOR, |run| run.color)
+    }
 }
 
 /// Cualquier cosa que el lector agregue al documento.
@@ -215,7 +264,7 @@ impl Annotation {
     pub fn is_empty(&self) -> bool {
         match self {
             Self::Mark(mark) => mark.is_empty(),
-            Self::Note(note) => note.text.trim().is_empty(),
+            Self::Note(note) => note.text().trim().is_empty(),
         }
     }
 }
@@ -455,14 +504,60 @@ mod tests {
 
     /// Nota de texto con un recuadro conocido, para las pruebas.
     fn note(text: &str) -> TextNote {
-        TextNote {
-            page: 2,
-            at: (10.0, 20.0),
-            width: 30.0,
-            height: 5.0,
-            text: text.to_string(),
-            font: font("Sans", false, false),
-        }
+        TextNote::new(
+            2,
+            (10.0, 20.0),
+            30.0,
+            5.0,
+            vec![TextRun {
+                text: text.to_string(),
+                font: font("Sans", false, false),
+                color: NOTE_COLOR,
+            }],
+        )
+    }
+
+    #[test]
+    fn a_note_concatenates_its_runs_and_reports_the_first_style() {
+        let styled = TextNote::new(
+            0,
+            (5.0, 6.0),
+            40.0,
+            12.0,
+            vec![
+                TextRun {
+                    text: "Hola ".to_string(),
+                    font: font("Times New Roman", false, false),
+                    color: [1.0, 0.0, 0.0],
+                },
+                TextRun {
+                    text: "mundo".to_string(),
+                    font: font("Noto Sans Mono", true, false),
+                    color: [0.0, 0.0, 1.0],
+                },
+            ],
+        );
+
+        assert_eq!(styled.text(), "Hola mundo", "los tramos se leen en orden");
+        assert_eq!(
+            styled.font(),
+            Some(&font("Times New Roman", false, false)),
+            "el PDF escribe la fuente del primer tramo"
+        );
+        assert_eq!(
+            styled.color(),
+            [1.0, 0.0, 0.0],
+            "y también su color"
+        );
+
+        let without_runs = TextNote::new(0, (0.0, 0.0), 1.0, 1.0, Vec::new());
+        assert_eq!(without_runs.text(), "");
+        assert_eq!(without_runs.font(), None);
+        assert_eq!(
+            without_runs.color(),
+            NOTE_COLOR,
+            "sin tramos el color por omisión es negro"
+        );
     }
 
     #[test]

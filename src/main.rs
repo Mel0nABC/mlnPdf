@@ -26,7 +26,9 @@ mod tests {
     use crate::ui::actions::*;
     use std::rc::Rc;
     use crate::engine::geometry::*;
-    use crate::engine::annotation::{Annotation, FontChoice, MarkKind, TextMark, TextNote};
+    use crate::engine::annotation::{
+        Annotation, FontChoice, MarkKind, NOTE_COLOR, TextMark, TextNote, TextRun,
+    };
     use crate::ui::shell::*;
 
     /// One page, 200x100 pt, fully filled with pure red, no xref table
@@ -46,6 +48,15 @@ trailer\n<< /Root 1 0 R /Size 5 >>\n%%EOF\n";
 4 0 obj\n<< /Length 72 >>\nstream\nBT /F1 36 Tf 20 150 Td (Arriba) Tj ET\nBT /F1 36 Tf 20 30 Td (Abajo) Tj ET\nendstream\nendobj\n\
 5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n\
 trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
+
+    /// Una página alta, de 200x1200 pt, rellena de rojo puro: alcanza para hacer
+    /// scroll al 100 % y observar el ancla del zoom y el centrado de la página.
+    const TALL_PAGE_PDF: &[u8] = b"%PDF-1.4\n\
+1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\
+2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n\
+3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 1200] /Contents 4 0 R /Resources << >> >>\nendobj\n\
+4 0 obj\n<< /Length 27 >>\nstream\n1 0 0 rg\n0 0 200 1200 re\nf\nendstream\nendobj\n\
+trailer\n<< /Root 1 0 R /Size 5 >>\n%%EOF\n";
 
     fn red_page() -> (poppler::Document, poppler::Page) {
         let document =
@@ -547,7 +558,11 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
             bold: true,
             italic: false,
         };
-        viewer.apply_text_draft("Nota (insertada) ñandú".to_string(), note_font.clone());
+        viewer.apply_text_draft(vec![TextRun {
+            text: "Nota (insertada) ñandú".to_string(),
+            font: note_font.clone(),
+            color: NOTE_COLOR,
+        }]);
         assert!(
             viewer.text_tool_active(),
             "Insertar texto deja la herramienta armada para el clic"
@@ -579,8 +594,12 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
             (40.0, 20.0),
             "el clic fija la esquina superior izquierda"
         );
-        assert_eq!(note.text, "Nota (insertada) ñandú");
-        assert_eq!(note.font, note_font, "la fuente elegida viaja con la nota");
+        assert_eq!(note.text(), "Nota (insertada) ñandú");
+        assert_eq!(
+            note.font(),
+            Some(&note_font),
+            "la fuente elegida viaja con la nota"
+        );
         assert!(
             note.width > 50.0 && note.height > 1.0,
             "Pango mide el texto en puntos: {}x{}",
@@ -594,6 +613,30 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
             annotation_ink(&viewer, 0) > 0,
             "la nota se pinta en la capa de la página"
         );
+
+        // S1: el recuadro punteado de la nota elegida rodea el texto en vez de
+        // quedar justo por encima. Se rasteriza la capa de anotaciones y se
+        // comparan la caja del contorno azul y la de la tinta negra.
+        viewer.select_note(Some(edit_id(&viewer, 4)));
+        let side = 200;
+        let pixels = annotation_pixels(&viewer, 0, side, side);
+        let dashed = pixel_box(side, &pixels, |[red, green, blue]| {
+            blue > 200 && red < 150 && green < 200
+        })
+        .expect("el recuadro punteado se pinta");
+        let ink = pixel_box(side, &pixels, |[red, green, blue]| {
+            red < 80 && green < 80 && blue < 80
+        })
+        .expect("el texto se pinta en negro");
+        assert!(
+            dashed.0 <= ink.0 && dashed.1 <= ink.1 && dashed.2 >= ink.2 && dashed.3 >= ink.3,
+            "el recuadro {dashed:?} tiene que rodear la tinta {ink:?}"
+        );
+        assert!(
+            ink.1 > dashed.1,
+            "el texto no puede quedar por encima del recuadro: tinta {ink:?}, caja {dashed:?}"
+        );
+        viewer.select_note(None);
 
         // Deshacer y rehacer también alcanzan a la nota.
         assert!(viewer.undo(), "deshacer alcanza a la nota");
@@ -862,7 +905,7 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
         // texto, todo sobre la misma anotación que ya está en el archivo.
         let note_id = edit_id(&viewer, 4);
         let before = note_value(&viewer, 4);
-        assert_eq!(before.text, "Nota (insertada) ñandú");
+        assert_eq!(before.text(), "Nota (insertada) ñandú");
 
         // Un clic sobre la nota la elige y habilita sus acciones.
         viewer.select_note(Some(note_id.clone()));
@@ -928,12 +971,19 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
         // Editar el texto: se vuelve a medir con Pango y la nota cambia de ancho.
         let longer = "Una nota bastante más larga que la anterior".to_string();
         assert!(
-            viewer.apply_note_text(&note_id, longer.clone(), note_font.clone()),
+            viewer.apply_note_text(
+                &note_id,
+                vec![TextRun {
+                    text: longer.clone(),
+                    font: note_font.clone(),
+                    color: NOTE_COLOR,
+                }],
+            ),
             "el texto nuevo se aplica a la nota elegida"
         );
         let edited = note_value(&viewer, 4);
-        assert_eq!(edited.text, longer);
-        assert_eq!(edited.font, note_font, "la fuente se conserva");
+        assert_eq!(edited.text(), longer);
+        assert_eq!(edited.font(), Some(&note_font), "la fuente se conserva");
         assert!(
             edited.width > moved.width,
             "la nota se vuelve a medir: {} > {}",
@@ -941,6 +991,43 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
             moved.width
         );
         assert!(viewer.has_pending_marks());
+
+        // S8: dos tramos con colores distintos se pintan cada uno con el suyo,
+        // mientras el texto que se escribe al PDF sigue siendo el mismo.
+        assert!(
+            viewer.apply_note_text(
+                &note_id,
+                vec![
+                    TextRun {
+                        text: longer.chars().take(8).collect(),
+                        font: note_font.clone(),
+                        color: [0.8, 0.0, 0.0],
+                    },
+                    TextRun {
+                        text: longer.chars().skip(8).collect(),
+                        font: note_font.clone(),
+                        color: [0.0, 0.6, 0.0],
+                    },
+                ],
+            ),
+            "los tramos con color se aplican a la nota"
+        );
+        let pixels = annotation_pixels(&viewer, 0, 700, 400);
+        let red = pixels
+            .iter()
+            .filter(|[red, green, blue]| *red > 120 && *green < 80 && *blue < 80)
+            .count();
+        let green = pixels
+            .iter()
+            .filter(|[red, green, blue]| *green > 80 && *red < 80 && *blue < 80)
+            .count();
+        assert!(red > 0, "el primer tramo se pinta de rojo");
+        assert!(green > 0, "el segundo tramo se pinta de verde");
+        assert_eq!(
+            note_value(&viewer, 4).text(),
+            longer,
+            "cambiar el color no cambia el texto"
+        );
 
         // Guardar después de mover y de editar: el archivo mantiene una sola
         // anotación por nota, con el texto nuevo, y poppler lo sigue abriendo.
@@ -978,6 +1065,101 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
         );
         assert!(viewer.annot.selected.borrow().is_none());
 
+        // Clicar la página suelta el foco de los campos: con el buscador
+        // enfocado, Supr editaría el campo y nunca llegaría a la nota.
+        viewer.ui.search_entry.grab_focus();
+        viewer.release_text_focus();
+        assert!(
+            gtk::prelude::GtkWindowExt::focus(&viewer.ui.window).is_none(),
+            "clicar la página deja la ventana sin foco de texto"
+        );
+
+        // El menú contextual usa acciones propias del popover: editar abre el
+        // diálogo (después de cerrarse el menú) y borrar quita la nota.
+        let menu_anchor = viewer.doc.slots.borrow()[0].canvas.clone();
+        viewer.select_note(Some(note_id.clone()));
+        let popover = viewer.open_note_menu(note_id.clone(), &menu_anchor, 20.0, 20.0);
+        assert!(
+            popover.activate_action("note.edit", None).is_ok(),
+            "Editar texto es una acción del menú de la nota"
+        );
+        popover.popdown();
+        popover.unparent();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut dialog: Option<gtk::Window> = None;
+        while dialog.is_none() && std::time::Instant::now() < deadline {
+            gtk::glib::MainContext::default().iteration(false);
+            dialog = gtk::Window::list_toplevels()
+                .into_iter()
+                .filter(|widget| *widget != viewer.ui.window)
+                .find_map(|widget| widget.downcast::<gtk::Window>().ok());
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            dialog.is_some(),
+            "Editar texto desde el menú abre el diálogo de edición"
+        );
+        assert!(
+            click_dialog_button(&viewer, "Cancelar"),
+            "el diálogo de edición se cierra con Cancelar"
+        );
+
+        viewer.select_note(Some(note_id.clone()));
+        let popover = viewer.open_note_menu(note_id.clone(), &menu_anchor, 20.0, 20.0);
+        assert!(
+            popover.activate_action("note.delete", None).is_ok(),
+            "Borrar es una acción del menú de la nota"
+        );
+        popover.popdown();
+        popover.unparent();
+        assert!(
+            !viewer
+                .annot
+                .edits
+                .borrow()
+                .iter()
+                .any(|edit| edit.id == note_id),
+            "Borrar desde el menú quita la nota elegida"
+        );
+
+        // Página alta: el zoom conserva el punto del documento que está bajo el
+        // puntero y elegir la página la deja centrada en la ventana.
+        let tall_path = dir.join("tall-page-ui.pdf");
+        std::fs::write(&tall_path, TALL_PAGE_PDF).expect("write tall PDF");
+        viewer.open(&tall_path).expect("open the tall page");
+        viewer.input.pointer.set(Some((450.0, 450.0)));
+        let local_y = {
+            let adjustment = viewer.ui.scroller.vadjustment();
+            let layout = viewer.doc.layout.borrow();
+            let middle = adjustment.value() + 450.0;
+            middle - layout.page_offset(layout.page_at(middle))
+        };
+        viewer.apply_zoom(2.0);
+        {
+            let adjustment = viewer.ui.scroller.vadjustment();
+            let layout = viewer.doc.layout.borrow();
+            let layout_top = layout.page_offset(0);
+            drop(layout);
+            let anchored = layout_top + local_y * 2.0;
+            assert!(
+                (anchored - (adjustment.value() + 450.0)).abs() < 2.0,
+                "el punto bajo el puntero se queda quieto al hacer zoom: {anchored} != {}",
+                adjustment.value() + 450.0
+            );
+        }
+        viewer.goto_page_centered(0);
+        {
+            let adjustment = viewer.ui.scroller.vadjustment();
+            let layout = viewer.doc.layout.borrow();
+            let middle = layout.page_offset(0) + layout.row_height(0) / 2.0;
+            drop(layout);
+            assert!(
+                (middle - (adjustment.value() + adjustment.page_size() / 2.0)).abs() < 2.0,
+                "la página elegida queda centrada en la ventana"
+            );
+        }
+        viewer.input.pointer.set(None);
+
         // Una sola herramienta armada: armar un marcado apaga insertar texto, y
         // Esc desarma la herramienta de texto.
         viewer.set_text_tool(true);
@@ -989,15 +1171,16 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
         );
         viewer.set_mark_mode(MarkKind::Underline, false);
 
-        viewer.apply_text_draft(
-            "Otra nota".to_string(),
-            FontChoice {
+        viewer.apply_text_draft(vec![TextRun {
+            text: "Otra nota".to_string(),
+            font: FontChoice {
                 family: "Sans".to_string(),
                 size: 12.0,
                 bold: false,
                 italic: false,
             },
-        );
+            color: NOTE_COLOR,
+        }]);
         assert!(viewer.text_tool_active());
         assert_eq!(
             viewer.escape_pressed(),
@@ -1026,6 +1209,7 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
 
         std::fs::remove_file(&text_path).ok();
         std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&tall_path).ok();
     }
 
     /// Pulsa el botón del diálogo modal que se esté mostrando encima de la
@@ -1153,11 +1337,14 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
     }
 
     /// Dibuja la capa de anotaciones de una página en una superficie aparte y
-    /// cuenta los píxeles oscuros: prueba que el texto de la nota se pinta sin
-    /// necesitar que el canvas esté en pantalla.
-    fn annotation_ink(viewer: &Viewer, page: usize) -> usize {
-        let mut surface = cairo::ImageSurface::create(cairo::Format::ARgb32, 200, 200)
-            .expect("crear la superficie");
+    /// devuelve sus píxeles como `[r, g, b]`.
+    fn annotation_pixels(viewer: &Viewer, page: usize, width: usize, height: usize) -> Vec<[u8; 3]> {
+        let mut surface = cairo::ImageSurface::create(
+            cairo::Format::ARgb32,
+            width as i32,
+            height as i32,
+        )
+        .expect("crear la superficie");
         {
             let context = cairo::Context::new(&surface).expect("contexto");
             context.set_source_rgb(1.0, 1.0, 1.0);
@@ -1167,19 +1354,45 @@ trailer\n<< /Root 1 0 R /Size 6 >>\n%%EOF\n";
         surface.flush();
 
         let stride = usize::try_from(surface.stride()).expect("stride");
-        let (width, height) = (surface.width() as usize, surface.height() as usize);
         let data = surface.data().expect("píxeles");
-        let mut dark = 0;
+        let mut pixels = Vec::with_capacity(width * height);
         for row in 0..height {
             for column in 0..width {
                 let offset = row * stride + column * 4;
-                let (blue, green, red) = (data[offset], data[offset + 1], data[offset + 2]);
-                if red < 80 && green < 80 && blue < 80 {
-                    dark += 1;
-                }
+                pixels.push([data[offset + 2], data[offset + 1], data[offset]]);
             }
         }
-        dark
+        pixels
+    }
+
+    /// Dibuja la capa de anotaciones de una página en una superficie aparte y
+    /// cuenta los píxeles oscuros: prueba que el texto de la nota se pinta sin
+    /// necesitar que el canvas esté en pantalla.
+    fn annotation_ink(viewer: &Viewer, page: usize) -> usize {
+        annotation_pixels(viewer, page, 200, 200)
+            .iter()
+            .filter(|[red, green, blue]| *red < 80 && *green < 80 && *blue < 80)
+            .count()
+    }
+
+    /// Caja `(x0, y0, x1, y1)` inclusiva de los píxeles que acepta `keep`.
+    fn pixel_box(
+        width: usize,
+        pixels: &[[u8; 3]],
+        keep: impl Fn([u8; 3]) -> bool,
+    ) -> Option<(usize, usize, usize, usize)> {
+        let mut bounds: Option<(usize, usize, usize, usize)> = None;
+        for (index, pixel) in pixels.iter().copied().enumerate() {
+            if !keep(pixel) {
+                continue;
+            }
+            let (x, y) = (index % width, index / width);
+            bounds = Some(match bounds {
+                None => (x, y, x, y),
+                Some((x0, y0, x1, y1)) => (x0.min(x), y0.min(y), x1.max(x), y1.max(y)),
+            });
+        }
+        bounds
     }
 
     /// Runs the main loop until `done` holds, so an animated change can settle.
