@@ -316,6 +316,41 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             "el menú Edit borra la nota justo después de editar: {edit_labels:?}"
         );
 
+        // Help reúne los atajos y el «Acerca de»; el icono de la aplicación se
+        // decodifica desde el PNG incrustado.
+        let help_labels: Vec<String> = (0..model.n_items())
+            .find(|index| {
+                model
+                    .item_attribute_value(*index, "label", None)
+                    .and_then(|value| value.get::<String>())
+                    .as_deref()
+                    == Some("Help")
+            })
+            .and_then(|index| model.item_link(index, "submenu"))
+            .map(|menu| {
+                (0..menu.n_items())
+                    .filter_map(|index| menu.item_attribute_value(index, "label", None))
+                    .filter_map(|value| value.get::<String>())
+                    .collect()
+            })
+            .expect("el menú Help tiene que existir");
+        assert_eq!(
+            help_labels,
+            ["Atajos de teclado…", "Acerca de MlnPdf"],
+            "Help ofrece atajos y Acerca de: {help_labels:?}"
+        );
+        assert!(
+            viewer.ui.window.lookup_action("about").is_some(),
+            "la acción Acerca de está instalada"
+        );
+        let icon = app_icon();
+        assert!(
+            icon.width() > 0 && icon.height() > 0,
+            "el icono de la aplicación se decodifica: {}x{}",
+            icon.width(),
+            icon.height()
+        );
+
         // Every declared shortcut must be a valid trigger, and every action it
         // names must exist on the window, or the key silently does nothing.
         for (trigger, action) in SHORTCUTS {

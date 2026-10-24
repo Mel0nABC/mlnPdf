@@ -147,6 +147,7 @@ pub fn build_menu_bar() -> gtk::PopoverMenuBar {
 
     let help_menu = gio::Menu::new();
     help_menu.append(Some("Atajos de teclado…"), Some("win.shortcuts"));
+    help_menu.append(Some("Acerca de MlnPdf"), Some("win.about"));
     model.append_submenu(Some("Help"), &help_menu);
 
     gtk::PopoverMenuBar::from_model(Some(&model))

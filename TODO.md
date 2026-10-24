@@ -15,6 +15,7 @@ Una línea por capacidad, sin agrupar cosas distintas en una sola casilla.
 - [x] Teclas `↑` retrocede y `↓` avanza de página
 - [x] Herramienta mano (`Space`) para desplazar arrastrando, con inercia al soltar: el arrastre sigue al puntero 1:1 y, al soltar, el scroll continúa con la velocidad que traía y frena solo. El cursor se mantiene durante el arrastre y `Esc` sale del modo
 - [x] Barra de menús con `File`, `View`, `Edit`, `Go`, `Tools`, `Settings`, `Help`
+- [x] Icono de la aplicación en la cabecera, en la ventana de Atajos y en Acerca de; «Acerca de MlnPdf» con versión, autor y repositorio
 - [x] Ir a una página concreta escribiendo el número (campo `Ir a` + `Ctrl+L`)
 - [x] `PageUp` / `PageDown`
 - [x] `Ctrl+Inicio` / `Ctrl+Fin` a primera y última página (`Home`/`End` solas quedan libres para el campo de página)

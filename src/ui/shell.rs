@@ -382,6 +382,9 @@ impl Viewer {
         let title = gtk::Label::new(Some(WINDOW_TITLE));
 
         let header = gtk::HeaderBar::new();
+        let header_icon = app_icon_image(24);
+        accessible_label(&header_icon, "MlnPdf");
+        header.pack_start(&header_icon);
         header.set_title_widget(Some(&title));
 
         let pages = gtk::Box::builder()
@@ -904,6 +907,7 @@ impl Viewer {
         Self::install_action(viewer, "print-options", |viewer| viewer.print_with_options());
         Self::install_action(viewer, "recent", |viewer| viewer.show_recent());
         Self::install_action(viewer, "shortcuts", |viewer| viewer.show_shortcuts());
+        Self::install_action(viewer, "about", |viewer| viewer.show_about());
         Self::install_action(viewer, "open", |viewer| viewer.choose_file());
         Self::install_action(viewer, "hand-mode", |viewer| viewer.toggle_hand_mode());
         Self::install_action(viewer, "underline", |viewer| {
@@ -4965,8 +4969,33 @@ impl Viewer {
             .transient_for(&self.ui.window)
             .default_width(420)
             .build();
+        let header = gtk::HeaderBar::new();
+        let icon = app_icon_image(24);
+        accessible_label(&icon, "MlnPdf");
+        header.pack_start(&icon);
+        let heading = gtk::Label::new(Some("Atajos de teclado"));
+        heading.add_css_class("title");
+        header.set_title_widget(Some(&heading));
+        window.set_titlebar(Some(&header));
         window.set_child(Some(&grid));
         window.present();
+    }
+
+    /// «Acerca de»: icono, versión, autor y repositorio de la aplicación.
+    pub(crate) fn show_about(&self) {
+        let about = gtk::AboutDialog::builder()
+            .program_name("MlnPdf")
+            .version(env!("CARGO_PKG_VERSION"))
+            .comments("Lector de PDF con búsqueda, anotaciones y edición de texto.")
+            .website("https://github.com/Mel0nABC/mlnPdf")
+            .website_label("Repositorio en GitHub")
+            .authors(["Mel0nABC"])
+            .logo(&app_icon())
+            .modal(true)
+            .transient_for(&self.ui.window)
+            .build();
+        about.set_title(Some("Acerca de MlnPdf"));
+        about.present();
     }
 
     /// Logical size of a page thumbnail at `THUMB_WIDTH`.
@@ -6220,6 +6249,19 @@ fn note_menu_button(label: &str) -> gtk::Button {
         child.set_halign(gtk::Align::Start);
     }
     button
+}
+
+/// Icono de la aplicación, incrustado para no depender del directorio de trabajo.
+pub(crate) fn app_icon() -> gdk::Texture {
+    let bytes = glib::Bytes::from_static(include_bytes!("../../mlnpdfIcon.png"));
+    gdk::Texture::from_bytes(&bytes).expect("el icono de la aplicación es un PNG válido")
+}
+
+/// El icono de la aplicación como imagen de `size` píxeles lógicos.
+fn app_icon_image(size: i32) -> gtk::Image {
+    let image = gtk::Image::from_paintable(Some(&app_icon()));
+    image.set_pixel_size(size);
+    image
 }
 
 /// Logical size of a thumbnail for a page of `size` points.

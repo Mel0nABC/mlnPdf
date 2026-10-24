@@ -80,6 +80,8 @@ ventana.
 | Inversión de colores por capas (el color de las imágenes se conserva) | `Ctrl+I` |
 | Escalado de la interfaz independiente del zoom del documento | `View > Aumentar` / `Reducir` / `Restablecer interfaz` |
 | Colores derivados del tema del sistema (incluye contraste alto) | Automático |
+| Icono de la aplicación en la cabecera, en `Atajos de teclado` y en `Acerca de` | Automático, con el PNG incrustado en el binario |
+| Acerca de MlnPdf: versión, autor y repositorio | `Help > Acerca de MlnPdf` |
 
 ### Archivos, sesión y exportación
 
