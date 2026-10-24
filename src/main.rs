@@ -1104,6 +1104,25 @@ trailer\n<< /Root 1 0 R /Size 5 >>\n%%EOF\n";
             "el diálogo de edición se cierra con Cancelar"
         );
 
+        // La opción Mover arma el cursor de cuatro flechas sobre la nota.
+        viewer.select_note(Some(note_id.clone()));
+        let popover = viewer.open_note_menu(note_id.clone(), &menu_anchor, 20.0, 20.0);
+        assert!(
+            popover.activate_action("note.move", None).is_ok(),
+            "Mover con el ratón es una acción del menú de la nota"
+        );
+        popover.popdown();
+        popover.unparent();
+        assert!(
+            viewer.annot.move_armed.get(),
+            "Mover con el ratón deja armado el cursor de mover"
+        );
+        assert_eq!(
+            viewer.annot.selected.borrow().clone(),
+            Some(note_id.clone()),
+            "Mover con el ratón deja la nota elegida"
+        );
+
         viewer.select_note(Some(note_id.clone()));
         let popover = viewer.open_note_menu(note_id.clone(), &menu_anchor, 20.0, 20.0);
         assert!(
