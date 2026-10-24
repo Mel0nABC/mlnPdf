@@ -3813,6 +3813,270 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         assert!(viewer.undo(), "mover un extremo se deshace de una vez");
         assert_eq!(shape_of(&viewer, &handle_arrow), arrow);
 
+        // S5 (T9): el relleno del rectángulo y de la elipse. La casilla está en el
+        // popover de dibujo, debajo del grosor, y se recuerda entre trazos.
+        viewer.discard_edits();
+        viewer.apply_zoom(1.0);
+        viewer.clear_selection();
+        let fill_check = viewer.ui.stroke_fill.clone();
+        assert_eq!(
+            fill_check.label().as_deref(),
+            Some("Rellenar"),
+            "la casilla del relleno se llama «Rellenar»"
+        );
+        assert_eq!(
+            fill_check.tooltip_text().as_deref(),
+            Some("Rellenar el rectángulo y la elipse con el color del trazo"),
+            "la casilla explica qué rellena y con qué color"
+        );
+        assert_eq!(
+            check_button(stroke_popover.upcast_ref::<gtk::Widget>()),
+            Some(fill_check.clone()),
+            "la casilla vive en el popover de dibujo"
+        );
+        assert!(
+            !fill_check.is_active(),
+            "arranca desmarcada: el relleno es opcional"
+        );
+
+        // Con el rectángulo armado la casilla se habilita; la forma se guarda con
+        // relleno y su interior se pinta con el color del trazo.
+        viewer.start_stroke_tool(StrokeKind::Shape(ShapeKind::Rectangle));
+        assert!(
+            fill_check.is_sensitive(),
+            "con el rectángulo armado la casilla se habilita"
+        );
+        fill_check.set_active(true);
+        assert!(
+            viewer.stroke_drag_begin(0, 30.0, 30.0),
+            "el arrastre empieza el rectángulo relleno"
+        );
+        assert!(
+            viewer.stroke_drag_update(0, 90.0, 70.0),
+            "el arrastre agranda el rectángulo"
+        );
+        assert!(viewer.stroke_drag_end(), "soltar cierra la forma");
+        let filled_rect_id = edit_id(&viewer, 0);
+        let filled_rect = shape_of(&viewer, &filled_rect_id);
+        assert!(filled_rect.filled, "la forma se guarda con relleno");
+        assert_eq!(
+            (filled_rect.from, filled_rect.to),
+            ((30.0, 30.0), (120.0, 100.0)),
+            "el relleno no cambia la geometría de la forma"
+        );
+        let side = 200usize;
+        // El interior se pinta con el color del propio trazo, sea cual sea el que
+        // el popover tenga elegido en este punto de la prueba.
+        let same_colour = |pixel: [u8; 3], shape: &Shape| {
+            pixel
+                .iter()
+                .zip(shape.color)
+                .all(|(channel, want)| (f64::from(*channel) - want * 255.0).abs() <= 2.0)
+        };
+        let filled_pixels = annotation_pixels(&viewer, 0, side, side);
+        let filled_interior = filled_pixels[65 * side + 75];
+        assert!(
+            same_colour(filled_interior, &filled_rect),
+            "el interior del rectángulo relleno se pinta con el color del trazo: \
+             {filled_interior:?}"
+        );
+
+        // La misma forma con la casilla desmarcada: solo el borde, el interior
+        // queda del color del papel. La herramienta sigue armada, así que el
+        // segundo arrastre no vuelve al menú.
+        fill_check.set_active(false);
+        assert!(
+            viewer.stroke_drag_begin(0, 30.0, 120.0),
+            "el arrastre empieza el rectángulo sin relleno"
+        );
+        assert!(
+            viewer.stroke_drag_update(0, 90.0, 50.0),
+            "el arrastre agranda el rectángulo sin relleno"
+        );
+        assert!(viewer.stroke_drag_end(), "soltar cierra la forma");
+        viewer.escape_pressed();
+        let plain_rect_id = edit_id(&viewer, 1);
+        assert!(
+            !shape_of(&viewer, &plain_rect_id).filled,
+            "sin la casilla la forma no se rellena"
+        );
+        let plain_pixels = annotation_pixels(&viewer, 0, side, side);
+        let plain_interior = plain_pixels[145 * side + 75];
+        assert!(
+            plain_interior.iter().all(|channel| *channel > 240),
+            "sin relleno el interior queda del color del papel: {plain_interior:?}"
+        );
+
+        // La elipse rellena es una elipse de verdad: el centro se pinta y la
+        // esquina de su caja queda del color del papel, así que el relleno no es
+        // un rectángulo ni un polígono tosco.
+        viewer.start_stroke_tool(StrokeKind::Shape(ShapeKind::Ellipse));
+        fill_check.set_active(true);
+        assert!(
+            viewer.stroke_drag_begin(0, 130.0, 30.0),
+            "el arrastre empieza la elipse rellena"
+        );
+        assert!(
+            viewer.stroke_drag_update(0, 60.0, 60.0),
+            "el arrastre agranda la elipse"
+        );
+        assert!(viewer.stroke_drag_end(), "soltar cierra la elipse");
+        viewer.escape_pressed();
+        let filled_ellipse = shape_of(&viewer, &edit_id(&viewer, 2));
+        assert!(filled_ellipse.filled, "la elipse se guarda con relleno");
+        let ellipse_pixels = annotation_pixels(&viewer, 0, side, side);
+        assert!(
+            same_colour(ellipse_pixels[60 * side + 160], &filled_ellipse),
+            "el centro de la elipse rellena se pinta"
+        );
+        assert!(
+            ellipse_pixels[35 * side + 135]
+                .iter()
+                .all(|channel| *channel > 240),
+            "la esquina de la caja queda fuera de la elipse rellena: {:?}",
+            ellipse_pixels[35 * side + 135]
+        );
+        fill_check.set_active(false);
+
+        // La casilla se deshabilita en las herramientas sin interior y vuelve a
+        // habilitarse en la elipse, que sí lo tiene. Su estado se recuerda.
+        for (kind, sensitive) in [
+            (StrokeKind::Shape(ShapeKind::Line), false),
+            (StrokeKind::Shape(ShapeKind::Arrow), false),
+            (StrokeKind::Ink, false),
+            (StrokeKind::Shape(ShapeKind::Rectangle), true),
+            (StrokeKind::Shape(ShapeKind::Ellipse), true),
+        ] {
+            viewer.start_stroke_tool(kind);
+            assert_eq!(
+                fill_check.is_sensitive(),
+                sensitive,
+                "la casilla y la herramienta {kind:?}"
+            );
+        }
+        assert!(
+            !fill_check.is_active(),
+            "el estado de la casilla se recuerda entre herramientas"
+        );
+        viewer.escape_pressed();
+
+        // El menú contextual de una forma ya colocada ofrece «Rellenar», y un solo
+        // deshacer lo revierte.
+        viewer.select_annotation(Some(plain_rect_id.clone()));
+        let fill_anchor = viewer.doc.slots.borrow()[0].canvas.clone();
+        let plain_menu =
+            viewer.open_annotation_menu(plain_rect_id.clone(), &fill_anchor, 20.0, 20.0);
+        let plain_labels = button_labels(plain_menu.upcast_ref::<gtk::Widget>());
+        assert!(
+            plain_labels.iter().any(|label| label == "Rellenar"),
+            "el menú de la forma sin relleno ofrece «Rellenar»: {plain_labels:?}"
+        );
+        let fill_button = labeled_button(plain_menu.upcast_ref::<gtk::Widget>(), "Rellenar")
+            .expect("el menú ofrece el botón de relleno");
+        let undo_before = viewer.annot.undo_stack.borrow().len();
+        fill_button.emit_by_name::<()>("clicked", &[]);
+        assert!(
+            shape_of(&viewer, &plain_rect_id).filled,
+            "el botón rellena la forma ya dibujada"
+        );
+        assert_eq!(
+            viewer.annot.undo_stack.borrow().len(),
+            undo_before + 1,
+            "el relleno del menú deja una sola instantánea"
+        );
+        let refilled = annotation_pixels(&viewer, 0, side, side);
+        assert!(
+            same_colour(refilled[145 * side + 75], &shape_of(&viewer, &plain_rect_id)),
+            "el interior se repinta con el relleno"
+        );
+        assert!(viewer.undo(), "un solo deshacer quita el relleno");
+        assert!(
+            !shape_of(&viewer, &plain_rect_id).filled,
+            "deshacer deja la forma como estaba, sin relleno"
+        );
+        drop(plain_menu);
+
+        // Con la forma rellena el menú ofrece quitar el relleno.
+        viewer.select_annotation(Some(filled_rect_id.clone()));
+        let filled_menu =
+            viewer.open_annotation_menu(filled_rect_id.clone(), &fill_anchor, 20.0, 20.0);
+        let filled_labels = button_labels(filled_menu.upcast_ref::<gtk::Widget>());
+        assert!(
+            filled_labels.iter().any(|label| label == "Quitar relleno"),
+            "el menú de la forma rellena ofrece «Quitar relleno»: {filled_labels:?}"
+        );
+        filled_menu.popdown();
+
+        // En una línea el botón no aparece: su tipo no tiene interior.
+        let bare_line = "mlnpdf-relleno-linea".to_string();
+        viewer.annot.edits.borrow_mut().push(Edit {
+            id: bare_line.clone(),
+            value: Annotation::Shape(Shape::new(
+                0,
+                ShapeKind::Line,
+                (20.0, 180.0),
+                (120.0, 180.0),
+                [0.0, 0.0, 0.0],
+                2.0,
+            )),
+        });
+        viewer.select_annotation(Some(bare_line.clone()));
+        let line_anchor = viewer.doc.slots.borrow()[0].canvas.clone();
+        let line_menu = viewer.open_annotation_menu(bare_line.clone(), &line_anchor, 20.0, 20.0);
+        let line_labels = button_labels(line_menu.upcast_ref::<gtk::Widget>());
+        assert!(
+            !line_labels
+                .iter()
+                .any(|label| label == "Rellenar" || label == "Quitar relleno"),
+            "en una línea el menú no ofrece relleno: {line_labels:?}"
+        );
+        line_menu.popdown();
+
+        // El relleno alcanza a todas las formas elegidas que lo admiten, con una
+        // sola instantánea: con la línea y el rectángulo elegidos, el rectángulo se
+        // rellena y la línea queda como está.
+        viewer.select_annotation(Some(plain_rect_id.clone()));
+        viewer.toggle_annotation_selection(&bare_line);
+        assert_eq!(
+            viewer.selected_ids(),
+            vec![plain_rect_id.clone(), bare_line.clone()],
+            "las dos formas quedan elegidas"
+        );
+        let both_menu = viewer.open_annotation_menu(bare_line.clone(), &line_anchor, 20.0, 20.0);
+        let both_fill = labeled_button(both_menu.upcast_ref::<gtk::Widget>(), "Rellenar")
+            .expect("el conjunto ofrece rellenar la forma que lo admite");
+        let undo_before_both = viewer.annot.undo_stack.borrow().len();
+        both_fill.emit_by_name::<()>("clicked", &[]);
+        assert!(
+            shape_of(&viewer, &plain_rect_id).filled,
+            "el rectángulo del conjunto se rellena"
+        );
+        assert!(
+            !shape_of(&viewer, &bare_line).filled,
+            "la línea del conjunto sigue sin interior"
+        );
+        assert_eq!(
+            viewer.annot.undo_stack.borrow().len(),
+            undo_before_both + 1,
+            "el relleno del conjunto deja una sola instantánea"
+        );
+        assert!(
+            viewer.undo(),
+            "el relleno del conjunto se deshace de una vez"
+        );
+        assert!(
+            !shape_of(&viewer, &plain_rect_id).filled,
+            "deshacer deja las dos formas como estaban"
+        );
+        drop(both_menu);
+
+        // El estado queda como estaba: sin formas, sin selección y con la casilla
+        // desmarcada.
+        fill_check.set_active(false);
+        viewer.discard_edits();
+        assert!(viewer.annot.edits.borrow().is_empty());
+        assert!(viewer.selected_ids().is_empty());
+
         // El estado queda como estaba: documento de la prueba, sin anotaciones y
         // sin ningún arrastre vivo.
         viewer.discard_edits();
@@ -3909,6 +4173,21 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         let mut child = widget.first_child();
         while let Some(current) = child {
             if let Some(found) = spin_button(&current) {
+                return Some(found);
+            }
+            child = current.next_sibling();
+        }
+        None
+    }
+
+    /// Busca la primera casilla de verificación dentro del árbol de un popover.
+    fn check_button(widget: &gtk::Widget) -> Option<gtk::CheckButton> {
+        if let Some(check) = widget.downcast_ref::<gtk::CheckButton>() {
+            return Some(check.clone());
+        }
+        let mut child = widget.first_child();
+        while let Some(current) = child {
+            if let Some(found) = check_button(&current) {
                 return Some(found);
             }
             child = current.next_sibling();

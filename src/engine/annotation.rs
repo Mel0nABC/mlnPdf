@@ -333,11 +333,16 @@ pub struct Shape {
     pub color: [f64; 3],
     /// Grosor en puntos, recortado a `STROKE_MIN_WIDTH..=STROKE_MAX_WIDTH`.
     pub width: f64,
+    /// True cuando el interior se pinta con el mismo color del trazo. Solo el
+    /// rectángulo y la elipse tienen interior; en la línea y la flecha el
+    /// relleno no existe.
+    pub filled: bool,
 }
 
 impl Shape {
     /// Forma con su página, su tipo, sus dos extremos, su color y su grosor. El
-    /// color se recorta a `0..=1` y el grosor al rango de las formas.
+    /// color se recorta a `0..=1` y el grosor al rango de las formas. Nace sin
+    /// relleno: es lo que hace `with_fill`.
     pub fn new(
         page: usize,
         kind: ShapeKind,
@@ -353,7 +358,24 @@ impl Shape {
             to,
             color: color.map(|component| component.clamp(0.0, 1.0)),
             width: clamp_stroke_width(width),
+            filled: false,
         }
+    }
+
+    /// La misma forma con el relleno indicado. El interior usa el mismo color que
+    /// el trazo, así que no hay un segundo color que guardar. La geometría, el
+    /// color, el grosor y la página se copian tal como estaban; la línea y la
+    /// flecha no tienen interior, así que `with_fill(true)` las deja igual.
+    pub fn with_fill(&self, filled: bool) -> Shape {
+        let mut shape = self.clone();
+        shape.filled = filled && self.can_be_filled();
+        shape
+    }
+
+    /// True cuando el tipo de forma tiene interior que rellenar: el rectángulo y
+    /// la elipse sí, la línea y la flecha no.
+    pub fn can_be_filled(&self) -> bool {
+        matches!(self.kind, ShapeKind::Rectangle | ShapeKind::Ellipse)
     }
 
     /// Caja de la forma: las dos esquinas opuestas, con el mínimo y el máximo en
@@ -2829,6 +2851,57 @@ mod tests {
         let line = Shape::new(0, ShapeKind::Line, (10.0, 40.0), (50.0, 40.0), [0.0, 0.0, 0.0], 2.0);
         assert!(line.covers((30.0, 40.0), 0.5), "el segmento se agarra sobre él");
         assert!(!line.covers((30.0, 45.0), 0.5), "lejos del segmento no hay nada");
+    }
+
+    #[test]
+    fn a_shape_starts_without_fill_and_only_the_box_shapes_admit_it() {
+        for (kind, fillable) in [
+            (ShapeKind::Rectangle, true),
+            (ShapeKind::Ellipse, true),
+            (ShapeKind::Line, false),
+            (ShapeKind::Arrow, false),
+        ] {
+            let shape = Shape::new(0, kind, (10.0, 20.0), (50.0, 60.0), [0.1, 0.2, 0.3], 2.0);
+            assert!(!shape.filled, "{kind:?} nace sin relleno");
+            assert_eq!(shape.can_be_filled(), fillable, "{kind:?} y su interior");
+        }
+    }
+
+    #[test]
+    fn with_fill_copies_the_shape_and_leaves_the_lines_alone() {
+        let rectangle = Shape::new(
+            0,
+            ShapeKind::Rectangle,
+            (10.0, 20.0),
+            (50.0, 60.0),
+            [0.2, 0.4, 0.6],
+            3.0,
+        );
+        let filled = rectangle.with_fill(true);
+        assert!(filled.filled, "el rectángulo se rellena");
+        assert_eq!(filled.page, rectangle.page, "la página no cambia");
+        assert_eq!(filled.kind, rectangle.kind, "el tipo no cambia");
+        assert_eq!(
+            (filled.from, filled.to),
+            (rectangle.from, rectangle.to),
+            "la geometría se copia"
+        );
+        assert_eq!(
+            filled.color, rectangle.color,
+            "el relleno usa el mismo color que el trazo"
+        );
+        assert!(
+            (filled.width - rectangle.width).abs() < 1e-9,
+            "el grosor no cambia"
+        );
+        assert!(!filled.with_fill(false).filled, "quitar el relleno lo apaga");
+
+        for kind in [ShapeKind::Line, ShapeKind::Arrow] {
+            let line = Shape::new(0, kind, (10.0, 20.0), (50.0, 60.0), [0.0, 0.0, 0.0], 2.0);
+            assert!(!line.can_be_filled(), "{kind:?} no tiene interior");
+            assert_eq!(line.with_fill(true), line, "{kind:?} se queda igual");
+            assert!(!line.with_fill(true).filled, "{kind:?} no se rellena");
+        }
     }
 
     #[test]

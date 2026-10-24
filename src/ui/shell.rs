@@ -187,6 +187,10 @@ pub(crate) struct UiHandles {
     /// Grosor en puntos que comparten el lápiz y las formas; se recuerda entre
     /// trazos.
     pub(crate)     stroke_width: gtk::SpinButton,
+    /// Casilla «Rellenar» del popover de dibujo: el interior del rectángulo y de
+    /// la elipse se pinta con el color del trazo. Se recuerda entre trazos y se
+    /// deshabilita en las herramientas que no tienen interior.
+    pub(crate)     stroke_fill: gtk::CheckButton,
     /// Selector de color del trazo, también recordado entre trazos.
     pub(crate)     stroke_color: StrokeColorUi,
     /// Los tres botones de la sección «Sellos» del popover de dibujo, en el orden
@@ -299,8 +303,17 @@ pub(crate) enum StrokeKind {
     Shape(ShapeKind),
 }
 
-/// La herramienta de dibujo armada, con el color y el grosor que se recuerdan
-/// para el trazo siguiente.
+impl StrokeKind {
+    /// True cuando la herramienta tiene interior que rellenar: el rectángulo y la
+    /// elipse. El lápiz, la línea y la flecha no, así que la casilla «Rellenar»
+    /// se deshabilita cuando alguno de ellos está armado.
+    pub(crate) fn can_be_filled(self) -> bool {
+        matches!(self, Self::Shape(ShapeKind::Rectangle | ShapeKind::Ellipse))
+    }
+}
+
+/// La herramienta de dibujo armada, con el color, el grosor y el relleno que se
+/// recuerdan para el trazo siguiente.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct StrokeTool {
     pub(crate) kind: StrokeKind,
@@ -308,6 +321,9 @@ pub(crate) struct StrokeTool {
     pub(crate) color: (f64, f64, f64),
     /// Grosor en puntos, dentro de `STROKE_MIN_WIDTH..=STROKE_MAX_WIDTH`.
     pub(crate) width: f64,
+    /// True cuando la forma se guarda con su interior pintado. La casilla
+    /// «Rellenar» lo decide y solo lo admiten el rectángulo y la elipse.
+    pub(crate) filled: bool,
 }
 
 impl StrokeTool {
@@ -350,14 +366,17 @@ impl StrokeDrag {
                     self.tool.width,
                 )))
             }
-            StrokeKind::Shape(kind) => Some(Annotation::Shape(Shape::new(
-                self.page,
-                kind,
-                self.from,
-                self.to,
-                self.tool.rgb(),
-                self.tool.width,
-            ))),
+            StrokeKind::Shape(kind) => Some(Annotation::Shape(
+                Shape::new(
+                    self.page,
+                    kind,
+                    self.from,
+                    self.to,
+                    self.tool.rgb(),
+                    self.tool.width,
+                )
+                .with_fill(self.tool.filled),
+            )),
         }
     }
 
@@ -628,8 +647,15 @@ impl Viewer {
         // Quinta herramienta: dibujar. Un solo botón abre el popover con el
         // lápiz, las cuatro formas, el grosor libre, el color, la nota adhesiva y
         // los sellos predefinidos.
-        let (stroke_button, stroke_tools, stroke_width, stroke_color, sticky_button, stamp_buttons) =
-            build_stroke_menu();
+        let (
+            stroke_button,
+            stroke_tools,
+            stroke_width,
+            stroke_fill,
+            stroke_color,
+            sticky_button,
+            stamp_buttons,
+        ) = build_stroke_menu();
 
         let title = gtk::Label::new(Some(WINDOW_TITLE));
 
@@ -790,6 +816,7 @@ impl Viewer {
                 stroke_button: stroke_button.clone(),
                 stroke_tools: stroke_tools.clone(),
                 stroke_width: stroke_width.clone(),
+                stroke_fill: stroke_fill.clone(),
                 stroke_color: stroke_color.clone(),
                 stamp_buttons: stamp_buttons.clone(),
             },
@@ -2449,13 +2476,18 @@ impl Viewer {
         self.set_text_tool(false);
         self.set_sticky_tool(false);
 
-        // El grosor y el color salen de los controles del popover, que conservan
-        // lo último que se eligió para el trazo siguiente.
+        // El grosor, el color y el relleno salen de los controles del popover,
+        // que conservan lo último que se eligió para el trazo siguiente. El
+        // relleno solo se aplica a las formas que lo admiten, y la casilla queda
+        // deshabilitada en las que no.
         let rgba = self.ui.stroke_color.value.get();
+        let fillable = kind.can_be_filled();
+        self.ui.stroke_fill.set_sensitive(fillable);
         let tool = StrokeTool {
             kind,
             color: rgba,
             width: clamp_stroke_width(self.ui.stroke_width.value()),
+            filled: fillable && self.ui.stroke_fill.is_active(),
         };
         *self.annot.stroke_tool.borrow_mut() = Some(tool);
         self.refresh_page_cursor();
@@ -4207,6 +4239,77 @@ impl Viewer {
         true
     }
 
+    /// Estado de relleno que manda en la selección: el de la forma principal, que
+    /// es la última elegida. Si la principal no tiene interior, manda la última
+    /// elegida que sí, y `None` cuando ninguna de las elegidas admite relleno.
+    fn selection_filled(&self) -> Option<bool> {
+        let selected = self.selected_ids();
+        let edits = self.annot.edits.borrow();
+        selected
+            .iter()
+            .filter_map(|id| {
+                edits
+                    .iter()
+                    .find(|edit| edit.id == *id)
+                    .and_then(|edit| match &edit.value {
+                        Annotation::Shape(shape) if shape.can_be_filled() => Some(shape.filled),
+                        _ => None,
+                    })
+            })
+            .next_back()
+    }
+
+    /// Rellena o quita el relleno de todas las formas elegidas que lo admiten, con
+    /// una sola instantánea de deshacer: el cambio del conjunto se deshace de una
+    /// vez, como el color y el borrado. La línea, la flecha y las demás
+    /// anotaciones no cambian. Devuelve si cambió algo; un conjunto que ya está
+    /// como se pide no toca nada.
+    pub(crate) fn set_selection_fill(&self, filled: bool) -> bool {
+        let selected = self.selected_ids();
+        let changing: Vec<String> = {
+            let edits = self.annot.edits.borrow();
+            selected
+                .iter()
+                .filter(|id| {
+                    edits
+                        .iter()
+                        .find(|edit| edit.id == **id)
+                        .is_some_and(|edit| match &edit.value {
+                            Annotation::Shape(shape) => {
+                                shape.can_be_filled() && shape.filled != filled
+                            }
+                            _ => false,
+                        })
+                })
+                .cloned()
+                .collect()
+        };
+        if changing.is_empty() {
+            return false;
+        }
+        let pages = self.selection_pages(&changing);
+        self.begin_edit();
+        for edit in self.annot.edits.borrow_mut().iter_mut() {
+            if !changing.iter().any(|id| *id == edit.id) {
+                continue;
+            }
+            if let Annotation::Shape(shape) = &mut edit.value {
+                *shape = shape.with_fill(filled);
+            }
+        }
+        for page in pages {
+            self.queue_page_draw(page);
+        }
+        let message = match (filled, changing.len()) {
+            (true, 1) => "Relleno aplicado".to_string(),
+            (true, count) => format!("Relleno aplicado en {count} formas"),
+            (false, 1) => "Relleno quitado".to_string(),
+            (false, count) => format!("Relleno quitado en {count} formas"),
+        };
+        self.announce_change(&message);
+        true
+    }
+
     /// Diálogo de color de lo elegido: el mismo selector de GTK que usan las
     /// herramientas, abierto sobre la ventana. Al aceptar, el color se aplica a
     /// toda la selección con `recolor_selection`.
@@ -4641,12 +4744,16 @@ impl Viewer {
     /// Empieza un trazo con la herramienta de dibujo armada y devuelve si el
     /// gesto es un dibujo: si lo es, no hay selección de texto.
     pub(crate) fn stroke_drag_begin(&self, page: usize, x: f64, y: f64) -> bool {
-        let Some(tool) = self.stroke_tool_active() else {
+        let Some(mut tool) = self.stroke_tool_active() else {
             return false;
         };
         let Some(point) = self.view_to_pdf(page, x, y) else {
             return false;
         };
+        // La casilla se vuelve a leer al empezar el trazo: cambiar el relleno
+        // entre dos formas no obliga a volver a armar la herramienta, y la línea
+        // y la flecha lo ignoran porque no tienen interior.
+        tool.filled = tool.kind.can_be_filled() && self.ui.stroke_fill.is_active();
         // El gesto dibuja: no selecciona texto ni deja una anotación elegida.
         if self.sel.selection.borrow_mut().take().is_some() {
             self.sel.selection_rects.borrow_mut().clear();
@@ -5011,6 +5118,26 @@ impl Viewer {
             });
         }
         content.append(&recolor);
+
+        // Relleno de las formas elegidas: el botón dice qué va a hacer según el
+        // estado de la principal y solo aparece si alguna elegida lo admite. La
+        // línea y la flecha no tienen interior, así que no ofrecen la acción.
+        if let Some(filled) = self.selection_filled() {
+            let fill = context_menu_button(if filled { "Quitar relleno" } else { "Rellenar" });
+            {
+                let weak = Rc::downgrade(self);
+                let popover_ref = popover.downgrade();
+                fill.connect_clicked(move |_| {
+                    if let Some(popover) = popover_ref.upgrade() {
+                        popover.popdown();
+                    }
+                    if let Some(viewer) = weak.upgrade() {
+                        viewer.set_selection_fill(!filled);
+                    }
+                });
+            }
+            content.append(&fill);
+        }
 
         let delete = context_menu_button(if is_note { "Borrar" } else { "Eliminar" });
         {
@@ -8467,7 +8594,8 @@ fn draw_ink(
 
 /// Pinta una forma: el rectángulo y la elipse se trazan sobre su caja, la línea
 /// es un segmento recto y la flecha suma una punta triangular rellena del mismo
-/// color en su segundo extremo.
+/// color en su segundo extremo. Una forma rellena pinta primero su interior y
+/// después el borde, así el contorno queda nítido sobre el relleno.
 fn draw_shape(
     context: &cairo::Context,
     shape: &Shape,
@@ -8489,13 +8617,18 @@ fn draw_shape(
                 (x1 - x2).abs(),
                 (y1 - y2).abs(),
             );
+            if shape.filled {
+                // `fill_preserve` deja el camino para trazar el borde encima.
+                let _ = context.fill_preserve();
+            }
             let _ = context.stroke();
         }
         ShapeKind::Ellipse => {
             // La elipse se inscribe en la caja con una escala temporal: el
-            // círculo unitario se estira a los dos radios y el trazo se hace
-            // después, con el contexto ya restablecido, para que el grosor no se
-            // deforme con la escala.
+            // círculo unitario se estira a los dos radios y el relleno es una
+            // elipse de verdad, no un polígono. El trazo se hace después, con el
+            // contexto ya restablecido, para que el grosor no se deforme con la
+            // escala.
             let (width, height) = ((x1 - x2).abs(), (y1 - y2).abs());
             let _ = context.save();
             context.translate(x1.min(x2) + width / 2.0, y1.min(y2) + height / 2.0);
@@ -8504,6 +8637,9 @@ fn draw_shape(
                 (height / 2.0).max(f64::MIN_POSITIVE),
             );
             context.arc(0.0, 0.0, 1.0, 0.0, std::f64::consts::TAU);
+            if shape.filled {
+                let _ = context.fill_preserve();
+            }
             let _ = context.restore();
             let _ = context.stroke();
         }
@@ -9299,13 +9435,14 @@ fn stamp_shortcut(kind: StampKind) -> &'static str {
 }
 
 /// Botón de la barra y popover de dibujo: las cinco herramientas, el grosor
-/// libre en puntos, la paleta de colores, el color a medida, la nota adhesiva y
-/// los tres sellos. Devuelve las piezas que el visor tiene que conectar y
-/// recordar.
+/// libre en puntos, la casilla de relleno, la paleta de colores, el color a
+/// medida, la nota adhesiva y los tres sellos. Devuelve las piezas que el visor
+/// tiene que conectar y recordar.
 fn build_stroke_menu() -> (
     gtk::MenuButton,
     [gtk::Button; 5],
     gtk::SpinButton,
+    gtk::CheckButton,
     StrokeColorUi,
     gtk::Button,
     [gtk::Button; 3],
@@ -9418,6 +9555,17 @@ fn build_stroke_menu() -> (
     settings.append(&width);
     settings.append(&color.swatch);
 
+    // Casilla de relleno, debajo del grosor: el interior del rectángulo y de la
+    // elipse se pinta con el color del trazo, así que no hace falta un segundo
+    // color. Su estado se recuerda entre trazos, como el grosor y el color.
+    let fill = gtk::CheckButton::with_label("Rellenar");
+    fill.set_tooltip_text(Some("Rellenar el rectángulo y la elipse con el color del trazo"));
+    fill.set_halign(gtk::Align::Start);
+    accessible_label(
+        &fill,
+        "Rellenar el rectángulo y la elipse con el color del trazo",
+    );
+
     let colors = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     let color_label = gtk::Label::new(Some("Color"));
     color_label.set_xalign(0.0);
@@ -9427,6 +9575,7 @@ fn build_stroke_menu() -> (
 
     content.append(&tools);
     content.append(&settings);
+    content.append(&fill);
     content.append(&colors);
 
     // La nota adhesiva comparte este popover: no es un trazo, pero también se
@@ -9475,7 +9624,7 @@ fn build_stroke_menu() -> (
         .build();
     accessible_label(&button, "Dibujar y formas");
 
-    (button, buttons, width, color, sticky, stamp_buttons)
+    (button, buttons, width, fill, color, sticky, stamp_buttons)
 }
 
 fn toolbar_gap(width: i32) -> gtk::Box {

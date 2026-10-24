@@ -339,6 +339,8 @@ fn ink_dictionary(stroke: &InkStroke, page: PageBox, id: &str) -> Object {
 
 /// Diccionario de una forma: `/Square`, `/Circle` o `/Line` según su tipo, con su
 /// caja, su color y su grosor. La flecha es una `/Line` con la punta en `/LE`.
+/// Una forma rellena suma `/IC` con el mismo color del trazo; la que no lo está
+/// no escribe `/IC`, así el archivo no cambia.
 fn shape_dictionary(shape: &Shape, page: PageBox, id: &str) -> Object {
     let from = user_point(shape.from, page);
     let to = user_point(shape.to, page);
@@ -358,8 +360,13 @@ fn shape_dictionary(shape: &Shape, page: PageBox, id: &str) -> Object {
     dictionary.set("C", color_array(shape.color));
     dictionary.set("BS", border_width(shape.width));
     match shape.kind {
-        // El rectángulo y la elipse se pintan solos: la caja dice dónde.
+        // El rectángulo y la elipse se pintan solos: la caja dice dónde. El
+        // interior es `/IC`, el campo que el formato define para él, con el mismo
+        // color que el borde.
         ShapeKind::Rectangle | ShapeKind::Ellipse => {
+            if shape.filled {
+                dictionary.set("IC", color_array(shape.color));
+            }
             dictionary.set("F", Object::Integer(4));
         }
         // La línea y la flecha necesitan sus dos extremos, en espacio de usuario.
@@ -1379,7 +1386,8 @@ fn read_ink(
 }
 
 /// Forma leída de su `/Rect` (rectángulo y elipse) o de sus dos extremos `/L`
-/// (línea y flecha), con el grosor de `/BS` y el color de `/C`.
+/// (línea y flecha), con el grosor de `/BS`, el color de `/C` y el relleno de
+/// `/IC`.
 fn read_shape(
     document: &Document,
     dictionary: &Dictionary,
@@ -1405,14 +1413,25 @@ fn read_shape(
     };
 
     let [red, green, blue] = color_of(document, dictionary);
-    Some(Annotation::Shape(Shape::new(
+    let shape = Shape::new(
         page,
         kind,
         from,
         to,
         [red, green, blue],
         stroke_width(document, dictionary),
-    )))
+    );
+    // Solo el rectángulo y la elipse tienen interior, y una forma se rellena
+    // cuando el archivo trae `/IC`; sin `/IC` se lee sin relleno, que es como
+    // quedaron las formas guardadas antes de que existiera el relleno.
+    Some(Annotation::Shape(shape.with_fill(interior(document, dictionary))))
+}
+
+/// True cuando el diccionario de una forma trae un interior `/IC` de tres
+/// componentes. Un `/IC` malformado no cuenta como relleno: la forma se lee sin
+/// él. La línea y la flecha no lo consultan, porque no tienen interior.
+fn interior(document: &Document, dictionary: &Dictionary) -> bool {
+    numbers_of(document, dictionary, b"IC").is_some_and(|components| components.len() == 3)
 }
 
 /// Tipo de una `/Line` según su `/LE`: si alguno de sus finales es una flecha
@@ -3758,6 +3777,317 @@ mod tests {
         assert!(
             dark_pixels(&std::fs::read(&target).expect("resultado"), size) > 0,
             "poppler dibuja el borde del rectángulo"
+        );
+    }
+
+    #[test]
+    fn only_a_filled_shape_writes_its_interior_colour() {
+        let source = scratch("fill.pdf");
+        let target = scratch("fill-out.pdf");
+        std::fs::write(&source, fixture([0.0, 0.0, 300.0, 200.0], 0)).expect("escribir el PDF");
+
+        let rectangle = Shape::new(
+            0,
+            ShapeKind::Rectangle,
+            (20.0, 20.0),
+            (80.0, 60.0),
+            [0.0, 0.0, 1.0],
+            2.0,
+        )
+        .with_fill(true);
+        let plain = Shape::new(
+            0,
+            ShapeKind::Rectangle,
+            (100.0, 20.0),
+            (160.0, 60.0),
+            [0.0, 1.0, 0.0],
+            2.0,
+        );
+        let ellipse = Shape::new(
+            0,
+            ShapeKind::Ellipse,
+            (20.0, 80.0),
+            (80.0, 140.0),
+            [1.0, 0.0, 0.0],
+            3.0,
+        )
+        .with_fill(true);
+        let line = Shape::new(
+            0,
+            ShapeKind::Line,
+            (100.0, 80.0),
+            (160.0, 140.0),
+            [1.0, 0.0, 1.0],
+            1.5,
+        )
+        .with_fill(true);
+
+        write_fresh(
+            &source,
+            &target,
+            &[
+                Annotation::Shape(rectangle),
+                Annotation::Shape(plain),
+                Annotation::Shape(ellipse),
+                Annotation::Shape(line),
+            ],
+        )
+        .expect("las cuatro formas tienen que escribirse");
+
+        let document = Document::load(&target).expect("el archivo escrito tiene que cargarse");
+        let page_id = *document.get_pages().get(&1).expect("página 1");
+        let annotations = document.get_page_annotations(page_id).expect("anotaciones");
+        assert_eq!(annotations.len(), 4);
+
+        assert_eq!(
+            numbers(annotations[0], b"IC"),
+            vec![0.0, 0.0, 1.0],
+            "el interior del rectángulo lleva el mismo color que /C"
+        );
+        assert_eq!(numbers(annotations[0], b"C"), vec![0.0, 0.0, 1.0]);
+        assert!(
+            annotations[1].get(b"IC").is_err(),
+            "una forma sin relleno no escribe /IC"
+        );
+        assert!(
+            annotations[1].get(b"C").is_ok(),
+            "el color del trazo se sigue escribiendo en /C"
+        );
+        assert_eq!(
+            numbers(annotations[2], b"IC"),
+            vec![1.0, 0.0, 0.0],
+            "la elipse rellena también lleva su interior"
+        );
+        assert!(
+            annotations[3].get(b"IC").is_err(),
+            "la línea no escribe /IC aunque se le pida relleno"
+        );
+    }
+
+    #[test]
+    fn a_filled_rectangle_and_ellipse_come_back_filled() {
+        let filled = Shape::new(
+            0,
+            ShapeKind::Rectangle,
+            (20.0, 80.0),
+            (80.0, 120.0),
+            [0.0, 0.0, 1.0],
+            2.0,
+        )
+        .with_fill(true);
+        let plain = Shape::new(
+            0,
+            ShapeKind::Rectangle,
+            (100.0, 80.0),
+            (160.0, 120.0),
+            [0.0, 1.0, 0.0],
+            2.0,
+        );
+        let ellipse = Shape::new(
+            0,
+            ShapeKind::Ellipse,
+            (20.0, 20.0),
+            (80.0, 60.0),
+            [1.0, 0.0, 0.0],
+            3.0,
+        )
+        .with_fill(true);
+        let current = vec![
+            owned("mlnpdf-ida-relleno", Annotation::Shape(filled)),
+            owned("mlnpdf-ida-sin-relleno", Annotation::Shape(plain)),
+            owned("mlnpdf-ida-elipse-rellena", Annotation::Shape(ellipse)),
+        ];
+
+        let (_, read) = round_trip(
+            "rt-fill",
+            fixture([0.0, 0.0, 200.0, 200.0], 0),
+            &current,
+        );
+        assert_eq!(read.len(), 3, "vuelven las tres formas: {read:?}");
+        let shape_of = |entry: &(String, Annotation)| match &entry.1 {
+            Annotation::Shape(shape) => shape.clone(),
+            other => panic!("se esperaba una forma y se leyó {other:?}"),
+        };
+        assert!(shape_of(&read[0]).filled, "el rectángulo vuelve relleno");
+        assert!(
+            !shape_of(&read[1]).filled,
+            "sin /IC la forma vuelve sin relleno"
+        );
+        assert!(
+            shape_of(&read[2]).filled && shape_of(&read[2]).kind == ShapeKind::Ellipse,
+            "la elipse vuelve rellena y sigue siendo una elipse"
+        );
+    }
+
+    /// PDF con cuatro anotaciones propias escritas a mano: un `/Square` con su
+    /// interior `/IC`, uno sin él, uno con un `/IC` malformado y una `/Line` con
+    /// `/IC`, que su tipo no admite.
+    fn interior_fixture() -> Vec<u8> {
+        let mut document = Document::load_mem(&fixture([0.0, 0.0, 200.0, 200.0], 0))
+            .expect("cargar el fixture");
+        let page_id = *document.get_pages().get(&1).expect("página 1");
+        let filled = Object::Dictionary(dictionary! {
+            "Type" => "Annot",
+            "Subtype" => "Square",
+            "NM" => Object::string_literal("mlnpdf-relleno-con"),
+            "Rect" => Object::Array(vec![10.into(), 10.into(), 60.into(), 60.into()]),
+            "C" => Object::Array(vec![0.into(), 0.into(), 1.into()]),
+            "IC" => Object::Array(vec![1.into(), 0.into(), 0.into()]),
+            "F" => Object::Integer(4),
+        });
+        let plain = Object::Dictionary(dictionary! {
+            "Type" => "Annot",
+            "Subtype" => "Square",
+            "NM" => Object::string_literal("mlnpdf-relleno-sin"),
+            "Rect" => Object::Array(vec![70.into(), 10.into(), 120.into(), 60.into()]),
+            "C" => Object::Array(vec![0.into(), 1.into(), 0.into()]),
+        });
+        let malformed = Object::Dictionary(dictionary! {
+            "Type" => "Annot",
+            "Subtype" => "Square",
+            "NM" => Object::string_literal("mlnpdf-relleno-malformado"),
+            "Rect" => Object::Array(vec![10.into(), 80.into(), 60.into(), 130.into()]),
+            "C" => Object::Array(vec![0.into(), 0.into(), 0.into()]),
+            "IC" => Object::Array(vec![1.into(), 0.into()]),
+        });
+        let line = Object::Dictionary(dictionary! {
+            "Type" => "Annot",
+            "Subtype" => "Line",
+            "NM" => Object::string_literal("mlnpdf-relleno-linea"),
+            "Rect" => Object::Array(vec![70.into(), 80.into(), 120.into(), 130.into()]),
+            "L" => Object::Array(vec![70.into(), 80.into(), 120.into(), 130.into()]),
+            "C" => Object::Array(vec![0.into(), 0.into(), 0.into()]),
+            "IC" => Object::Array(vec![1.into(), 0.into(), 0.into()]),
+        });
+        document
+            .get_dictionary_mut(page_id)
+            .expect("página")
+            .set("Annots", Object::Array(vec![filled, plain, malformed, line]));
+
+        let mut bytes = Vec::new();
+        document.save_to(&mut bytes).expect("serializar el fixture");
+        bytes
+    }
+
+    #[test]
+    fn the_fill_is_read_from_the_interior_colour_and_never_on_a_line() {
+        let path = scratch("rt-fill-read.pdf");
+        std::fs::write(&path, interior_fixture()).expect("escribir el fixture");
+
+        let read = read_annotations(&path).expect("leer las anotaciones propias");
+        assert_eq!(read.len(), 4, "vuelven las cuatro anotaciones: {read:?}");
+        let shape_of = |index: usize| match &read[index].1 {
+            Annotation::Shape(shape) => shape.clone(),
+            other => panic!("se esperaba una forma y se leyó {other:?}"),
+        };
+        assert!(
+            shape_of(0).filled,
+            "un /IC de tres componentes marca la forma como rellena"
+        );
+        assert!(!shape_of(1).filled, "sin /IC la forma se lee sin relleno");
+        assert!(!shape_of(2).filled, "un /IC malformado no cuenta como relleno");
+        assert_eq!(shape_of(3).kind, ShapeKind::Line, "la cuarta es una línea");
+        assert!(
+            !shape_of(3).filled,
+            "la línea se lee sin relleno aunque el archivo traiga /IC"
+        );
+    }
+
+    /// Cuenta los píxeles rojos estrictamente dentro de `box`, sin la banda de
+    /// `inset` píxeles del borde, en la página rasterizada con poppler.
+    fn red_pixels_inside(
+        bytes: &[u8],
+        size: (f64, f64),
+        page_box: (i32, i32, i32, i32),
+        inset: i32,
+    ) -> usize {
+        let document = poppler::Document::from_data(bytes, None).expect("poppler abre el PDF");
+        let page = document.page(0).expect("página 0");
+
+        let mut surface = cairo::ImageSurface::create(
+            cairo::Format::ARgb32,
+            size.0.ceil() as i32,
+            size.1.ceil() as i32,
+        )
+        .expect("crear la superficie");
+        {
+            let context = cairo::Context::new(&surface).expect("contexto");
+            context.set_source_rgb(1.0, 1.0, 1.0);
+            context.paint().expect("fondo blanco");
+            page.render(&context);
+        }
+        surface.flush();
+
+        let stride = usize::try_from(surface.stride()).expect("stride");
+        let data = surface.data().expect("píxeles");
+        let (x0, y0) = (page_box.0 + inset, page_box.1 + inset);
+        let (x1, y1) = (page_box.2 - inset, page_box.3 - inset);
+        let mut found = 0;
+        for row in y0..y1 {
+            for column in x0..x1 {
+                let offset = row as usize * stride + column as usize * 4;
+                let (blue, green, red) = (data[offset], data[offset + 1], data[offset + 2]);
+                if red > 150 && green < 120 && blue < 120 {
+                    found += 1;
+                }
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn poppler_paints_the_interior_of_a_filled_rectangle() {
+        // La prueba de que otro lector ve el relleno: se rasteriza la misma caja
+        // con y sin relleno y se cuentan los píxeles rojos del interior, lejos del
+        // borde que ya pintaba la forma sin relleno.
+        let source = scratch("fill-painted.pdf");
+        let plain_target = scratch("fill-painted-plain.pdf");
+        let filled_target = scratch("fill-painted-filled.pdf");
+        std::fs::write(&source, fixture([0.0, 0.0, 300.0, 200.0], 0)).expect("escribir el PDF");
+
+        let rectangle = Shape::new(
+            0,
+            ShapeKind::Rectangle,
+            (40.0, 80.0),
+            (160.0, 160.0),
+            [1.0, 0.0, 0.0],
+            2.0,
+        );
+        let size = (300.0, 200.0);
+        let whole_box = (40, 80, 160, 160);
+
+        write_fresh(
+            &source,
+            &plain_target,
+            &[Annotation::Shape(rectangle.clone())],
+        )
+        .expect("la forma sin relleno tiene que escribirse");
+        let plain = red_pixels_inside(
+            &std::fs::read(&plain_target).expect("resultado"),
+            size,
+            whole_box,
+            8,
+        );
+        assert_eq!(
+            plain, 0,
+            "una forma sin relleno solo pinta su borde, fuera de la caja interior"
+        );
+
+        write_fresh(
+            &source,
+            &filled_target,
+            &[Annotation::Shape(rectangle.with_fill(true))],
+        )
+        .expect("la forma rellena tiene que escribirse");
+        let filled = red_pixels_inside(
+            &std::fs::read(&filled_target).expect("resultado"),
+            size,
+            whole_box,
+            8,
+        );
+        assert!(
+            filled > 1000,
+            "poppler pinta el interior de la forma rellena: {filled} píxeles"
         );
     }
 
