@@ -2914,17 +2914,28 @@ impl Viewer {
         if *hover == current {
             return;
         }
-        let cursor = current
-            .as_ref()
-            .and_then(|(_, name)| gdk::Cursor::from_name(name, None));
+        let name = current.as_ref().map(|(_, name)| *name);
         *hover = current;
-        overlay.set_cursor(cursor.as_ref());
+        drop(hover);
+        self.apply_note_cursor(page, overlay, name);
     }
 
     /// El puntero salió de la página: ya no hay nota bajo el cursor.
-    pub(crate) fn clear_note_cursor(&self, overlay: &gtk::Overlay) {
+    pub(crate) fn clear_note_cursor(&self, page: usize, overlay: &gtk::Overlay) {
         self.annot.hover.borrow_mut().take();
-        overlay.set_cursor(None::<&gdk::Cursor>);
+        self.apply_note_cursor(page, overlay, None);
+    }
+
+    /// Pone el cursor en todas las capas de la página. El lienzo de la selección
+    /// es el widget que recibe el puntero y heredar el cursor del `Overlay` no se
+    /// refresca mientras el puntero sigue dentro: hay que fijarlo en el lienzo.
+    fn apply_note_cursor(&self, page: usize, overlay: &gtk::Overlay, name: Option<&str>) {
+        let cursor = name.and_then(|name| gdk::Cursor::from_name(name, None));
+        overlay.set_cursor(cursor.as_ref());
+        if let Some(slot) = self.doc.slots.borrow().get(page) {
+            slot.canvas.set_cursor(cursor.as_ref());
+            slot.picture.set_cursor(cursor.as_ref());
+        }
     }
 
     /// Menú contextual de la nota: editar el texto, borrarla o armar el movimiento
@@ -3939,7 +3950,7 @@ impl Viewer {
         let overlay_for_leave = overlay.clone();
         motion.connect_leave(move |_| {
             if let Some(viewer) = weak.upgrade() {
-                viewer.clear_note_cursor(&overlay_for_leave);
+                viewer.clear_note_cursor(page, &overlay_for_leave);
             }
         });
         overlay.add_controller(motion);

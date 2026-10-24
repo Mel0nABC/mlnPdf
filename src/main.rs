@@ -1039,6 +1039,42 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             "cambiar el color no cambia el texto"
         );
 
+        // El cursor distingue el borde de la nota (cuatro flechas) del interior
+        // (cursor de texto), también después de moverla y editarla.
+        assert!(
+            gtk::gdk::Cursor::from_name("move", None).is_some(),
+            "el tema tiene cursor de mover"
+        );
+        let current_note = note_value(&viewer, 4);
+        let overlay = viewer.doc.slots.borrow()[0].overlay.clone();
+        viewer.update_note_cursor(
+            0,
+            current_note.at.0 + 2.0,
+            current_note.at.1 + current_note.height / 2.0,
+            &overlay,
+        );
+        assert_eq!(
+            viewer.annot.hover.borrow().clone(),
+            Some((note_id.clone(), "move")),
+            "el borde de la nota muestra el cursor de mover"
+        );
+        viewer.update_note_cursor(
+            0,
+            current_note.at.0 + current_note.width / 2.0,
+            current_note.at.1 + current_note.height / 2.0,
+            &overlay,
+        );
+        assert_eq!(
+            viewer.annot.hover.borrow().clone(),
+            Some((note_id.clone(), "text")),
+            "el texto de la nota muestra el cursor de edición"
+        );
+        viewer.clear_note_cursor(0, &overlay);
+        assert!(
+            viewer.annot.hover.borrow().is_none(),
+            "salir de la nota limpia el cursor"
+        );
+
         // Guardar después de mover y de editar: el archivo mantiene una sola
         // anotación por nota, con el texto nuevo, y poppler lo sigue abriendo.
         viewer.save_annotations();
