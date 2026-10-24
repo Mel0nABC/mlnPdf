@@ -4,10 +4,11 @@
 
 use std::path::{Path, PathBuf};
 
-use lopdf::{Dictionary, Document, Object, ObjectId};
+use lopdf::{Dictionary, Document, Object, ObjectId, Stream};
 
 use crate::engine::annotation::{
-    Annotation, FontChoice, MarkKind, PageBox, TextNote, bounds_rect, mark_quads, note_rect,
+    Annotation, FontChoice, ImageAppearance, ImageNote, ImagePixels, MarkKind, PageBox, TextNote,
+    bounds_rect, image_appearance, mark_quads, note_rect,
 };
 
 /// Escribe en el PDF las anotaciones propias y lo guarda en `target`; devuelve
@@ -79,6 +80,7 @@ pub fn write_annotations(
                 mark_dictionary(&quads, mark.color, mark.kind, id)
             }
             Annotation::Note(note) => note_dictionary(note, page_box, id),
+            Annotation::Image(image) => image_dictionary(&mut document, image, page_box, id)?,
         };
         push_annotation(&mut document, page_id, object)?;
         written += 1;
@@ -132,6 +134,147 @@ fn mark_dictionary(quads: &[[f64; 8]], color: [f64; 3], kind: MarkKind, id: &str
 
 fn real(value: f64) -> Object {
     Object::Real(value as f32)
+}
+
+/// Número para el contenido de un stream: cuatro decimales bastan para la matriz
+/// de una imagen y no llenan el archivo de ceros.
+fn number(value: f64) -> String {
+    let mut text = format!("{value:.4}");
+    if text.contains('.') {
+        text = text.trim_end_matches('0').trim_end_matches('.').to_string();
+    }
+    if text == "-0" { "0".to_string() } else { text }
+}
+
+/// Diccionario de una imagen insertada: una anotación `/Stamp` cuya apariencia es
+/// un form XObject que dibuja el XObject de la imagen.
+///
+/// `/Stamp` es lo que hace que cualquier lector la muestre como un sello sobre la
+/// página, y el `/NM` es lo que deja que este programa la reemplace o la quite en
+/// el siguiente guardado sin tocar las anotaciones de otros programas.
+fn image_dictionary(
+    document: &mut Document,
+    image: &ImageNote,
+    page: PageBox,
+    id: &str,
+) -> Result<Object, String> {
+    let appearance = image_appearance(image, page);
+    let pixels = image_stream(document, &image.pixels)?;
+    let form = appearance_stream(document, appearance, pixels)?;
+
+    let mut dictionary = Dictionary::new();
+    dictionary.set("Type", Object::Name(b"Annot".to_vec()));
+    dictionary.set("Subtype", Object::Name(b"Stamp".to_vec()));
+    set_identifier(&mut dictionary, id);
+    let rect = appearance.rect;
+    dictionary.set(
+        "Rect",
+        Object::Array(vec![real(rect.0), real(rect.1), real(rect.2), real(rect.3)]),
+    );
+    // Print flag without a border: la imagen se ve, el marco no.
+    dictionary.set("F", Object::Integer(4));
+    dictionary.set(
+        "Border",
+        Object::Array(vec![
+            Object::Integer(0),
+            Object::Integer(0),
+            Object::Integer(0),
+        ]),
+    );
+    let mut appearance_dictionary = Dictionary::new();
+    appearance_dictionary.set("N", Object::Reference(form));
+    dictionary.set("AP", Object::Dictionary(appearance_dictionary));
+    Ok(Object::Dictionary(dictionary))
+}
+
+/// XObject de imagen con los píxeles en `DeviceRGB` comprimido y, cuando la
+/// imagen tiene transparencia, un `/SMask` en escala de grises con el alfa.
+fn image_stream(document: &mut Document, pixels: &ImagePixels) -> Result<ObjectId, String> {
+    let mut dictionary = image_dictionary_of(pixels.width, pixels.height);
+
+    if pixels.has_transparency() {
+        let mut mask = image_dictionary_of(pixels.width, pixels.height);
+        mask.set("ColorSpace", Object::Name(b"DeviceGray".to_vec()));
+        let mask_id = add_image_stream(document, mask, &pixels.alpha())?;
+        dictionary.set("SMask", Object::Reference(mask_id));
+    }
+
+    add_image_stream(document, dictionary, &pixels.rgb())
+}
+
+/// Cabecera común de un XObject de imagen: tamaño y ocho bits por componente.
+fn image_dictionary_of(width: u32, height: u32) -> Dictionary {
+    let mut dictionary = Dictionary::new();
+    dictionary.set("Type", Object::Name(b"XObject".to_vec()));
+    dictionary.set("Subtype", Object::Name(b"Image".to_vec()));
+    dictionary.set("Width", Object::Integer(i64::from(width)));
+    dictionary.set("Height", Object::Integer(i64::from(height)));
+    dictionary.set("ColorSpace", Object::Name(b"DeviceRGB".to_vec()));
+    dictionary.set("BitsPerComponent", Object::Integer(8));
+    dictionary
+}
+
+/// Apariencia de la imagen: un form XObject que ocupa su `/Rect` y dibuja el
+/// XObject de imagen con la matriz que lo deja acostado con la página.
+///
+/// El `/BBox` es el mismo rectángulo en espacio de usuario, así que el lector lo
+/// lleva a `/Rect` sin escalar nada y la imagen cae justo donde está su caja.
+fn appearance_stream(
+    document: &mut Document,
+    appearance: ImageAppearance,
+    pixels: ObjectId,
+) -> Result<ObjectId, String> {
+    let [a, b, c, d, e, f] = appearance.matrix;
+    let content = format!(
+        "q {} {} {} {} {} {} cm /Im0 Do Q",
+        number(a),
+        number(b),
+        number(c),
+        number(d),
+        number(e),
+        number(f)
+    );
+
+    let mut dictionary = Dictionary::new();
+    dictionary.set("Type", Object::Name(b"XObject".to_vec()));
+    dictionary.set("Subtype", Object::Name(b"Form".to_vec()));
+    let (x1, y1, x2, y2) = appearance.rect;
+    dictionary.set(
+        "BBox",
+        Object::Array(vec![real(x1), real(y1), real(x2), real(y2)]),
+    );
+    let mut xobjects = Dictionary::new();
+    xobjects.set("Im0", Object::Reference(pixels));
+    let mut resources = Dictionary::new();
+    resources.set("XObject", Object::Dictionary(xobjects));
+    dictionary.set("Resources", Object::Dictionary(resources));
+
+    add_stream(document, dictionary, content.into_bytes())
+}
+
+/// Agrega un XObject de imagen con sus píxeles crudos, sin comprimir: una imagen
+/// de un megabyte de PNG ocupa varios sin compresión y el archivo se hincharía.
+fn add_image_stream(
+    document: &mut Document,
+    dictionary: Dictionary,
+    content: &[u8],
+) -> Result<ObjectId, String> {
+    add_stream(document, dictionary, content.to_vec())
+}
+
+/// Agrega un stream al documento y lo intenta comprimir.
+fn add_stream(
+    document: &mut Document,
+    dictionary: Dictionary,
+    content: Vec<u8>,
+) -> Result<ObjectId, String> {
+    let mut stream = Stream::new(dictionary, content);
+    stream
+        .compress()
+        .map_err(|error| format!("no se pudo comprimir la imagen: {error}"))?;
+    document
+        .try_add_object(stream)
+        .map_err(|error| format!("no se pudo agregar la imagen al PDF: {error}"))
 }
 
 /// `/NM`: el nombre con el que el visor reconoce su propia anotación en un
@@ -925,6 +1068,101 @@ mod tests {
             }
         }
         (yellow, ink)
+    }
+
+    #[test]
+    fn poppler_paints_the_inserted_image_from_the_written_file() {
+        // La prueba de que el sello se ve en otro lector: la anotación lleva su
+        // apariencia con el XObject de la imagen. Sin ese `/AP`, el archivo tendría
+        // la anotación y nadie la pintaría.
+        let source = scratch("image-painted.pdf");
+        let target = scratch("image-painted-out.pdf");
+        std::fs::write(&source, fixture([0.0, 0.0, 300.0, 200.0], 0)).expect("escribir el PDF");
+
+        let image = ImageNote::new(0, (40.0, 50.0), 80.0, 40.0, red_pixels(8, 4));
+        write_fresh(&source, &target, &[Annotation::Image(image)]).expect("escribir la imagen");
+
+        let size = (300.0, 200.0);
+        assert_eq!(
+            reddish_bbox(&std::fs::read(&source).expect("original"), size),
+            None,
+            "la página vacía no tiene nada rojo"
+        );
+        let painted = reddish_bbox(&std::fs::read(&target).expect("resultado"), size)
+            .expect("poppler dibuja la imagen");
+        let width = painted.2 - painted.0 + 1.0;
+        let height = painted.3 - painted.1 + 1.0;
+        assert!(
+            (width - 80.0).abs() <= 2.0 && (height - 40.0).abs() <= 2.0,
+            "la imagen mide su caja de 80x40 pt: {painted:?}"
+        );
+
+        // Y la anotación es un sello con apariencia, que es lo que el lector pinta
+        // y lo que el siguiente guardado reconoce por su /NM.
+        let document = Document::load(&target).expect("cargar el resultado");
+        let page_id = *document.get_pages().get(&1).expect("página 1");
+        let annotations = document.get_page_annotations(page_id).expect("anotaciones");
+        assert_eq!(annotations.len(), 1);
+        assert_eq!(
+            annotations[0].get(b"Subtype").and_then(Object::as_name).expect("Subtype"),
+            b"Stamp"
+        );
+        assert!(
+            annotations[0].get(b"AP").is_ok(),
+            "sin apariencia el sello no se ve"
+        );
+    }
+
+    #[test]
+    fn a_translucent_image_is_written_with_its_alpha_mask() {
+        // Un PNG con transparencia tiene que conservarla: el alfa va en un
+        // `/SMask`, o el lector pintaría el fondo del color del píxel opaco.
+        let source = scratch("image-alpha.pdf");
+        let target = scratch("image-alpha-out.pdf");
+        std::fs::write(&source, fixture([0.0, 0.0, 300.0, 200.0], 0)).expect("escribir el PDF");
+
+        let mut data = Vec::new();
+        for _ in 0..4 {
+            data.extend_from_slice(&[0, 0, 255, 128]);
+        }
+        let pixels = ImagePixels::new(2, 2, data).expect("píxeles con alfa");
+        let image = ImageNote::new(0, (10.0, 10.0), 20.0, 20.0, pixels);
+        write_fresh(&source, &target, &[Annotation::Image(image)]).expect("escribir la imagen");
+
+        let document = Document::load(&target).expect("cargar el resultado");
+        let page_id = *document.get_pages().get(&1).expect("página 1");
+        let annotation = document.get_page_annotations(page_id).expect("anotaciones")[0].clone();
+        let appearance = match annotation.get(b"AP").expect("AP") {
+            Object::Dictionary(dictionary) => dictionary.clone(),
+            other => panic!("AP tiene que ser un diccionario: {other:?}"),
+        };
+        let form = match appearance.get(b"N").expect("N") {
+            Object::Reference(id) => document.get_object(*id).expect("form"),
+            other => other,
+        };
+        let Object::Stream(form) = form else {
+            panic!("la apariencia es un form XObject");
+        };
+        let resources = form.dict.get(b"Resources").expect("Resources").as_dict().expect("diccionario");
+        let xobjects = resources.get(b"XObject").expect("XObject").as_dict().expect("diccionario");
+        let image_id = xobjects.get(b"Im0").expect("Im0").as_reference().expect("referencia");
+        let image_object = document.get_object(image_id).expect("imagen");
+        let Object::Stream(image_stream) = image_object else {
+            panic!("la imagen es un stream");
+        };
+        assert!(
+            image_stream.dict.get(b"SMask").is_ok(),
+            "la transparencia va en un /SMask"
+        );
+    }
+
+    /// Píxeles rojos opacos: lo que `reddish_bbox` sabe encontrar.
+    fn red_pixels(width: u32, height: u32) -> ImagePixels {
+        let mut data = Vec::new();
+        for _ in 0..width * height {
+            data.extend_from_slice(&[0, 0, 255, 255]);
+        }
+        ImagePixels::new(width, height, data).expect("píxeles completos")
     }
 
     #[test]

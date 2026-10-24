@@ -70,6 +70,10 @@ const NOTE_HIT_TOLERANCE: f64 = 2.0;
 /// pixels, so the mark can be clicked to select it.
 const MARK_HIT_TOLERANCE: f64 = 4.0;
 
+/// Lado de las asas de una imagen elegida, en píxeles lógicos: se dibujan
+/// centradas en cada esquina y se agarran con la misma tolerancia que el clic.
+const IMAGE_HANDLE_SIZE: f64 = 7.0;
+
 /// Width of the thumbnails in the side panel, in logical pixels.
 const THUMB_WIDTH: i32 = 120;
 
@@ -250,6 +254,10 @@ pub(crate) struct AnnotationState {
     pub(crate)     text_tool: Cell<bool>,
     /// Texto y fuente que dejó el diálogo, esperando ese clic.
     pub(crate)     draft: RefCell<Option<TextDraft>>,
+    /// Superficies de cairo ya armadas con los píxeles de cada imagen, por
+    /// dirección del búfer compartido: convertir los píxeles en cada fotograma
+    /// costaría más que pintar la página entera.
+    pub(crate)     image_surfaces: RefCell<HashMap<usize, Rc<cairo::ImageSurface>>>,
 }
 
 /// Borrador de la herramienta «insertar texto»: lo que se escribió en el
@@ -596,6 +604,7 @@ impl Viewer {
                 }),
                 text_tool: Cell::new(false),
                 draft: RefCell::new(None),
+                image_surfaces: RefCell::new(HashMap::new()),
             },
             input: InteractionState {
                 hand_mode: Cell::new(false),
@@ -2537,6 +2546,7 @@ impl Viewer {
         *self.annot.edits.borrow_mut() = persisted;
         self.annot.undo_stack.borrow_mut().clear();
         self.annot.redo_stack.borrow_mut().clear();
+        self.annot.image_surfaces.borrow_mut().clear();
         *self.annot.selected.borrow_mut() = None;
         self.refresh_edit_actions();
         for page in pages {
@@ -2695,7 +2705,7 @@ impl Viewer {
             .find(|edit| edit.id == id)
             .and_then(|edit| match &edit.value {
                 Annotation::Note(note) => Some(note.clone()),
-                Annotation::Mark(_) => None,
+                Annotation::Mark(_) | Annotation::Image(_) => None,
             })
     }
 
@@ -2901,7 +2911,7 @@ impl Viewer {
                 note.at = at;
                 true
             }
-            Annotation::Mark(_) => false,
+            Annotation::Mark(_) | Annotation::Image(_) => false,
         }
     }
 
@@ -3163,6 +3173,11 @@ impl Viewer {
                     draw_note(context, note, size, rotation, zoom, chosen);
                     continue;
                 }
+                Annotation::Image(image) => {
+                    let chosen = selected.as_deref() == Some(edit.id.as_str());
+                    self.draw_image(context, image, size, rotation, zoom, chosen);
+                    continue;
+                }
             };
             match mark.kind {
                 MarkKind::Underline => {
@@ -3207,6 +3222,67 @@ impl Viewer {
         {
             draw_mark_selection(context, mark, size, rotation, zoom);
         }
+    }
+
+    /// Pinta una imagen sobre la página: la caja se lleva al espacio de la vista
+    /// con la rotación y el zoom, y la superficie se pinta en el cuadrado unitario,
+    /// así la imagen queda acostada con la página cuando está girada.
+    fn draw_image(
+        &self,
+        context: &cairo::Context,
+        image: &ImageNote,
+        page: (f64, f64),
+        rotation: i32,
+        zoom: f64,
+        selected: bool,
+    ) {
+        let (x1, y1, x2, y2) = image.rect();
+        let top_left = forward_rotation((x1, y1), page, rotation);
+        let top_right = forward_rotation((x2, y1), page, rotation);
+        let bottom_left = forward_rotation((x1, y2), page, rotation);
+        let Ok(surface) = self.image_surface(&image.pixels) else {
+            return;
+        };
+
+        let matrix = cairo::Matrix::new(
+            (top_right.0 - top_left.0) * zoom,
+            (top_right.1 - top_left.1) * zoom,
+            (bottom_left.0 - top_left.0) * zoom,
+            (bottom_left.1 - top_left.1) * zoom,
+            top_left.0 * zoom,
+            top_left.1 * zoom,
+        );
+
+        let _ = context.save();
+        context.transform(matrix);
+        context.scale(
+            1.0 / f64::from(image.pixels.width),
+            1.0 / f64::from(image.pixels.height),
+        );
+        let _ = context.set_source_surface(surface.as_ref(), 0.0, 0.0);
+        context.rectangle(0.0, 0.0, 1.0, 1.0);
+        let _ = context.fill();
+        let _ = context.restore();
+
+        if selected {
+            draw_image_selection(context, image, page, rotation, zoom);
+        }
+    }
+
+    /// Superficie de cairo con los píxeles de una imagen, armada una sola vez por
+    /// imagen y guardada por la dirección del búfer, que todas las copias
+    /// comparten: moverla o deshacer no la vuelve a convertir.
+    fn image_surface(&self, pixels: &ImagePixels) -> Result<Rc<cairo::ImageSurface>, String> {
+        let key = Rc::as_ptr(&pixels.data) as usize;
+        if let Some(surface) = self.annot.image_surfaces.borrow().get(&key) {
+            return Ok(surface.clone());
+        }
+        let surface = Rc::new(image_surface_for(pixels)?);
+        self.annot
+            .image_surfaces
+            .borrow_mut()
+            .insert(key, surface.clone());
+        Ok(surface)
     }
 
     /// Closes one of our modal dialogs in the order that leaves the parent
@@ -6176,6 +6252,73 @@ fn draw_mark_selection(
     context.set_source_rgba(0.20, 0.45, 0.95, 0.9);
     context.rectangle(left, top, width, height);
     let _ = context.stroke();
+    let _ = context.restore();
+}
+
+/// Superficie de cairo con los píxeles de una imagen. El formato `ARGB32` de cairo
+/// es BGRA premultiplicado, exactamente lo que guarda `ImagePixels`, así que solo
+/// hay que copiar las filas: el relleno del final de cada una puede no coincidir.
+fn image_surface_for(pixels: &ImagePixels) -> Result<cairo::ImageSurface, String> {
+    let width = i32::try_from(pixels.width)
+        .map_err(|_| "la imagen es demasiado ancha para el lienzo".to_string())?;
+    let height = i32::try_from(pixels.height)
+        .map_err(|_| "la imagen es demasiado alta para el lienzo".to_string())?;
+    let mut surface = cairo::ImageSurface::create(cairo::Format::ARgb32, width, height)
+        .map_err(|error| format!("no se pudo preparar la imagen: {error}"))?;
+    {
+        let stride = usize::try_from(surface.stride())
+            .map_err(|_| "el lienzo de la imagen no tiene un ancho válido".to_string())?;
+        let row = pixels.width as usize * 4;
+        let mut data = surface
+            .data()
+            .map_err(|error| format!("no se pudo escribir la imagen: {error}"))?;
+        for line in 0..pixels.height as usize {
+            let source = &pixels.data[line * row..(line + 1) * row];
+            data[line * stride..line * stride + row].copy_from_slice(source);
+        }
+    }
+    surface.mark_dirty();
+    Ok(surface)
+}
+
+/// Contorno punteado y asas de una imagen elegida: es la señal de que responde a
+/// `Supr` y de que las esquinas se arrastran para redimensionarla.
+fn draw_image_selection(
+    context: &cairo::Context,
+    image: &ImageNote,
+    page: (f64, f64),
+    rotation: i32,
+    zoom: f64,
+) {
+    let rect = image.rect();
+    let outline = [
+        Corner::TopLeft,
+        Corner::TopRight,
+        Corner::BottomRight,
+        Corner::BottomLeft,
+    ]
+    .map(|corner| forward_rotation(corner.point(rect), page, rotation));
+    let dash = (4.0 * zoom).max(2.0);
+
+    let _ = context.save();
+    context.set_dash(&[dash, dash * 0.75], 0.0);
+    context.set_line_width((1.0 * zoom).max(1.0));
+    context.set_source_rgba(0.20, 0.45, 0.95, 0.9);
+    context.move_to(outline[0].0 * zoom, outline[0].1 * zoom);
+    for point in &outline[1..] {
+        context.line_to(point.0 * zoom, point.1 * zoom);
+    }
+    context.close_path();
+    let _ = context.stroke();
+
+    // Asas: un cuadrado lleno en cada esquina, del tamaño que se agarra con el
+    // ratón. Van sin rotar, como los tiradores de cualquier editor.
+    let half = (IMAGE_HANDLE_SIZE * zoom / 2.0).max(2.0);
+    for corner in Corner::ALL {
+        let (x, y) = forward_rotation(corner.point(rect), page, rotation);
+        context.rectangle(x * zoom - half, y * zoom - half, half * 2.0, half * 2.0);
+    }
+    let _ = context.fill();
     let _ = context.restore();
 }
 
