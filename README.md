@@ -195,8 +195,14 @@ inicializa una vez por proceso y la prueba aísla `XDG_CONFIG_HOME` dentro de
 
 ```bash
 cargo build --release
-./packaging/install-desktop.sh
+./packaging/install-desktop.sh     # instala binario, lanzador e iconos
+./packaging/uninstall-desktop.sh   # lo desinstala todo
 ```
+
+El desinstalador quita el binario, el lanzador y los iconos del tema (solo los de
+MlnPdf) y refresca las cachés; con `--purgar` borra además los datos de sesión
+(`~/.config/mlnpdf`: página y zoom recordados, documentos recientes). No toca el
+repositorio, lo compilado ni los archivos de otras aplicaciones.
 
 Copia el binario a `~/.local/bin/mlnpdf`, el lanzador a
 `~/.local/share/applications/dev.mel0n.MlnPdf.desktop` y el icono a
