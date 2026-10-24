@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Mel0nABC <mel0n@mel0n.dev>
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Application CSS and the cairo/GDK pixel format pairing.
 
 use gtk::gdk;

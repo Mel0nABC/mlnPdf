@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Mel0nABC <mel0n@mel0n.dev>
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Discrete zoom steps and the Ctrl+wheel accumulator.
 
 /// Discrete zoom levels, smallest first. 1.0 draws the page at its point size.

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Mel0nABC <mel0n@mel0n.dev>
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Page expressions for exporting a subset of the document.
 //!
 //! The reader writes what the print dialog accepts (`1,2,100,158`, `1-55`), and

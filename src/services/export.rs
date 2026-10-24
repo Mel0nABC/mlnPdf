@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Mel0nABC <mel0n@mel0n.dev>
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Exports: textures to JPEG and one page to PDF.
 
 use std::path::Path;

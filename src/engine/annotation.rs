@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Mel0nABC <mel0n@mel0n.dev>
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Anotaciones: los subrayados, las notas de texto y las imágenes pendientes, y
 //! su paso al espacio de usuario del PDF, que es con el origen abajo a la
 //! izquierda y el que leen los demás lectores.

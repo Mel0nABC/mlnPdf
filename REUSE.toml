@@ -1,0 +1,31 @@
+version = 1
+
+SPDX-PackageName = "mlnpdf"
+SPDX-PackageSupplier = "Mel0nABC <mel0n@mel0n.dev>"
+SPDX-PackageDownloadLocation = "https://github.com/Mel0nABC/mlnPdf"
+
+# Archivos que no admiten un comentario de cabecera: documentación, imágenes y
+# el propio texto de la licencia.
+[[annotations]]
+path = ["**/*.md", "REUSE.toml"]
+precedence = "closest"
+SPDX-FileCopyrightText = "2026 Mel0nABC <mel0n@mel0n.dev>"
+SPDX-License-Identifier = "GPL-3.0-or-later"
+
+[[annotations]]
+path = ["mlnpdfIcon.png", "packaging/mlnpdf.png"]
+precedence = "closest"
+SPDX-FileCopyrightText = "2026 Mel0nABC <mel0n@mel0n.dev>"
+SPDX-License-Identifier = "GPL-3.0-or-later"
+
+[[annotations]]
+path = ["LICENSE"]
+precedence = "closest"
+SPDX-FileCopyrightText = "2007 Free Software Foundation, Inc. <https://fsf.org/>"
+SPDX-License-Identifier = "GPL-3.0-or-later"
+
+[[annotations]]
+path = ["Cargo.lock"]
+precedence = "closest"
+SPDX-FileCopyrightText = "2026 Mel0nABC <mel0n@mel0n.dev>"
+SPDX-License-Identifier = "GPL-3.0-or-later"

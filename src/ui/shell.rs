@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Mel0nABC <mel0n@mel0n.dev>
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! The GTK shell: owns the widgets and orchestrates the engine.
 
 use std::cell::{Cell, RefCell};

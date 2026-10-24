@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Mel0nABC <mel0n@mel0n.dev>
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Page geometry: rotation transforms and the row layout used by the view.
 
 pub const PAGE_GAP: i32 = 12;

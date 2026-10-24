@@ -237,7 +237,7 @@ se hizo antes de cerrar el documento.
 MlnPdf se distribuye bajo la **GNU General Public License, versión 3 o posterior**
 (`GPL-3.0-or-later`). El texto completo está en [LICENSE](LICENSE).
 
-    Copyright (C) 2026 Mel0nABC <alex@alex.es>
+    Copyright (C) 2026 Mel0nABC <mel0n@mel0n.dev>
 
 Esto significa que puedes usar, estudiar, modificar y redistribuir el programa,
 siempre que las versiones que distribuyas sigan siendo libres bajo la misma
@@ -248,6 +248,12 @@ El programa enlaza bibliotecas del sistema con sus propias licencias —poppler 
 GPL-2.0-or-later, y GTK, cairo y pango son LGPL-2.1-or-later—, así que un binario
 compilado y distribuido tiene que ser compatible con la GPL. El detalle está en
 [THIRD-PARTY.md](THIRD-PARTY.md).
+
+Cada archivo del repositorio lleva sus etiquetas `SPDX-FileCopyrightText` y
+`SPDX-License-Identifier`; los que no admiten un comentario (documentación,
+imágenes, `Cargo.lock`) están declarados en [REUSE.toml](REUSE.toml) y el texto de
+la licencia vive en [LICENSES/](LICENSES). El proyecto cumple la especificación
+REUSE 3.3: `reuse lint` lo confirma.
 
 ## Siguiente paso
 

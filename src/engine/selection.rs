@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Mel0nABC <mel0n@mel0n.dev>
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Text selection over a page. This is the only place in the engine that talks
 //! to poppler's C API directly: the unsafe calls and their contracts live here.
 

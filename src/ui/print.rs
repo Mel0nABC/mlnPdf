@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Mel0nABC <mel0n@mel0n.dev>
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Preview of the pages, for GTK's print dialog.
 //!
 //! GTK's dialog cannot be reshaped, but it can host a widget of the application:

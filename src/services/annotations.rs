@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Mel0nABC <mel0n@mel0n.dev>
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Escritura de anotaciones en el PDF. poppler-glib es de solo lectura, así que
 //! el archivo se edita con lopdf y se guarda en un temporal que después
 //! reemplaza al original: un fallo a mitad de camino no puede romper el PDF.
