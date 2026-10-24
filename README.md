@@ -68,7 +68,7 @@ ventana.
 | Subrayar el texto como anotación real del PDF, en el color elegido (el botón muestra ese color) | Botón al lado del zoom, `Ctrl+U`: abre el selector de color y aplica a la selección o al siguiente arrastre |
 | Resaltar el texto como rotulador, en su propio color (el botón lo muestra de fondo) | Botón al lado del zoom, `Ctrl+Shift+U`: abre el selector de color y aplica a la selección o al siguiente arrastre |
 | Insertar texto libre sobre la página, con la fuente y el color elegidos en los selectores de GTK (familia aproximada a una de las 14 estándar del PDF) | Botón `T` al lado de las otras herramientas, `Ctrl+T` o `Edit > Insertar texto…`: el diálogo pide texto (multilínea), fuente y color, y el siguiente clic fija la esquina de la nota |
-| Mover, borrar o cambiar el texto de una nota ya creada, también después de guardarla | Arrastrar la nota (cursor de cuatro flechas) para moverla, `Supr` (o `Retroceso`) para borrarla, doble clic o `Edit > Editar texto de la nota` para reescribirla, y clic derecho para el menú con `Editar texto`, `Borrar` y `Mover con el ratón` |
+| Mover, borrar o cambiar el texto de una nota ya creada, también después de guardarla | Arrastrar la nota para moverla (en el borde el cursor es el de cuatro flechas; sobre el texto, el de edición), `Supr` (o `Retroceso`) para borrarla, doble clic o `Edit > Editar texto de la nota` para reescribirla, y clic derecho para el menú con `Editar texto` y `Borrar` |
 | Cambiar la fuente o el color de solo una parte de la nota | En el diálogo de edición, seleccionar el texto y elegir la fuente o el color; sin selección, se aplica a toda la nota |
 | Deshacer y rehacer con instantáneas, de a un cambio | `Ctrl+Z` / `Ctrl+Shift+Z` (o `Ctrl+Y`), `Edit > Deshacer` / `Rehacer` |
 | Metadatos del documento | `Ctrl+D` |
@@ -94,7 +94,7 @@ ventana.
 | Exportar una selección de páginas | `Tools > Exportar páginas…`: `1,2,100`, `1-55`, `pares`, `impares`, `última`, `todas` |
 | Exportar el texto plano del documento | `Tools > Exportar texto…` |
 | Imprimir, con vista previa, opciones y folleto | `Ctrl+P`, `File > Imprimir con opciones…`, `File > Imprimir folleto…`; el diálogo suma a la derecha la miniatura de las páginas con flechas ‹ › |
-| `File > Guardar` escribe las anotaciones (subrayados, resaltados y notas de texto) en el PDF abierto; `File > Guardar como…` guarda una copia. Si quedan cambios sin guardar, pregunta antes | `Ctrl+S` / `Ctrl+Shift+S` |
+| `File > Guardar` escribe las anotaciones (subrayados, resaltados y notas de texto) en el PDF abierto; `File > Guardar como…` guarda una copia. Si quedan cambios sin guardar pregunta «¿Quieres guardar los cambios?» con `Sí`, `No` y `Cancelar`; `Cancelar` no cierra ni descarta nada | `Ctrl+S` / `Ctrl+Shift+S` |
 
 ## Atajos
 
@@ -166,7 +166,7 @@ Probado con GTK 4.24 y poppler-glib 26.10.
 
 ```bash
 cargo build --release
-cargo test                 # 97 pruebas: motor, render, selección, búsqueda, páginas, sesión, anotaciones
+cargo test                 # 99 pruebas: motor, render, selección, búsqueda, páginas, sesión, anotaciones
 cargo test -- --ignored    # prueba de display: atajos, zoom y propiedad del viewer
 ```
 

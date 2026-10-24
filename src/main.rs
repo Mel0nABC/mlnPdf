@@ -721,10 +721,10 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         viewer.resolve_pending_marks(move |_| counter.set(counter.get() + 1));
         assert_eq!(ran.get(), 0, "con cambios pendientes nada sigue solo");
 
-        // El diálogo ofrece guardar o descartar; acá se elige descartar.
+        // El diálogo pregunta «¿Quieres guardar los cambios?»; acá se elige No.
         assert!(
-            click_dialog_button(&viewer, "Descartar"),
-            "el diálogo ofrece descartar los cambios pendientes"
+            click_dialog_button(&viewer, "No"),
+            "el diálogo ofrece No para descartar los cambios pendientes"
         );
         pump_until(|| ran.get() == 1);
         assert!(
@@ -737,7 +737,7 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             "descartar no escribe nada en el archivo"
         );
 
-        // Y elegir guardar escribe los pendientes antes de seguir.
+        // Y elegir Sí escribe los pendientes antes de seguir.
         viewer.begin_selection(0, 20.0, 155.0);
         viewer.update_selection(0, 160.0, 40.0);
         viewer.finish_selection();
@@ -748,8 +748,8 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         viewer.resolve_pending_marks(move |_| counter.set(counter.get() + 1));
         assert_eq!(ran.get(), 0, "el cierre espera la decisión");
         assert!(
-            click_dialog_button(&viewer, "Guardar"),
-            "el diálogo ofrece guardar los cambios pendientes"
+            click_dialog_button(&viewer, "Sí"),
+            "el diálogo ofrece Sí para guardar los cambios pendientes"
         );
         pump_until(|| ran.get() == 1);
         assert!(
@@ -1089,7 +1089,7 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         // cursor de cuatro flechas.
         let menu_anchor = viewer.doc.slots.borrow()[0].canvas.clone();
         viewer.select_note(Some(note_id.clone()));
-        let popover = viewer.open_note_menu(note_id.clone(), &menu_anchor, 20.0, 20.0);
+        let popover = viewer.open_note_menu(&menu_anchor, 20.0, 20.0);
         let edit_button = labeled_button(popover.upcast_ref::<gtk::Widget>(), "Editar texto")
             .expect("el menú de la nota ofrece Editar texto");
         edit_button.emit_by_name::<()>("clicked", &[]);
@@ -1112,25 +1112,8 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             "el diálogo de edición se cierra con Cancelar"
         );
 
-        // La opción Mover arma el cursor de cuatro flechas sobre la nota.
         viewer.select_note(Some(note_id.clone()));
-        let popover = viewer.open_note_menu(note_id.clone(), &menu_anchor, 20.0, 20.0);
-        let move_button =
-            labeled_button(popover.upcast_ref::<gtk::Widget>(), "Mover con el ratón")
-                .expect("el menú de la nota ofrece Mover con el ratón");
-        move_button.emit_by_name::<()>("clicked", &[]);
-        assert!(
-            viewer.annot.move_armed.get(),
-            "Mover con el ratón deja armado el cursor de mover"
-        );
-        assert_eq!(
-            viewer.annot.selected.borrow().clone(),
-            Some(note_id.clone()),
-            "Mover con el ratón deja la nota elegida"
-        );
-
-        viewer.select_note(Some(note_id.clone()));
-        let popover = viewer.open_note_menu(note_id.clone(), &menu_anchor, 20.0, 20.0);
+        let popover = viewer.open_note_menu(&menu_anchor, 20.0, 20.0);
         let delete_button = labeled_button(popover.upcast_ref::<gtk::Widget>(), "Borrar")
             .expect("el menú de la nota ofrece Borrar");
         delete_button.emit_by_name::<()>("clicked", &[]);
@@ -1253,6 +1236,41 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         assert!(
             annotation_ink(&viewer, 1) > 0,
             "la nota se pinta en la página de destino"
+        );
+
+        // El diálogo de cambios sin guardar pregunta con Sí / No / Cancelar:
+        // Cancelar no sigue con el cierre y conserva la nota; No descarta.
+        let resolved = Rc::new(std::cell::Cell::new(false));
+        let resolved_ref = resolved.clone();
+        viewer.resolve_pending_marks(move |_| resolved_ref.set(true));
+        assert!(
+            click_dialog_button(&viewer, "Cancelar"),
+            "el diálogo de cambios ofrece Cancelar"
+        );
+        assert!(!resolved.get(), "Cancelar no sigue con el cierre");
+        assert_eq!(
+            viewer.annot.edits.borrow().len(),
+            1,
+            "Cancelar conserva la nota pendiente"
+        );
+        // Deja que el diálogo cerrado termine de desaparecer antes de abrir el
+        // siguiente: las ventanas nativas se destruyen en el bucle principal.
+        let settle = std::time::Instant::now() + std::time::Duration::from_millis(300);
+        while std::time::Instant::now() < settle {
+            gtk::glib::MainContext::default().iteration(false);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        let resolved_ref = resolved.clone();
+        viewer.resolve_pending_marks(move |_| resolved_ref.set(true));
+        assert!(
+            click_dialog_button(&viewer, "No"),
+            "el diálogo de cambios ofrece No"
+        );
+        pump_until(|| resolved.get());
+        assert!(
+            viewer.annot.edits.borrow().is_empty(),
+            "No descarta los cambios pendientes"
         );
 
         // Pulsar la herramienta abre el selector de color del sistema. Es la

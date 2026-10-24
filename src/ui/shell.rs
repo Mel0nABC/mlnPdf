@@ -52,6 +52,10 @@ pub(crate) const HIGHLIGHT_COLOR: (f64, f64, f64) = (1.0, 0.88, 0.2);
 /// carries in `/CA`, so the page and the saved file read the same.
 pub(crate) const HIGHLIGHT_ALPHA: f64 = 0.4;
 
+/// Width in logical pixels of the border band of a note where the cursor turns
+/// into the four-arrow move cursor.
+const NOTE_CURSOR_BORDER: f64 = 5.0;
+
 /// Width of the thumbnails in the side panel, in logical pixels.
 const THUMB_WIDTH: i32 = 120;
 
@@ -223,11 +227,9 @@ pub(crate) struct AnnotationState {
     pub(crate)     id_prefix: String,
     /// Arrastre de una nota en curso, si hay uno.
     pub(crate)     note_drag: RefCell<Option<NoteDrag>>,
-    /// Nota bajo el puntero, para no reescribir el cursor en cada movimiento.
-    pub(crate)     hover: RefCell<Option<String>>,
-    /// «Mover con el ratón» armado desde el menú contextual: el cursor de mover
-    /// se mantiene y `Esc` lo desarma.
-    pub(crate)     move_armed: Cell<bool>,
+    /// Nota bajo el puntero y cursor que le corresponde, para no reescribirlo en
+    /// cada movimiento.
+    pub(crate)     hover: RefCell<Option<(String, &'static str)>>,
     pub(crate)     underline: Cell<MarkTool>,
     pub(crate)     highlight: Cell<MarkTool>,
     /// Herramienta «insertar texto» armada: el próximo clic coloca la nota.
@@ -567,7 +569,6 @@ impl Viewer {
                 id_prefix: format!("mlnpdf-{}-{}", std::process::id(), session_nanos()),
                 note_drag: RefCell::new(None),
                 hover: RefCell::new(None),
-                move_armed: Cell::new(false),
                 underline: Cell::new(MarkTool {
                     color: UNDERLINE_COLOR,
                     active: false,
@@ -2466,12 +2467,11 @@ impl Viewer {
 
         let dialog = gtk::AlertDialog::builder()
             .modal(true)
-            .message(format!("Hay {count} {plural} sin guardar"))
-            .detail(format!(
-                "«{name}» todavía no tiene {count} {plural}. Si seguís sin guardar, se pierden."
-            ))
-            .buttons(["Descartar", "Guardar", "Guardar como…"])
-            .default_button(1)
+            .message("¿Quieres guardar los cambios?")
+            .detail(format!("«{name}» tiene {count} {plural} sin guardar."))
+            .buttons(["Sí", "No", "Cancelar"])
+            .default_button(0)
+            .cancel_button(2)
             .build();
 
         let weak = Rc::downgrade(self);
@@ -2483,25 +2483,20 @@ impl Viewer {
                     return;
                 };
                 match result {
+                    // Sí: guardar en el archivo abierto. Si falla, no se sigue
+                    // con la acción original.
                     Ok(0) => {
-                        viewer.discard_edits();
-                        then(&viewer);
-                    }
-                    // Guardar: si falla, no se sigue con la acción original.
-                    Ok(1) => {
                         if viewer.save_pending_edits_file() {
                             then(&viewer);
                         }
                     }
-                    // Guardar como: la copia es la decisión del lector, así que
-                    // los pendientes quedan resueltos; cancelar el diálogo de
-                    // archivo deja todo como estaba.
-                    Ok(2) => viewer.save_annotations_as(Some(Box::new(move |viewer| {
+                    // No: descartar los cambios pendientes y seguir.
+                    Ok(1) => {
                         viewer.discard_edits();
-                        then(viewer);
-                    }))),
-                    // Cerrar el diálogo con Esc o con la X no elige nada: la
-                    // acción original se cancela en vez de descartar en silencio.
+                        then(&viewer);
+                    }
+                    // Cancelar (o cerrar el diálogo con Esc o con la X): la
+                    // acción original se cancela y la ventana sigue abierta.
                     _ => {}
                 }
             },
@@ -2617,7 +2612,6 @@ impl Viewer {
         self.annot.note_drag.borrow_mut().take();
         self.annot.hover.borrow_mut().take();
         *self.annot.selected.borrow_mut() = None;
-        self.annot.move_armed.set(false);
         self.set_text_tool(false);
         self.set_mark_mode(MarkKind::Underline, false);
         self.set_mark_mode(MarkKind::Highlight, false);
@@ -2717,7 +2711,6 @@ impl Viewer {
         self.begin_edit();
         self.annot.edits.borrow_mut().retain(|edit| edit.id != id);
         *self.annot.selected.borrow_mut() = None;
-        self.annot.move_armed.set(false);
         self.refresh_note_actions();
         self.queue_page_draw(page);
         self.ui
@@ -2893,9 +2886,10 @@ impl Viewer {
         true
     }
 
-    /// Cursor de la capa de la página: el de mover (cuatro flechas) sobre una
-    /// nota, porque se puede arrastrar. El modo mano y las herramientas armadas
-    /// mandan: mientras alguno esté activo, el cursor es el suyo.
+    /// Cursor de la capa de la página: cuatro flechas en el borde de la nota
+    /// (ahí se agarra para moverla) y cursor de texto sobre el texto. El modo mano
+    /// y las herramientas armadas mandan: mientras alguno esté activo, el cursor
+    /// es el suyo.
     pub(crate) fn update_note_cursor(&self, page: usize, x: f64, y: f64, overlay: &gtk::Overlay) {
         if self.input.hand_mode.get()
             || self.active_mark_tool().is_some()
@@ -2903,17 +2897,27 @@ impl Viewer {
         {
             return;
         }
-        let hit = self.note_at(page, x, y);
+        let current = self.note_at(page, x, y).and_then(|id| {
+            let note = self.note(&id)?;
+            let size = self.doc.page_sizes.borrow().get(page).copied()?;
+            let name = note_cursor_at(
+                &note,
+                size,
+                self.view.rotation.get(),
+                self.view.zoom.get(),
+                x,
+                y,
+            );
+            Some((id, name))
+        });
         let mut hover = self.annot.hover.borrow_mut();
-        if *hover == hit {
+        if *hover == current {
             return;
         }
-        let cursor = if hit.is_some() {
-            gdk::Cursor::from_name("move", None)
-        } else {
-            None
-        };
-        *hover = hit;
+        let cursor = current
+            .as_ref()
+            .and_then(|(_, name)| gdk::Cursor::from_name(name, None));
+        *hover = current;
         overlay.set_cursor(cursor.as_ref());
     }
 
@@ -2930,7 +2934,6 @@ impl Viewer {
     /// después de que el menú se cierre.
     pub(crate) fn open_note_menu(
         self: &Rc<Self>,
-        id: String,
         anchor: &gtk::DrawingArea,
         x: f64,
         y: f64,
@@ -2980,22 +2983,6 @@ impl Viewer {
         }
         content.append(&delete);
 
-        let move_button = note_menu_button("Mover con el ratón");
-        {
-            let weak = Rc::downgrade(self);
-            let popover_ref = popover.downgrade();
-            let id = id.clone();
-            move_button.connect_clicked(move |_| {
-                if let Some(popover) = popover_ref.upgrade() {
-                    popover.popdown();
-                }
-                if let Some(viewer) = weak.upgrade() {
-                    viewer.begin_note_move(&id);
-                }
-            });
-        }
-        content.append(&move_button);
-
         popover.set_child(Some(&content));
         // El menú cuelga de la página y se suelta al cerrarse: un popover sin padre
         // no se puede abrir, y dejarlo colgado acumularía widgets.
@@ -3005,25 +2992,6 @@ impl Viewer {
         popover.set_pointing_to(Some(&place));
         popover.popup();
         popover
-    }
-
-    /// «Mover con el ratón» desde el menú: elige la nota y pone el cursor de mover
-    /// sobre ella para que el siguiente arrastre la coloque. `Esc` lo desarma.
-    pub(crate) fn begin_note_move(&self, id: &str) -> bool {
-        if self.note(id).is_none() {
-            return false;
-        }
-        self.select_note(Some(id.to_string()));
-        self.annot.move_armed.set(true);
-        let Some(page) = self.edit_page(Some(id)) else {
-            return false;
-        };
-        let cursor = gdk::Cursor::from_name("move", None);
-        if let Some(slot) = self.doc.slots.borrow().get(page) {
-            slot.overlay.set_cursor(cursor.as_ref());
-            slot.canvas.set_cursor(cursor.as_ref());
-        }
-        true
     }
 
     /// Clicar una página suelta el foco de los campos de búsqueda y de número de
@@ -3208,13 +3176,6 @@ impl Viewer {
         }
         if self.annot.selected.borrow().is_some() {
             self.select_note(None);
-            return glib::Propagation::Stop;
-        }
-        if self.annot.move_armed.replace(false) {
-            // «Mover con el ratón» queda desarmado y el cursor vuelve al normal
-            // hasta que el puntero vuelva a entrar en una nota.
-            self.annot.hover.borrow_mut().take();
-            self.apply_hand_cursor(None);
             return glib::Propagation::Stop;
         }
         glib::Propagation::Proceed
@@ -3946,7 +3907,7 @@ impl Viewer {
                 (gdk::BUTTON_SECONDARY, Some(id)) => {
                     viewer.release_text_focus();
                     viewer.select_note(Some(id.clone()));
-                    viewer.open_note_menu(id, &canvas_for_menu, x, y);
+                    viewer.open_note_menu(&canvas_for_menu, x, y);
                     gesture.set_state(gtk::EventSequenceState::Claimed);
                 }
                 (gdk::BUTTON_PRIMARY, Some(id)) => {
@@ -6143,6 +6104,39 @@ fn page_under_content(
     nearest
 }
 
+/// Cursor que muestra una nota en `(x, y)`, en píxeles lógicos de la capa de la
+/// página: cuatro flechas en su borde y cursor de texto sobre su texto. La banda
+/// es fija en pantalla, así que se divide por el zoom.
+fn note_cursor_at(
+    note: &TextNote,
+    page: (f64, f64),
+    rotation: i32,
+    zoom: f64,
+    x: f64,
+    y: f64,
+) -> &'static str {
+    if zoom <= 0.0 {
+        return "text";
+    }
+    let (x1, y1) = forward_rotation(note.at, page, rotation);
+    let (x2, y2) = forward_rotation(
+        (note.at.0 + note.width, note.at.1 + note.height),
+        page,
+        rotation,
+    );
+    let (left, right) = (x1.min(x2), x1.max(x2));
+    let (top, bottom) = (y1.min(y2), y1.max(y2));
+    let point = (x / zoom, y / zoom);
+    let band = NOTE_CURSOR_BORDER / zoom;
+    let distance_x = (point.0 - left).max(0.0).min((right - point.0).max(0.0));
+    let distance_y = (point.1 - top).max(0.0).min((bottom - point.1).max(0.0));
+    if distance_x <= band || distance_y <= band {
+        "move"
+    } else {
+        "text"
+    }
+}
+
 /// Botón de una entrada del menú contextual de la nota: aspecto de ítem de menú
 /// y texto alineado a la izquierda.
 fn note_menu_button(label: &str) -> gtk::Button {
@@ -6515,6 +6509,41 @@ mod tests {
             color: NOTE_COLOR,
         }]);
         assert_eq!(measured, expected, "Pango mide igual por atributos que por descripción");
+    }
+
+    #[test]
+    fn the_note_cursor_is_text_inside_and_move_on_the_border() {
+        let note = TextNote::new(
+            0,
+            (10.0, 10.0),
+            100.0,
+            20.0,
+            vec![run("Nota", 12.0, NOTE_COLOR)],
+        );
+        let page = (200.0, 200.0);
+
+        assert_eq!(note_cursor_at(&note, page, 0, 1.0, 60.0, 20.0), "text");
+        assert_eq!(note_cursor_at(&note, page, 0, 1.0, 12.0, 20.0), "move");
+        assert_eq!(note_cursor_at(&note, page, 0, 1.0, 60.0, 29.0), "move");
+
+        // A 200 % la banda sigue midiendo 5 px: en puntos de la vista son 2.5.
+        assert_eq!(note_cursor_at(&note, page, 0, 2.0, 120.0, 40.0), "text");
+        assert_eq!(note_cursor_at(&note, page, 0, 2.0, 24.0, 40.0), "move");
+        assert_eq!(note_cursor_at(&note, page, 0, 2.0, 32.0, 40.0), "text");
+    }
+
+    #[test]
+    fn the_note_cursor_follows_the_rotated_box() {
+        let note = TextNote::new(
+            0,
+            (10.0, 10.0),
+            100.0,
+            20.0,
+            vec![run("Nota", 12.0, NOTE_COLOR)],
+        );
+        // Con /Rotate 90 la caja va de (70,10) a (90,110) en la vista.
+        assert_eq!(note_cursor_at(&note, (200.0, 100.0), 90, 1.0, 80.0, 60.0), "text");
+        assert_eq!(note_cursor_at(&note, (200.0, 100.0), 90, 1.0, 71.0, 60.0), "move");
     }
 
     #[test]
