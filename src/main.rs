@@ -4319,6 +4319,15 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         }
         let shape_dialog_widget = shape_dialog.clone().upcast::<gtk::Widget>();
         assert!(
+            !dialog_labels.iter().any(|label| label.starts_with("Elegir")),
+            "el diálogo ya no muestra una etiqueta «Elegir…»: {dialog_labels:?}"
+        );
+        assert_eq!(
+            swatch_buttons(&shape_dialog_widget),
+            2,
+            "contorno y relleno se eligen pulsando su propia muestra de color"
+        );
+        assert!(
             !labeled_button(&shape_dialog_widget, "Quitar relleno")
                 .expect("el diálogo ofrece quitar el relleno")
                 .is_sensitive(),
@@ -4631,6 +4640,23 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
     }
 
     /// Etiquetas de los botones de un menú, en el orden en que se ofrecen.
+    /// Cuenta los botones cuyo contenido es una muestra de color (un área de
+    /// dibujo), que es la forma en que el diálogo de la forma ofrece elegir.
+    fn swatch_buttons(widget: &gtk::Widget) -> usize {
+        let mut found = 0;
+        if let Some(button) = widget.downcast_ref::<gtk::Button>()
+            && button.child().is_some_and(|child| child.is::<gtk::DrawingArea>())
+        {
+            found += 1;
+        }
+        let mut child = widget.first_child();
+        while let Some(current) = child {
+            found += swatch_buttons(&current);
+            child = current.next_sibling();
+        }
+        found
+    }
+
     fn button_labels(widget: &gtk::Widget) -> Vec<String> {
         let mut found = Vec::new();
         if let Some(button) = widget.downcast_ref::<gtk::Button>()

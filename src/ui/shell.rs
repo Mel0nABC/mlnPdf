@@ -4688,12 +4688,16 @@ impl Viewer {
         fill_sample.set_tooltip_text(Some("Color del relleno actual"));
         accessible_label(&fill_sample, "Color del relleno actual");
 
-        let stroke_button = gtk::Button::with_label("Elegir…");
+        // El botón de cada fila es la propia muestra: se pulsa el color y se abre el
+        // selector, sin una etiqueta «Elegir…» al lado.
+        let stroke_button = gtk::Button::new();
         stroke_button.add_css_class("flat");
+        stroke_button.set_child(Some(&stroke_sample));
         stroke_button.set_tooltip_text(Some("Elegir el color del contorno"));
         accessible_label(&stroke_button, "Elegir el color del contorno");
-        let fill_button = gtk::Button::with_label("Elegir…");
+        let fill_button = gtk::Button::new();
         fill_button.add_css_class("flat");
+        fill_button.set_child(Some(&fill_sample));
         fill_button.set_tooltip_text(Some("Elegir el color del relleno"));
         accessible_label(&fill_button, "Elegir el color del relleno");
 
@@ -4702,7 +4706,6 @@ impl Viewer {
         stroke_caption.set_xalign(0.0);
         stroke_caption.set_hexpand(true);
         stroke_row.append(&stroke_caption);
-        stroke_row.append(&stroke_sample);
         stroke_row.append(&stroke_button);
 
         let fill_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -4710,7 +4713,6 @@ impl Viewer {
         fill_caption.set_xalign(0.0);
         fill_caption.set_hexpand(true);
         fill_row.append(&fill_caption);
-        fill_row.append(&fill_sample);
         fill_row.append(&fill_button);
 
         // Barra de la opacidad del relleno, de 10 % a 100 % en pasos de 5, con su
