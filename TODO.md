@@ -45,13 +45,13 @@ Una línea por capacidad, sin agrupar cosas distintas en una sola casilla.
 - [x] Seleccionar y borrar un subrayado o resaltado: un clic sobre la línea del subrayado o dentro del resaltado lo elige (contorno punteado), `Supr` / `Retroceso` o `Eliminar` del clic derecho lo borra, y `Esc` deselecciona; el menú contextual de un marcado no ofrece editar texto
 - [x] Guardar los marcados (subrayados y resaltados) y las notas de texto en el PDF abierto (`Ctrl+S`) o en una copia (`Ctrl+Shift+S`), con escritura atómica y pregunta «¿Quieres guardar los cambios?» con `Sí` / `No` / `Cancelar` al cerrar el documento, recargarlo, abrir otro o cerrar la ventana (`Cancelar` cancela la acción y deja la ventana abierta)
 - [x] Reabrir el archivo con lo guardado todavía editable: al abrir un PDF, las anotaciones propias —subrayados, resaltados, notas de texto e imágenes— se releen por su `/NM` y vuelven a la lista en memoria, así que se pueden elegir, mover, redimensionar, editar el texto, borrar y deshacer, y el siguiente guardado las reemplaza en vez de duplicarlas (lo que no lleva nuestro `/NM` no se toca); una nota recupera una sola fuente y un solo color porque el formato `/FreeText` solo admite un `/DA`
-- [ ] [BLOQUEADA: escritura de PDF] Tachado de texto
-- [ ] [BLOQUEADA: escritura de PDF] Notas adhesivas (sticky notes) y comentarios con hilos de respuesta
+- [x] Tachado de texto (`Ctrl+Alt+U`, botón `S` o `Edit > Tachar`), escrito como anotación `/StrikeOut` con `/QuadPoints` y `/C`: se aplica a la selección o al siguiente arrastre, tiene su propio color y se elige, se borra y se deshace como el subrayado
+- [x] Notas adhesivas con hilos de respuesta (`Ctrl+Alt+N` o «Nota adhesiva» en el menú de dibujo): el clic coloca el icono y abre un diálogo con el comentario raíz y sus respuestas; se escriben como anotaciones `/Text` con `/Contents` y `/Name /Comment`, encadenadas con `/IRT` y `/RT /R` y con un `/NM` por comentario, así que el hilo se ve en otros lectores y se vuelve a armar al abrir el archivo; el icono muestra la cuenta de respuestas, se arrastra para moverlo y `Supr` borra la nota con todo su hilo
 - [x] Texto libre sobre la página (`Ctrl+T`, botón `T` o `Edit > Insertar texto…`), escrito como anotación `/FreeText` con `/Contents`, `/Rect` y `/DA`: un diálogo modal pide el texto (editor multilínea), la fuente y el color; ambos se aplican al texto seleccionado, o a todo el texto si no hay selección, y el siguiente clic fija la esquina de la nota; la familia elegida se aproxima a una de las 14 estándar del PDF (`/Helv`, `/TiRo`, `/Cour` con su estilo), el ancho y el alto salen de medir con Pango en puntos y cada tramo se dibuja con su fuente y su color sobre la capa de la página
 - [x] Imágenes sobre la página (`Ctrl+Shift+I`, botón con el icono de imagen o `Edit > Insertar imagen…`), escritas como anotación `/Stamp` con `/AP` sobre un XObject de imagen `DeviceRGB` comprimido y `/SMask` cuando hay transparencia: el selector filtra `image/*` y acepta lo que el sistema sepa abrir; la imagen entra en el acto centrada en lo que se está viendo, ajustada al 40 % del ancho y del alto de la página y sin agrandarse más allá de su tamaño natural, ya elegida; arrastrarla desde dentro la mueve, arrastrar una esquina la redimensiona (lados independientes y `Shift` conserva la proporción, con la esquina opuesta fija y un mínimo de 8 pt), `Supr` o `Eliminar` la borra y `Ctrl+Z` lo deshace; también se puede soltar un archivo de imagen sobre la página y entra en el punto donde se soltó
-- [ ] [BLOQUEADA: escritura de PDF] Dibujo a mano alzada (lápiz) con grosor y color
-- [ ] [BLOQUEADA: escritura de PDF] Formas: rectángulo, elipse, línea, flecha
-- [ ] [BLOQUEADA: escritura de PDF] Sellos predefinidos (aprobado, revisado, borrador)
+- [x] Dibujo a mano alzada (lápiz) con color y grosor libre en puntos de 0,5 a 20 (`Ctrl+Alt+P` o «Lápiz» en el menú de dibujo), escrito como anotación `/Ink` con `/InkList`, `/C` y `/BS << /W >>`: se arrastra sobre la página y el trazo se pinta mientras se dibuja
+- [x] Formas (`Ctrl+Alt+R` rectángulo, `Ctrl+Alt+E` elipse, `Ctrl+Alt+L` línea, `Ctrl+Alt+F` flecha), escritas como `/Square`, `/Circle` y `/Line` con `/L` y `/LE [/None /OpenArrow]` para la flecha, con color y el mismo grosor libre en puntos que el lápiz
+- [x] Sellos predefinidos —aprobado, revisado y borrador— (`Ctrl+Alt+1`, `Ctrl+Alt+2`, `Ctrl+Alt+3` o «Sellos» en el menú de dibujo), escritos como `/Stamp` con su `/Name` estándar y una apariencia `/AP` propia (doble marco y texto en el color del tipo), así que se ven igual en otros lectores; entran centrados en lo que se está viendo, se arrastran para moverlos y `Supr` los borra
 - [ ] [BLOQUEADA: escritura de PDF] Firmas manuscritas reutilizables
 - [ ] [BLOQUEADA: escritura de PDF] Inspector de anotaciones: listar, filtrar y saltar entre ellas (borrar ya se hace desde la página)
 - [x] Editar las anotaciones ya creadas, también después de guardarlas: un clic sobre la nota la selecciona (contorno punteado que rodea el texto), arrastrarla la mueve, `Supr` / `Retroceso` la borra (clicar la página suelta el foco de los campos de texto para que la tecla llegue a la nota), el doble clic o `Edit > Editar texto de la nota` abre el diálogo con su texto, su fuente y su color precargados (se vuelve a medir con Pango) y el clic derecho abre el menú con `Editar texto` y `Borrar`; el cursor sobre el borde de la nota es el de cuatro flechas (`move`) y sobre el texto el de edición (`text`), y `Esc` deselecciona. Cada anotación propia se escribe con un `/NM` de la sesión, así que el guardado reemplaza o quita sólo las del visor y las de otros programas quedan intactas
@@ -130,10 +130,12 @@ paquete del sistema, así que el lanzador y el icono se copian con
 Estas líneas no se pueden cerrar con el stack actual. No son olvidos: cada una
 necesita una decisión o una dependencia nueva.
 
-- **Escritura de PDF** (resto de la sección 2, unir/dividir/comprimir): poppler-glib
-  es de solo lectura. La escritura de anotaciones ya se resolvió con `lopdf`
-  (subrayado, resaltado y texto libre, sección 2); lo que queda sigue necesitando escribir el PDF (qpdf,
-  mupdf, lopdf) o cambiar de motor a pdfium.
+- **Escritura de PDF** (firmas, inspector, guardado incremental, FDF/medición, y
+  unir/dividir/comprimir): poppler-glib es de solo lectura. La escritura de
+  anotaciones está resuelta con `lopdf` (subrayado, resaltado, tachado, texto
+  libre, imágenes, trazos, formas, notas adhesivas y sellos, sección 2); lo que
+  queda pide otras técnicas —guardado incremental, aplanado, FDF— o cambiar de
+  motor a pdfium, y la firma necesita además un stack criptográfico.
 - **Formularios y firmas** (sección 3): poppler no guarda AcroForm ni firmas; PAdES
   además necesita un stack criptográfico (`openssl`/`ring`) y verificación de
   cadena.

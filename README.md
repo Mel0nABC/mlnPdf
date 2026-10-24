@@ -67,12 +67,16 @@ ventana.
 | Selección con el ratón y copiar solo lo seleccionado | Arrastrar y `Ctrl+C` |
 | Subrayar el texto como anotación real del PDF, en el color elegido (el botón muestra ese color) | Botón al lado del zoom, `Ctrl+U`: abre el selector de color y aplica a la selección o al siguiente arrastre; un clic en el subrayado lo selecciona y `Supr` o `Eliminar` del menú contextual lo borra |
 | Resaltar el texto como rotulador, en su propio color (el botón lo muestra de fondo) | Botón al lado del zoom, `Ctrl+Shift+U`: abre el selector de color y aplica a la selección o al siguiente arrastre; un clic dentro del resaltado lo selecciona y `Supr` o `Eliminar` del menú contextual lo borra |
+| Tachar el texto como anotación real del PDF, en su propio color | Botón `S` al lado de `U` y `A`, `Ctrl+Alt+U` o `Edit > Tachar`: abre el selector de color y aplica a la selección o al siguiente arrastre; un clic sobre la línea del tachado lo selecciona |
+| Dibujar a mano alzada y trazar formas, con color y grosor libre en puntos (0,5 a 20) | Botón `✎` al lado de las otras herramientas: el menú ofrece lápiz, rectángulo, elipse, línea y flecha, con un control de grosor y el selector de color; elegida la herramienta, se arrastra sobre la página y el trazo se pinta mientras se dibuja. Atajos: `Ctrl+Alt+P` lápiz, `Ctrl+Alt+R` rectángulo, `Ctrl+Alt+E` elipse, `Ctrl+Alt+L` línea, `Ctrl+Alt+F` flecha |
+| Notas adhesivas con hilos de respuesta, escritas como anotaciones `/Text` encadenadas con `/IRT` | «Nota adhesiva» en el menú de dibujo, `Ctrl+Alt+N` o `Edit > Nota adhesiva`: el clic coloca el icono y abre el diálogo, donde se escribe el comentario y se agregan respuestas; doble clic para volver a editarla, y el icono muestra la cuenta de respuestas |
+| Sellos predefinidos (aprobado, revisado, borrador) con apariencia propia, visibles igual en otros lectores | «Sellos» en el menú de dibujo, `Ctrl+Alt+1` / `2` / `3`, o `Edit > Insertar sello…`: el sello entra centrado en lo que se está viendo, se arrastra para moverlo y `Supr` lo borra |
 | Insertar texto libre sobre la página, con la fuente y el color elegidos en los selectores de GTK (familia aproximada a una de las 14 estándar del PDF) | Botón `T` al lado de las otras herramientas, `Ctrl+T` o `Edit > Insertar texto…`: el diálogo pide texto (multilínea), fuente y color, y el siguiente clic fija la esquina de la nota |
 | Mover, borrar o cambiar el texto de una nota ya creada, también después de guardarla | Arrastrar la nota para moverla (en el borde el cursor es el de cuatro flechas; sobre el texto, el de edición), `Supr` (o `Retroceso`) para borrarla, doble clic o `Edit > Editar texto de la nota` para reescribirla, y clic derecho para el menú con `Editar texto` y `Borrar` |
 | Cambiar la fuente o el color de solo una parte de la nota | En el diálogo de edición, seleccionar el texto y elegir la fuente o el color; sin selección, se aplica a toda la nota |
 | Insertar una imagen sobre la página, en cualquier formato que el sistema sepa abrir (PNG, JPEG, WebP, GIF, BMP y SVG si está librsvg) | Botón con el icono de imagen al lado de la `T`, `Ctrl+Shift+I` o `Edit > Insertar imagen…`: el selector filtra `image/*` y la imagen entra en el acto centrada en lo que se está viendo, ya elegida y con asas |
 | Mover y redimensionar una imagen, y borrarla como cualquier otra anotación | Arrastrarla desde dentro para moverla (`move`), arrastrar una esquina para redimensionarla (`Shift` conserva la proporción, la esquina opuesta queda fija y ningún lado baja de 8 pt), `Supr` o `Eliminar` del menú contextual para borrarla; también se puede soltar un archivo de imagen directamente sobre la página |
-| Volver a editar lo guardado: al reabrir el archivo, los subrayados, resaltados, notas e imágenes que escribió MlnPdf vuelven a la lista editable | Abrir el archivo y usar las mismas herramientas: clic para elegir, `Supr` para borrar, doble clic o `Edit > Editar texto de la nota` para el texto, arrastrar para mover y las esquinas para redimensionar; las anotaciones de otros programas se respetan y no se reescriben |
+| Volver a editar lo guardado: al reabrir el archivo, todas las anotaciones que escribió MlnPdf —subrayados, resaltados, tachados, notas de texto, imágenes, trazos, formas, notas adhesivas con sus hilos y sellos— vuelven a la lista editable | Abrir el archivo y usar las mismas herramientas: clic para elegir, `Supr` para borrar, doble clic o `Edit > Editar texto de la nota` para el texto, arrastrar para mover y las esquinas para redimensionar; las anotaciones de otros programas se respetan y no se reescriben |
 | Deshacer y rehacer con instantáneas, de a un cambio | `Ctrl+Z` / `Ctrl+Shift+Z` (o `Ctrl+Y`), `Edit > Deshacer` / `Rehacer` |
 | Metadatos del documento | `Ctrl+D` |
 
@@ -117,6 +121,8 @@ ventana.
 | `Ctrl+C` / `Ctrl+Shift+C` | Copiar la selección / la página | `Esc` | Sale de presentación, del modo mano o de una herramienta de anotación; limpia la búsqueda |
 | `Ctrl+U` / `Ctrl+Shift+U` | Subrayar / resaltar | `Ctrl+T` | Insertar una nota de texto en la página |
 | `Ctrl+Shift+I` | Insertar una imagen en la página | `Shift` + arrastrar un asa | Redimensionar la imagen conservando la proporción |
+| `Ctrl+Alt+U` | Tachar el texto seleccionado | `Ctrl+Alt+N` | Insertar una nota adhesiva |
+| `Ctrl+Alt+P` / `R` / `E` / `L` / `F` | Lápiz / rectángulo / elipse / línea / flecha | `Ctrl+Alt+1` / `2` / `3` | Sello aprobado / revisado / borrador |
 | `Ctrl+Z` | Deshacer el último cambio | `Ctrl+Shift+Z` / `Ctrl+Y` | Rehacer el cambio deshecho |
 | `Supr` | Borrar la anotación seleccionada | `Ctrl+S` / `Ctrl+Shift+S` | Guardar / guardar como |
 
@@ -172,7 +178,7 @@ Probado con GTK 4.24 y poppler-glib 26.10.
 
 ```bash
 cargo build --release
-cargo test                 # 132 pruebas: motor, render, selección, búsqueda, páginas, sesión, anotaciones
+cargo test                 # 171 pruebas: motor, render, selección, búsqueda, páginas, sesión, anotaciones
 cargo test -- --ignored    # prueba de display: atajos, zoom y propiedad del viewer
 ```
 
@@ -229,8 +235,11 @@ formato `/FreeText` solo admite un `/DA`. Las anotaciones propias llevan su `/NM
 así que al volver a abrir el archivo se releen y siguen siendo editables; las de
 otros programas se ven pero no se reescriben. Mientras el documento está abierto
 se guarda en memoria una copia del PDF sin las anotaciones propias, que es la que
-se rasteriza. `Ctrl+Z` alcanza a los últimos 20 cambios de la sesión, no a lo que
-se hizo antes de cerrar el documento.
+se rasteriza. Los trazos y las formas no se pueden mover ni redimensionar una vez
+creados (se borran y se vuelven a dibujar), los sellos tienen tamaño fijo y solo se
+mueven, y el diálogo de una nota adhesiva agrega respuestas pero no borra una
+suelta. `Ctrl+Z` alcanza a los últimos 20 cambios de la sesión, no a lo que se hizo
+antes de cerrar el documento.
 
 ## Licencia
 
