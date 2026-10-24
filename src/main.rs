@@ -27,7 +27,7 @@ mod tests {
     use std::rc::Rc;
     use crate::engine::geometry::*;
     use crate::engine::annotation::{
-        Annotation, FontChoice, MarkKind, NOTE_COLOR, TextMark, TextNote, TextRun,
+        Annotation, FontChoice, IMAGE_BOX_FRACTION, MarkKind, NOTE_COLOR, TextMark, TextNote, TextRun,
     };
     use crate::ui::shell::*;
 
@@ -221,8 +221,8 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         };
         assert_eq!(
             children.len(),
-            8,
-            "búsqueda, hueco, páginas, hueco, zoom, subrayar, resaltar, insertar texto"
+            9,
+            "búsqueda, hueco, páginas, hueco, zoom, subrayar, resaltar, insertar texto e insertar imagen"
         );
         for gap in [&children[1], &children[3]] {
             assert_eq!(
@@ -250,6 +250,17 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             children[7].tooltip_text().as_deref(),
             Some("Insertar texto (Ctrl+T)"),
             "la tercera herramienta se anuncia con su atajo"
+        );
+        // Insertar imagen no es un modo que quede armado: es un botón normal con
+        // icono que abre el selector de archivos en el acto.
+        assert!(
+            !children[8].is::<gtk::ToggleButton>() && children[8].is::<gtk::Button>(),
+            "insertar imagen es un botón normal, no una herramienta armada"
+        );
+        assert_eq!(
+            children[8].tooltip_text().as_deref(),
+            Some("Insertar imagen (Ctrl+Shift+I)"),
+            "el botón de imagen se anuncia con su atajo"
         );
 
         // El menú File: guardar con nombres cortos. "Guardar" escribe en el
@@ -299,6 +310,10 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         assert!(
             edit_labels.iter().any(|label| label == "Insertar texto…"),
             "el menú Edit ofrece insertar texto: {edit_labels:?}"
+        );
+        assert!(
+            edit_labels.iter().any(|label| label == "Insertar imagen…"),
+            "el menú Edit ofrece insertar imagen junto al texto: {edit_labels:?}"
         );
         // Las dos acciones que operan sobre la nota elegida van después de Rehacer.
         let rehacer = edit_labels
@@ -367,6 +382,10 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
 
         viewer.open(&path).expect("open a document from disk");
         assert_eq!(viewer.ui.zoom_label.label(), "100 %");
+        assert!(
+            viewer.ui.image_button.is_sensitive(),
+            "con un documento abierto el botón de imagen se habilita"
+        );
 
         // One placeholder per page, sized in logical pixels.
         assert_eq!(viewer.doc.slots.borrow().len(), 1, "one slot per page");
@@ -1443,6 +1462,94 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             viewer.annot.edits.borrow().is_empty(),
             "No descarta los cambios pendientes"
         );
+
+        // S1 y S3: la herramienta de imagen. El selector de archivos es una
+        // ventana modal que una prueba no puede manejar, así que se llama a la
+        // misma función que usa el diálogo al aceptar, con un PNG generado acá
+        // mismo. La imagen tiene que nacer más chica que la página, conservar la
+        // proporción, quedar elegida y poder borrarse y recuperarse.
+        let image_path = dir.join("insert-image-ui.png");
+        let visible_page = viewer
+            .visible_page_point()
+            .map(|(page, _)| page)
+            .expect("hay una página a la vista donde insertar");
+        let (image_width, image_height) = (40usize, 20usize);
+        let image_stride = image_width * 4;
+        let mut image_bytes = vec![0u8; image_stride * image_height];
+        for pixel in image_bytes.chunks_exact_mut(4) {
+            // BGRA premultiplicado y opaco: un azul que se distingue del papel.
+            pixel.copy_from_slice(&[255, 0, 0, 255]);
+        }
+        let texture = gtk::gdk::MemoryTexture::new(
+            image_width as i32,
+            image_height as i32,
+            gtk::gdk::MemoryFormat::B8g8r8a8Premultiplied,
+            &gtk::glib::Bytes::from_owned(image_bytes),
+            image_stride,
+        );
+        texture
+            .save_to_png(&image_path)
+            .expect("el PNG de la prueba se escribe en el disco");
+
+        assert!(
+            viewer.insert_image(&image_path, None),
+            "la imagen elegida se inserta en la página visible"
+        );
+        assert_eq!(
+            viewer.annot.edits.borrow().len(),
+            1,
+            "la imagen entra como una anotación nueva"
+        );
+        let image_id = edit_id(&viewer, 0);
+        let image = match viewer.annot.edits.borrow()[0].value.clone() {
+            Annotation::Image(image) => image,
+            other => panic!("la anotación tiene que ser una imagen: {other:?}"),
+        };
+        assert_eq!(
+            viewer.annot.selected.borrow().clone(),
+            Some(image_id.clone()),
+            "la imagen recién insertada queda elegida, con sus asas"
+        );
+        assert_eq!(
+            image.page,
+            visible_page,
+            "la imagen cae en la página que se está viendo"
+        );
+        let page_size = viewer.doc.page_sizes.borrow()[image.page];
+        assert!(
+            image.width >= image_width as f64 && image.height >= image_height as f64,
+            "la imagen no se achica por debajo de su tamaño natural: {}x{}",
+            image.width,
+            image.height
+        );
+        assert!(
+            image.width <= page_size.0 * IMAGE_BOX_FRACTION
+                && image.height <= page_size.1 * IMAGE_BOX_FRACTION,
+            "la imagen no cubre toda la vista: {}x{} en una página {page_size:?}",
+            image.width,
+            image.height
+        );
+        assert!(
+            (image.width / image.height - image_width as f64 / image_height as f64).abs() < 1e-6,
+            "la imagen conserva su proporción: {}x{}",
+            image.width,
+            image.height
+        );
+
+        assert!(
+            viewer.delete_selected_annotation(),
+            "Supr borra la imagen elegida"
+        );
+        assert!(
+            viewer.annot.edits.borrow().is_empty(),
+            "la imagen borrada deja la página sin anotaciones"
+        );
+        assert!(viewer.undo(), "el borrado de la imagen se deshace");
+        assert!(
+            matches!(&viewer.annot.edits.borrow()[0].value, Annotation::Image(_)),
+            "deshacer recupera la imagen, no otra anotación"
+        );
+        std::fs::remove_file(&image_path).ok();
 
         // Pulsar la herramienta abre el selector de color del sistema. Es la
         // única parte del flujo que no se puede probar sin un clic real, así que

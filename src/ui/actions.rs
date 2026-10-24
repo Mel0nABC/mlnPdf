@@ -4,7 +4,7 @@ use gtk::gio;
 
 /// Keyboard shortcuts bound to the window actions. Declared as data so the
 /// display test can prove every trigger string actually parses.
-pub const SHORTCUTS: [(&str, &str); 40] = [
+pub const SHORTCUTS: [(&str, &str); 41] = [
     ("<Control>plus", "win.zoom-in"),
     ("<Control>equal", "win.zoom-in"),
     ("<Control>minus", "win.zoom-out"),
@@ -44,6 +44,7 @@ pub const SHORTCUTS: [(&str, &str); 40] = [
     ("<Control>u", "win.underline"),
     ("<Control><Shift>u", "win.highlight"),
     ("<Control>t", "win.insert-text"),
+    ("<Control><Shift>i", "win.insert-image"),
     ("<Control>s", "win.save-annotations"),
     ("<Control><Shift>s", "win.save-annotations-as"),
     // Sin `<Control>`: es la tecla de borrar la nota elegida. El visor la maneja
@@ -52,7 +53,7 @@ pub const SHORTCUTS: [(&str, &str); 40] = [
 ];
 
 /// Human-readable shortcut list shown by Help > Atajos de teclado.
-pub const SHORTCUT_HELP: [(&str, &str); 27] = [
+pub const SHORTCUT_HELP: [(&str, &str); 28] = [
     ("Ctrl+O", "Abrir un PDF"),
     ("Ctrl+P", "Imprimir"),
     ("Ctrl+F", "Buscar en el documento"),
@@ -71,6 +72,7 @@ pub const SHORTCUT_HELP: [(&str, &str); 27] = [
     ("Ctrl+U", "Subrayar el texto seleccionado"),
     ("Ctrl+Shift+U", "Resaltar el texto seleccionado"),
     ("Ctrl+T", "Insertar una nota de texto en la página"),
+    ("Ctrl+Shift+I", "Insertar una imagen en la página"),
     ("Ctrl+S / Ctrl+Shift+S", "Guardar los marcados / guardar como"),
     ("Ctrl+Shift+C", "Copiar el texto de la página actual"),
     ("Ctrl+G / Ctrl+Shift+G", "Siguiente / anterior coincidencia"),
@@ -108,6 +110,7 @@ pub fn build_menu_bar() -> gtk::PopoverMenuBar {
     edit_menu.append(Some("Subrayar"), Some("win.underline"));
     edit_menu.append(Some("Resaltar"), Some("win.highlight"));
     edit_menu.append(Some("Insertar texto…"), Some("win.insert-text"));
+    edit_menu.append(Some("Insertar imagen…"), Some("win.insert-image"));
     edit_menu.append(Some("Copiar texto de la página"), Some("win.copy-page-text"));
     model.append_submenu(Some("Edit"), &edit_menu);
 

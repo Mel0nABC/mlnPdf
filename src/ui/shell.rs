@@ -139,6 +139,9 @@ pub(crate) struct UiHandles {
     pub(crate)     tools: [MarkToolUi; 2],
     /// Botón de la herramienta «insertar texto».
     pub(crate)     text_button: gtk::ToggleButton,
+    /// Botón de la herramienta «insertar imagen»: no es un modo, abre el selector
+    /// de archivos y la imagen aparece en el acto.
+    pub(crate)     image_button: gtk::Button,
 }
 
 /// Widgets de una herramienta de marcado: el botón y el selector de color de
@@ -319,6 +322,14 @@ pub(crate) struct InteractionState {
     pub(crate)     pointer: Cell<Option<(f64, f64)>>,
 }
 
+/// Qué se agarró con el puntero, para decidir qué hacer con el clic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HitKind {
+    Note,
+    Image,
+    Mark,
+}
+
 /// Punto del documento que se mantiene bajo el puntero mientras cambia el zoom.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ZoomAnchor {
@@ -391,6 +402,12 @@ impl Viewer {
             .build();
         accessible_label(&text_button, "Insertar texto en la página");
 
+        let image_button = gtk::Button::builder()
+            .child(&gtk::Image::from_icon_name("image-x-generic-symbolic"))
+            .tooltip_text("Insertar imagen (Ctrl+Shift+I)")
+            .build();
+        accessible_label(&image_button, "Insertar imagen en la página");
+
         let title = gtk::Label::new(Some(WINDOW_TITLE));
 
         let header = gtk::HeaderBar::new();
@@ -456,6 +473,7 @@ impl Viewer {
         controls.append(&tools[0].button);
         controls.append(&tools[1].button);
         controls.append(&text_button);
+        controls.append(&image_button);
 
         // Secondary toolbar: the group stays centred, whatever the window width.
         let toolbar = gtk::Box::builder()
@@ -543,6 +561,7 @@ impl Viewer {
                 scale_provider: scale_provider.clone(),
                 tools,
                 text_button: text_button.clone(),
+                image_button: image_button.clone(),
             },
             doc: DocumentState {
                 document: RefCell::new(None),
@@ -660,6 +679,14 @@ impl Viewer {
                     viewer.prompt_text_note();
                 } else {
                     viewer.set_text_tool(false);
+                }
+            });
+        }
+        {
+            let weak = Rc::downgrade(&viewer);
+            image_button.connect_clicked(move |_| {
+                if let Some(viewer) = weak.upgrade() {
+                    viewer.prompt_insert_image();
                 }
             });
         }
@@ -930,6 +957,7 @@ impl Viewer {
             viewer.toggle_mark_mode(MarkKind::Highlight);
         });
         Self::install_action(viewer, "insert-text", |viewer| viewer.prompt_text_note());
+        Self::install_action(viewer, "insert-image", |viewer| viewer.prompt_insert_image());
         Self::install_action(viewer, "undo", |viewer| {
             let undone = viewer.undo();
             viewer.announce_change(if undone {
@@ -1979,6 +2007,135 @@ impl Viewer {
         self.prompt_note_text(None);
     }
 
+    /// Selector de archivos de la herramienta de imagen: lo elegido entra en la
+    /// página en el acto, ya elegido y listo para moverlo o redimensionarlo.
+    pub(crate) fn prompt_insert_image(self: &Rc<Self>) {
+        if self.doc.document.borrow().is_none() {
+            return;
+        }
+
+        let filter = gtk::FileFilter::new();
+        filter.set_name(Some("Imágenes"));
+        filter.add_mime_type("image/*");
+        let filters = gio::ListStore::new::<gtk::FileFilter>();
+        filters.append(&filter);
+
+        let dialog = gtk::FileDialog::builder()
+            .title("Insertar imagen")
+            .modal(true)
+            .filters(&filters)
+            .default_filter(&filter)
+            .build();
+
+        let weak = Rc::downgrade(self);
+        dialog.open(Some(&self.ui.window), None::<&gio::Cancellable>, move |result| {
+            let Some(viewer) = weak.upgrade() else {
+                return;
+            };
+            let file = match result {
+                Ok(file) => file,
+                Err(error) if error.matches(gtk::DialogError::Dismissed) => return,
+                Err(error) => {
+                    show_error(
+                        &viewer.ui.window,
+                        "No se pudo abrir el selector de archivos.",
+                        &error.to_string(),
+                    );
+                    return;
+                }
+            };
+            let Some(path) = file.path() else {
+                show_error(
+                    &viewer.ui.window,
+                    "La imagen elegida no está en el disco local.",
+                    "",
+                );
+                return;
+            };
+            viewer.insert_image(&path, None);
+        });
+    }
+
+    /// Inserta la imagen de `path` y devuelve si entró. Sin `target` se coloca
+    /// centrada en la zona visible de la página actual; con `target` se centra en
+    /// ese punto de esa página, que es donde se soltó el archivo.
+    ///
+    /// En los dos casos nace más chica que la página (`ImageNote::fitted_in_page`),
+    /// elegida y con sus asas: lo que sigue es moverla y redimensionarla.
+    pub(crate) fn insert_image(
+        self: &Rc<Self>,
+        path: &Path,
+        target: Option<(usize, (f64, f64))>,
+    ) -> bool {
+        if self.doc.document.borrow().is_none() {
+            return false;
+        }
+        let pixels = match load_image_pixels(path) {
+            Ok(pixels) => pixels,
+            Err(error) => {
+                show_error(
+                    &self.ui.window,
+                    "No se pudo leer la imagen.",
+                    &error,
+                );
+                return false;
+            }
+        };
+
+        let (page, center) = match target.or_else(|| self.visible_page_point()) {
+            Some((page, point)) => (page, Some(point)),
+            None => return false,
+        };
+        let Some(page_size) = self.doc.page_sizes.borrow().get(page).copied() else {
+            return false;
+        };
+        let (default_at, (width, height)) = ImageNote::fitted_in_page(&pixels, page_size);
+        let at = match center {
+            Some(point) => (point.0 - width / 2.0, point.1 - height / 2.0),
+            None => default_at,
+        };
+
+        self.begin_edit();
+        let id = self.new_id();
+        self.annot.edits.borrow_mut().push(Edit {
+            id: id.clone(),
+            value: Annotation::Image(ImageNote::new(page, at, width, height, pixels)),
+        });
+        self.select_annotation(Some(id));
+        self.queue_page_draw(page);
+        self.announce_change("Imagen insertada");
+        true
+    }
+
+    /// Página y punto —en el espacio de esa página, con el origen arriba— que
+    /// quedan en el centro de la zona visible. Es donde cae una imagen recién
+    /// elegida que no se soltó en ningún lado.
+    pub(crate) fn visible_page_point(&self) -> Option<(usize, (f64, f64))> {
+        let current = self.current_page();
+        let oriented = self.oriented_sizes();
+        let zoom = self.view.zoom.get();
+        let layout = self.doc.layout.borrow();
+        let (spread, cover) = (self.view.spread.get(), self.view.cover_alone.get());
+
+        let vadj = self.ui.scroller.vadjustment();
+        let hadj = self.ui.scroller.hadjustment();
+        let center = (
+            hadj.value() + hadj.page_size() / 2.0,
+            vadj.value() + vadj.page_size() / 2.0,
+        );
+        let page = page_under_content(&layout, &oriented, zoom, spread, cover, center)
+            .unwrap_or(current);
+        let raw = *self.doc.page_sizes.borrow().get(page)?;
+        let oriented_size = *oriented.get(page)?;
+        let left = page_left(&oriented, zoom, spread, cover, page)?;
+        let top = layout.page_offset(page);
+        let display = (
+            ((center.0 - left) / zoom).clamp(0.0, oriented_size.0),
+            ((center.1 - top) / zoom).clamp(0.0, oriented_size.1),
+        );
+        Some((page, inverse_rotation(display, raw, self.view.rotation.get())))
+    }
+
     /// Diálogo para cambiar el texto, la fuente y el color de la nota elegida,
     /// con lo que ya tiene precargado. `Cancelar` no cambia nada.
     pub(crate) fn prompt_note_edit(self: &Rc<Self>) {
@@ -2690,6 +2847,26 @@ impl Viewer {
         let edits = self.annot.edits.borrow();
         edits.iter().rev().find_map(|edit| match &edit.value {
             Annotation::Mark(mark) if mark.page == page && mark.contains(point, tolerance) => {
+                Some(edit.id.clone())
+            }
+            _ => None,
+        })
+    }
+
+    /// Imagen bajo el punto `(x, y)` de la vista, si hay alguna. La caja entera
+    /// agarra, no solo el contorno: es lo que se arrastra para moverla. La última
+    /// dibujada gana, igual que con los marcados.
+    pub(crate) fn image_at(&self, page: usize, x: f64, y: f64) -> Option<String> {
+        let point = self.view_to_pdf(page, x, y)?;
+        let zoom = self.view.zoom.get();
+        let tolerance = if zoom > 0.0 {
+            IMAGE_HANDLE_SIZE / zoom
+        } else {
+            0.0
+        };
+        let edits = self.annot.edits.borrow();
+        edits.iter().rev().find_map(|edit| match &edit.value {
+            Annotation::Image(image) if image.page == page && image.contains(point, tolerance) => {
                 Some(edit.id.clone())
             }
             _ => None,
@@ -4076,12 +4253,14 @@ impl Viewer {
             if viewer.input.hand_mode.get() || viewer.text_tool_active() {
                 return;
             }
-            // La nota gana sobre un marcado que la cubra; si no hay nota, se
-            // prueba el subrayado o el resaltado.
+            // La nota gana sobre lo demás por ser lo más chico y lo que se edita;
+            // después la imagen, que tapa lo que tenga debajo, y al final el
+            // subrayado o el resaltado.
             let hit = viewer
                 .note_at(page, x, y)
-                .map(|id| (id, true))
-                .or_else(|| viewer.mark_at(page, x, y).map(|id| (id, false)));
+                .map(|id| (id, HitKind::Note))
+                .or_else(|| viewer.image_at(page, x, y).map(|id| (id, HitKind::Image)))
+                .or_else(|| viewer.mark_at(page, x, y).map(|id| (id, HitKind::Mark)));
             match (gesture.current_button(), hit) {
                 (gdk::BUTTON_SECONDARY, Some((id, _))) => {
                     viewer.release_text_focus();
@@ -4089,12 +4268,12 @@ impl Viewer {
                     viewer.open_annotation_menu(id, &canvas_for_menu, x, y);
                     gesture.set_state(gtk::EventSequenceState::Claimed);
                 }
-                (gdk::BUTTON_PRIMARY, Some((id, is_note))) => {
+                (gdk::BUTTON_PRIMARY, Some((id, kind))) => {
                     viewer.release_text_focus();
                     viewer.select_annotation(Some(id));
                     // El doble clic abre el editor solo para una nota y fuera de
                     // las herramientas de marcado, donde el clic arma un marcado.
-                    if is_note && presses >= 2 && viewer.active_mark_tool().is_none() {
+                    if kind == HitKind::Note && presses >= 2 && viewer.active_mark_tool().is_none() {
                         viewer.prompt_note_edit();
                     }
                 }
@@ -5816,6 +5995,7 @@ impl Viewer {
             }
             self.ui.text_button.set_active(false);
             self.ui.text_button.set_sensitive(false);
+            self.ui.image_button.set_sensitive(false);
             for nav in &self.ui.navs {
                 nav.entry.set_text("");
                 nav.entry.set_sensitive(false);
@@ -5831,6 +6011,7 @@ impl Viewer {
             tool.button.set_sensitive(true);
         }
         self.ui.text_button.set_sensitive(true);
+        self.ui.image_button.set_sensitive(true);
         self.nav.current.set(index);
         if self.ui.thumbs_selection.selected() != index as u32 {
             self.input.thumb_sync.set(true);
@@ -6203,6 +6384,26 @@ fn note_attributes(runs: &[TextRun], zoom: f64) -> pango::AttrList {
         start = end;
     }
     attributes
+}
+
+/// Píxeles de una imagen ya decodificada, listos para el lienzo y para el PDF.
+///
+/// `download` entrega BGRA premultiplicado, el mismo formato que guarda
+/// `ImagePixels`: es el orden que cairo espera en una superficie `ARGB32`, así
+/// que decodificar una sola vez sirve para pintar la imagen en la página y para
+/// escribirla en el archivo.
+fn load_image_pixels(path: &Path) -> Result<ImagePixels, String> {
+    let texture = gdk::Texture::from_filename(path)
+        .map_err(|error| format!("no se pudo abrir «{}»: {error}", path.display()))?;
+    let (width, height) = (texture.width(), texture.height());
+    if width <= 0 || height <= 0 {
+        return Err("la imagen no tiene tamaño".to_string());
+    }
+    let stride = width as usize * 4;
+    let mut data = vec![0u8; stride * height as usize];
+    texture.download(&mut data, stride);
+    ImagePixels::new(width as u32, height as u32, data)
+        .ok_or_else(|| "la imagen llegó incompleta".to_string())
 }
 
 /// Mide el texto de los tramos en puntos PDF. El layout se crea a tamaño real,
