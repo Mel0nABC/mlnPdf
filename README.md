@@ -62,7 +62,7 @@ ventana.
 | Capacidad | Cómo se usa |
 |---|---|
 | Búsqueda con resaltado por carácter encontrado | `Ctrl+F`; `Enter` avanza al siguiente, `Esc` limpia |
-| Salto entre coincidencias con contador `n/m` | `Ctrl+G` / `Ctrl+Shift+G` |
+| Salto entre coincidencias con contador `n/m` | `Ctrl+G` / `Ctrl+Shift+G`: la página de la coincidencia queda **centrada** en la ventana y su miniatura centrada en el panel |
 | Copiar el texto de la página actual | `Ctrl+Shift+C` |
 | Selección con el ratón y copiar solo lo seleccionado | Arrastrar y `Ctrl+C` |
 | Subrayar el texto como anotación real del PDF, en el color elegido (el botón muestra ese color) | Botón al lado del zoom, `Ctrl+U`: abre el selector de color y aplica a la selección o al siguiente arrastre; un clic en el subrayado lo selecciona y `Supr` o `Eliminar` del menú contextual lo borra |
