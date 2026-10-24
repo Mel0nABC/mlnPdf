@@ -7986,7 +7986,7 @@ impl Viewer {
     /// from the rows the list already laid out, so theme margins and the
     /// interface scale are honoured instead of guessed.
     pub(crate) fn center_thumbnail(&self, index: usize) -> bool {
-        let Some((first_row_top, chrome)) = self.thumbnail_row_geometry() else {
+        let Some((anchor, anchor_top, chrome)) = self.thumbnail_row_geometry() else {
             return false;
         };
         let sizes = self.doc.page_sizes.borrow();
@@ -8002,14 +8002,16 @@ impl Viewer {
         };
 
         let adjustment = self.ui.sidebar.vadjustment();
-        let before: f64 = heights[..index]
-            .iter()
-            .map(|height| height + chrome)
-            .sum::<f64>()
-            + first_row_top;
-        let middle = before + (heights[index] + chrome) / 2.0;
         let maximum = (adjustment.upper() - adjustment.page_size()).max(0.0);
-        adjustment.set_value((middle - adjustment.page_size() / 2.0).clamp(0.0, maximum));
+        adjustment.set_value(thumbnail_center_target(
+            &heights,
+            chrome,
+            anchor,
+            anchor_top,
+            index,
+            adjustment.page_size(),
+            maximum,
+        ));
         true
     }
 
@@ -8017,16 +8019,18 @@ impl Viewer {
     /// its bitmap. Both are theme- and scale-dependent, so they are read from
     /// the laid-out rows; that only works while the list is still at the top,
     /// which is exactly the state a fresh session starts in.
-    fn thumbnail_row_geometry(&self) -> Option<(f64, f64)> {
+    /// Fila maquetada que sirve de ancla y espacio que ocupa cada fila por encima
+    /// de su miniatura. Devuelve `(página del ancla, tope del ancla dentro del
+    /// contenido, espacio extra)`. El ancla puede ser cualquier fila visible: su
+    /// posición ya está en coordenadas del contenido, así que el panel puede estar
+    /// desplazado.
+    fn thumbnail_row_geometry(&self) -> Option<(usize, f64, f64)> {
         let adjustment = self.ui.sidebar.vadjustment();
-        if adjustment.upper() <= adjustment.page_size() + 0.5 || adjustment.value() > 0.5 {
+        if adjustment.upper() <= adjustment.page_size() + 0.5 {
             return None;
         }
         let rows = self.laid_out_thumbnail_rows();
         let (&first, rest) = rows.split_first()?;
-        if first.0 != 0 {
-            return None;
-        }
         let bitmap = f64::from(thumbnail_dimensions(*self.doc.page_sizes.borrow().get(first.0)?)?.1);
         // Two rows give the full row pitch, margins included; with only one row
         // its own height is the best available measurement.
@@ -8034,7 +8038,7 @@ impl Viewer {
             Some(next) if next.0 == first.0 + 1 => next.1 - first.1,
             _ => first.2,
         };
-        Some((first.1, (pitch - bitmap).max(0.0)))
+        Some((first.0, first.1, (pitch - bitmap).max(0.0)))
     }
 
     /// Page index of the first rows the thumbnail list has laid out, with their
@@ -8050,6 +8054,9 @@ impl Viewer {
             let Some(bounds) = row.compute_bounds(&self.ui.thumbs_view) else {
                 continue;
             };
+            // `compute_bounds` respecto de la lista ya da la posición dentro del
+            // contenido, que no cambia al desplazar el panel: por eso el ancla sirve
+            // en cualquier posición y no solo con el panel arriba del todo.
             rows.push((index, f64::from(bounds.y()), f64::from(bounds.height())));
             if rows.len() == 2 {
                 break;
@@ -8705,6 +8712,32 @@ impl Viewer {
 
 /// Marca de tiempo del arranque en nanosegundos: completa el prefijo de los
 /// identificadores para que dos sesiones no coincidan.
+/// Desplazamiento del panel de miniaturas que deja centrada la fila `index`.
+///
+/// `anchor`/`anchor_top` son una fila ya maquetada y su tope medido **dentro del
+/// contenido**, así que el resultado no depende de cuánto esté desplazado el panel.
+/// Esa era la limitación que dejaba la miniatura sin centrar al saltar a un
+/// resultado de búsqueda.
+fn thumbnail_center_target(
+    heights: &[f64],
+    chrome: f64,
+    anchor: usize,
+    anchor_top: f64,
+    index: usize,
+    page_size: f64,
+    maximum: f64,
+) -> f64 {
+    let before = |page: usize| -> f64 {
+        heights[..page]
+            .iter()
+            .map(|height| height + chrome)
+            .sum::<f64>()
+    };
+    let top = anchor_top + before(index) - before(anchor);
+    let middle = top + (heights[index] + chrome) / 2.0;
+    (middle - page_size / 2.0).clamp(0.0, maximum)
+}
+
 fn session_nanos() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

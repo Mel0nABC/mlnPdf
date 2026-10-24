@@ -76,6 +76,60 @@ trailer\n<< /Root 1 0 R /Size 5 >>\n%%EOF\n";
 6 0 obj\n<< /Length 27 >>\nstream\n0 1 0 rg\n0 0 200 200 re\nf\nendstream\nendobj\n\
 trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
 
+    /// PDF de `pages` páginas de 200x200, para probar el panel de miniaturas con
+    /// contenido desplazable.
+    fn many_page_pdf(pages: usize) -> Vec<u8> {
+        use lopdf::dictionary;
+        let mut document = lopdf::Document::with_version("1.4");
+        let pages_id = document.new_object_id();
+        let mut kids = Vec::new();
+        for _ in 0..pages {
+            let contents =
+                document.add_object(lopdf::Stream::new(lopdf::Dictionary::new(), Vec::new()));
+            let page = document.add_object(dictionary! {
+                "Type" => "Page",
+                "Parent" => lopdf::Object::Reference(pages_id),
+                "MediaBox" => lopdf::Object::Array(vec![
+                    lopdf::Object::Integer(0),
+                    lopdf::Object::Integer(0),
+                    lopdf::Object::Integer(200),
+                    lopdf::Object::Integer(200),
+                ]),
+                "Contents" => lopdf::Object::Reference(contents),
+                "Resources" => lopdf::Dictionary::new(),
+            });
+            kids.push(lopdf::Object::Reference(page));
+        }
+        document.set_object(
+            pages_id,
+            dictionary! {
+                "Type" => "Pages",
+                "Kids" => lopdf::Object::Array(kids),
+                "Count" => lopdf::Object::Integer(pages as i64),
+            },
+        );
+        let catalog = document.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => lopdf::Object::Reference(pages_id),
+        });
+        document
+            .trailer
+            .set("Root", lopdf::Object::Reference(catalog));
+        let mut bytes = Vec::new();
+        document
+            .save_to(&mut bytes)
+            .expect("serializar el PDF de prueba");
+        bytes
+    }
+
+    /// Deja correr el bucle principal para que GTK maquete lo que se pidió.
+    fn pump(frames: usize) {
+        for _ in 0..frames {
+            gtk::glib::MainContext::default().iteration(false);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
     fn red_page() -> (poppler::Document, poppler::Page) {
         let document =
             poppler::Document::from_data(RED_PAGE_PDF, None).expect("minimal PDF should parse");
@@ -2448,6 +2502,43 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
 
         // Abrir otro documento deja la lista en lo que ese archivo tiene: el
         // documento original de la prueba no trae anotaciones propias.
+        // El panel de miniaturas centra la fila aunque ya esté desplazado: era el
+        // caso que dejaba la miniatura sin centrar al saltar a un resultado de
+        // búsqueda, porque la medición suponía el panel arriba del todo.
+        {
+            let many_path = dir.join("many-pages-ui.pdf");
+            std::fs::write(&many_path, many_page_pdf(20)).expect("escribir el PDF de veinte páginas");
+            viewer.open(&many_path).expect("abrir el PDF de veinte páginas");
+            pump(12);
+            let adjustment = viewer.ui.sidebar.vadjustment();
+            assert!(
+                adjustment.upper() > adjustment.page_size() + 1.0,
+                "el panel de miniaturas tiene contenido desplazable: {} <= {}",
+                adjustment.upper(),
+                adjustment.page_size()
+            );
+
+            adjustment.set_value(0.0);
+            pump(6);
+            assert!(
+                viewer.center_thumbnail(7),
+                "centrar una miniatura con el panel arriba funciona"
+            );
+            let from_top = adjustment.value();
+
+            adjustment.set_value(adjustment.upper() - adjustment.page_size());
+            pump(6);
+            assert!(
+                viewer.center_thumbnail(7),
+                "centrar una miniatura con el panel ya desplazado funciona"
+            );
+            assert!(
+                (adjustment.value() - from_top).abs() <= 1.0,
+                "el centrado no depende del desplazamiento previo: {} != {from_top}",
+                adjustment.value()
+            );
+            std::fs::remove_file(&many_path).ok();
+        }
         viewer.open(&two_path).expect("volver al documento de la prueba");
         assert!(
             viewer.annot.edits.borrow().is_empty(),
