@@ -1042,8 +1042,8 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         // El cursor distingue el borde de la nota (cuatro flechas) del interior
         // (cursor de texto), también después de moverla y editarla.
         assert!(
-            gtk::gdk::Cursor::from_name("move", None).is_some(),
-            "el tema tiene cursor de mover"
+            move_cursor().is_some(),
+            "el tema resuelve el cursor de cuatro flechas"
         );
         let current_note = note_value(&viewer, 4);
         let overlay = viewer.doc.slots.borrow()[0].overlay.clone();

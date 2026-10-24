@@ -53,8 +53,13 @@ pub(crate) const HIGHLIGHT_COLOR: (f64, f64, f64) = (1.0, 0.88, 0.2);
 pub(crate) const HIGHLIGHT_ALPHA: f64 = 0.4;
 
 /// Width in logical pixels of the border band of a note where the cursor turns
-/// into the four-arrow move cursor.
+/// into the four-arrow move cursor, measured towards the inside of the note.
 const NOTE_CURSOR_BORDER: f64 = 5.0;
+
+/// How far outside the note rectangle the move cursor still applies. El trazo
+/// del contorno queda a caballo del borde y el puntero suele apoyarse un poco
+/// afuera.
+const NOTE_CURSOR_REACH: f64 = 12.0;
 
 /// Width of the thumbnails in the side panel, in logical pixels.
 const THUMB_WIDTH: i32 = 120;
@@ -2926,12 +2931,14 @@ impl Viewer {
         let size = self.doc.page_sizes.borrow().get(page).copied()?;
         let rotation = self.view.rotation.get();
         let point = (x / zoom, y / zoom);
-        let band = NOTE_CURSOR_BORDER / zoom;
+        let inner = NOTE_CURSOR_BORDER / zoom;
+        let outer = NOTE_CURSOR_REACH / zoom;
         let edits = self.annot.edits.borrow();
         edits.iter().rev().find_map(|edit| match &edit.value {
             Annotation::Note(note) if note.page == page => {
                 let rect = note_view_rect(note, size, rotation);
-                cursor_in_note_band(rect, point, band).map(|cursor| (edit.id.clone(), cursor))
+                cursor_in_note_band(rect, point, inner, outer)
+                    .map(|cursor| (edit.id.clone(), cursor))
             }
             _ => None,
         })
@@ -2941,12 +2948,21 @@ impl Viewer {
     /// es el widget que recibe el puntero y heredar el cursor del `Overlay` no se
     /// refresca mientras el puntero sigue dentro: hay que fijarlo en el lienzo.
     fn apply_note_cursor(&self, page: usize, overlay: &gtk::Overlay, name: Option<&str>) {
-        let cursor = name.and_then(|name| gdk::Cursor::from_name(name, None));
+        let cursor = name.and_then(|name| {
+            if name == "move" {
+                move_cursor()
+            } else {
+                gdk::Cursor::from_name(name, None)
+            }
+        });
         overlay.set_cursor(cursor.as_ref());
         if let Some(slot) = self.doc.slots.borrow().get(page) {
             slot.canvas.set_cursor(cursor.as_ref());
             slot.picture.set_cursor(cursor.as_ref());
         }
+        // La ventana es la última red: si el puntero cae en cualquier widget del
+        // área de páginas que no sea la capa, el cursor igual se ve.
+        self.ui.window.set_cursor(cursor.as_ref());
     }
 
     /// Menú contextual de la nota: editar el texto, borrarla o armar el movimiento
@@ -6129,6 +6145,15 @@ fn page_under_content(
 /// Cursor que muestra una nota en `(x, y)`, en píxeles lógicos de la capa de la
 /// página: cuatro flechas en su borde y cursor de texto sobre su texto. La banda
 /// es fija en pantalla, así que se divide por el zoom.
+/// Cursor de cuatro flechas. En el tema Adwaita `move` es un alias del cursor
+/// normal (una flecha), así que se pide `fleur`, el nombre clásico que apunta a
+/// `all-resize`; en temas sin él se cae a `all-scroll` y, al final, a `move`.
+pub(crate) fn move_cursor() -> Option<gdk::Cursor> {
+    ["fleur", "all-scroll", "move"]
+        .into_iter()
+        .find_map(|name| gdk::Cursor::from_name(name, None))
+}
+
 /// Rectángulo de la nota en la vista orientada, en puntos con zoom 1.
 fn note_view_rect(note: &TextNote, page: (f64, f64), rotation: i32) -> (f64, f64, f64, f64) {
     let (x1, y1) = forward_rotation(note.at, page, rotation);
@@ -6140,26 +6165,27 @@ fn note_view_rect(note: &TextNote, page: (f64, f64), rotation: i32) -> (f64, f64
     (x1.min(x2), y1.min(y2), x1.max(x2), y1.max(y2))
 }
 
-/// `Some("move")` when `point` falls in the border band of `rect` (inside or up
-/// to one band outside), `Some("text")` when it falls in the inner text area, and
-/// `None` when it is outside the band altogether.
+/// `Some("move")` on the border of `rect` (up to `inner` towards the inside and
+/// `outer` towards the outside), `Some("text")` in the inner text area, and `None`
+/// beyond the outer reach.
 fn cursor_in_note_band(
     rect: (f64, f64, f64, f64),
     point: (f64, f64),
-    band: f64,
+    inner: f64,
+    outer: f64,
 ) -> Option<&'static str> {
     let (left, top, right, bottom) = rect;
-    if point.0 < left - band
-        || point.0 > right + band
-        || point.1 < top - band
-        || point.1 > bottom + band
+    if point.0 < left - outer
+        || point.0 > right + outer
+        || point.1 < top - outer
+        || point.1 > bottom + outer
     {
         return None;
     }
-    if point.0 <= left + band
-        || point.0 >= right - band
-        || point.1 <= top + band
-        || point.1 >= bottom - band
+    if point.0 < left + inner
+        || point.0 > right - inner
+        || point.1 < top + inner
+        || point.1 > bottom - inner
     {
         Some("move")
     } else {
@@ -6552,17 +6578,47 @@ mod tests {
         );
         let rect = note_view_rect(&note, (200.0, 200.0), 0);
 
-        assert_eq!(cursor_in_note_band(rect, (60.0, 20.0), 5.0), Some("text"));
-        assert_eq!(cursor_in_note_band(rect, (12.0, 20.0), 5.0), Some("move"));
-        assert_eq!(cursor_in_note_band(rect, (60.0, 29.0), 5.0), Some("move"));
-        // La banda también vale 2 px afuera del rectángulo, donde cae el trazo.
-        assert_eq!(cursor_in_note_band(rect, (8.0, 20.0), 5.0), Some("move"));
-        assert_eq!(cursor_in_note_band(rect, (4.0, 20.0), 5.0), None);
+        assert_eq!(
+            cursor_in_note_band(rect, (60.0, 20.0), 5.0, 12.0),
+            Some("text")
+        );
+        assert_eq!(
+            cursor_in_note_band(rect, (12.0, 20.0), 5.0, 12.0),
+            Some("move")
+        );
+        assert_eq!(
+            cursor_in_note_band(rect, (60.0, 29.0), 5.0, 12.0),
+            Some("move")
+        );
+        // La banda alcanza 2 y 6 px afuera, donde cae el trazo y el puntero.
+        assert_eq!(
+            cursor_in_note_band(rect, (8.0, 20.0), 5.0, 12.0),
+            Some("move")
+        );
+        assert_eq!(
+            cursor_in_note_band(rect, (4.0, 20.0), 5.0, 12.0),
+            Some("move")
+        );
+        assert_eq!(cursor_in_note_band(rect, (-5.0, 20.0), 5.0, 12.0), None);
 
-        // A 200 % la banda sigue midiendo 5 px: en puntos de la vista son 2.5.
-        assert_eq!(cursor_in_note_band(rect, (60.0, 20.0), 2.5), Some("text"));
-        assert_eq!(cursor_in_note_band(rect, (12.0, 20.0), 2.5), Some("move"));
-        assert_eq!(cursor_in_note_band(rect, (16.0, 20.0), 2.5), Some("text"));
+        // A 200 % la banda sigue midiendo 5 px hacia adentro y 12 hacia afuera.
+        assert_eq!(
+            cursor_in_note_band(rect, (60.0, 20.0), 2.5, 6.0),
+            Some("text")
+        );
+        assert_eq!(
+            cursor_in_note_band(rect, (12.0, 20.0), 2.5, 6.0),
+            Some("move")
+        );
+        assert_eq!(
+            cursor_in_note_band(rect, (16.0, 20.0), 2.5, 6.0),
+            Some("text")
+        );
+        assert_eq!(
+            cursor_in_note_band(rect, (6.0, 20.0), 2.5, 6.0),
+            Some("move")
+        );
+        assert_eq!(cursor_in_note_band(rect, (2.0, 20.0), 2.5, 6.0), None);
     }
 
     #[test]
@@ -6576,8 +6632,14 @@ mod tests {
         );
         // Con /Rotate 90 la caja va de (70,10) a (90,110) en la vista.
         let rect = note_view_rect(&note, (200.0, 100.0), 90);
-        assert_eq!(cursor_in_note_band(rect, (80.0, 60.0), 5.0), Some("text"));
-        assert_eq!(cursor_in_note_band(rect, (71.0, 60.0), 5.0), Some("move"));
+        assert_eq!(
+            cursor_in_note_band(rect, (80.0, 60.0), 5.0, 12.0),
+            Some("text")
+        );
+        assert_eq!(
+            cursor_in_note_band(rect, (71.0, 60.0), 5.0, 12.0),
+            Some("move")
+        );
     }
 
     #[test]
