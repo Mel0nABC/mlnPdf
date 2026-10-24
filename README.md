@@ -212,6 +212,14 @@ el de la cabecera y el de «Acerca de» sí sean los del proyecto. Si el icono n
 aparece al instante, cierra la sesión o ejecuta
 `gtk-update-icon-cache -f -t ~/.local/share/icons/hicolor`.
 
+El lanzador se instala con la **ruta absoluta** del binario en `Exec=` y `TryExec=`,
+para que el escritorio lo acepte aunque `~/.local/bin` no esté en `PATH` (una entrada
+cuyo `TryExec` no se encuentra se descarta, y con ella se pierde el icono asociado).
+El script también escribe el `index.theme` del tema de iconos del usuario con los
+directorios que existen de verdad; si aun así la caché no se puede generar —suele
+pasar por iconos de otras aplicaciones en el mismo tema— la borra y avisa: GTK
+busca los iconos en los directorios y el icono se muestra igual.
+
 Los iconos viven en `packaging/icons/`: el máster `mlnpdfIcon.png`, las medidas del
 tema en `hicolor/<medida>x<medida>/apps/mlnpdf.png` y la copia que se embebe en el
 binario para la cabecera y «Acerca de», `app-icon-256.png`. Para regenerarlos desde
