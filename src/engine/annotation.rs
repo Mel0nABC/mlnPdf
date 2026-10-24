@@ -412,11 +412,85 @@ impl Shape {
         }
     }
 
+    /// True cuando `point` cae dentro de la forma y no solo cerca de su trazado:
+    /// el interior del rectángulo, el de la elipse o la banda del segmento. Es lo
+    /// que agarra la forma entera para moverla, con la tolerancia de los clics
+    /// sobre el contorno.
+    pub fn covers(&self, point: (f64, f64), tolerance: f64) -> bool {
+        if self.is_empty() {
+            return false;
+        }
+        let (x1, y1, x2, y2) = self.rect();
+        let inside = match self.kind {
+            ShapeKind::Rectangle => {
+                point.0 >= x1 && point.0 <= x2 && point.1 >= y1 && point.1 <= y2
+            }
+            ShapeKind::Ellipse => {
+                // Los dos radios nunca son cero: una elipse vacía ya volvió por
+                // `is_empty`, así que el mínimo solo evita dividir por cero.
+                let radius_x = ((x2 - x1) / 2.0).max(f64::MIN_POSITIVE);
+                let radius_y = ((y2 - y1) / 2.0).max(f64::MIN_POSITIVE);
+                let across = (point.0 - (x1 + x2) / 2.0) / radius_x;
+                let down = (point.1 - (y1 + y2) / 2.0) / radius_y;
+                across * across + down * down <= 1.0
+            }
+            // La línea y la flecha no tienen interior: su banda es el trazado.
+            ShapeKind::Line | ShapeKind::Arrow => false,
+        };
+        inside || self.contains(point, tolerance)
+    }
+
+    /// Asas de las que se redimensiona la forma, en el orden en que se dibujan:
+    /// las cuatro esquinas de la caja para el rectángulo y la elipse —arriba a la
+    /// izquierda, arriba a la derecha, abajo a la izquierda y abajo a la derecha
+    /// de la caja ya normalizada— y los dos extremos —`from` y después `to`— para
+    /// la línea y la flecha.
+    pub fn handles(&self) -> Vec<(f64, f64)> {
+        let rect = self.rect();
+        match self.kind {
+            ShapeKind::Rectangle | ShapeKind::Ellipse => Corner::ALL
+                .into_iter()
+                .map(|corner| corner.point(rect))
+                .collect(),
+            ShapeKind::Line | ShapeKind::Arrow => vec![self.from, self.to],
+        }
+    }
+
+    /// Índice del asa que está bajo `point`, si alguna, con la misma tolerancia
+    /// cuadrada que las esquinas de una imagen.
+    pub fn handle_at(&self, point: (f64, f64), tolerance: f64) -> Option<usize> {
+        self.handles().into_iter().position(|(x, y)| {
+            (point.0 - x).abs() <= tolerance && (point.1 - y).abs() <= tolerance
+        })
+    }
+
+    /// Mueve el asa `handle` a `point` y deja el resto como está. En el
+    /// rectángulo y la elipse la esquina opuesta queda fija y la caja se
+    /// normaliza, así cruzar una esquina deja una caja válida; en la línea y la
+    /// flecha se mueve el extremo correspondiente. Un asa que no existe devuelve
+    /// una copia igual.
+    pub fn with_handle_at(&self, handle: usize, point: (f64, f64)) -> Shape {
+        let mut moved = self.clone();
+        match self.kind {
+            ShapeKind::Rectangle | ShapeKind::Ellipse => {
+                let Some(corner) = Corner::ALL.get(handle).copied() else {
+                    return moved;
+                };
+                let opposite = corner.opposite().point(self.rect());
+                moved.from = point;
+                moved.to = opposite;
+            }
+            ShapeKind::Line | ShapeKind::Arrow => match handle {
+                0 => moved.from = point,
+                1 => moved.to = point,
+                _ => {}
+            },
+        }
+        moved
+    }
+
     /// Mueve la forma `delta` puntos, en el espacio de la página. El grosor y el
     /// color no cambian.
-    // Mover una forma a mano todavía no tiene gesto propio: la API existe para las
-    // anotaciones que lo reutilizan y para las pruebas de geometría.
-    #[allow(dead_code)]
     pub fn moved(&self, delta: (f64, f64)) -> Self {
         let mut moved = self.clone();
         moved.from = (self.from.0 + delta.0, self.from.1 + delta.1);
@@ -927,7 +1001,8 @@ pub const IMAGE_BOX_FRACTION: f64 = 0.4;
 /// con el ratón para volver a agrandarla.
 pub const IMAGE_MIN_SIDE: f64 = 8.0;
 
-/// Esquina de la caja de una imagen, la que se arrastra para redimensionarla.
+/// Esquina de una caja —la de una imagen o la de la forma elegida—, la que se
+/// arrastra para redimensionarla.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Corner {
     TopLeft,
@@ -964,6 +1039,16 @@ impl Corner {
             Self::TopRight => (1.0, -1.0),
             Self::BottomLeft => (-1.0, 1.0),
             Self::BottomRight => (1.0, 1.0),
+        }
+    }
+
+    /// La esquina de la diagonal opuesta: es la que queda fija al arrastrar esta.
+    fn opposite(self) -> Self {
+        match self {
+            Self::TopLeft => Self::BottomRight,
+            Self::TopRight => Self::BottomLeft,
+            Self::BottomLeft => Self::TopRight,
+            Self::BottomRight => Self::TopLeft,
         }
     }
 }
@@ -1216,6 +1301,36 @@ impl Annotation {
                 .map(|comment| comment.id.as_str())
                 .collect(),
             _ => Vec::new(),
+        }
+    }
+}
+
+/// Qué hace el doble clic sobre una anotación ya colocada.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DoubleClickAction {
+    /// La nota de texto abre su editor.
+    EditText,
+    /// La nota adhesiva abre el diálogo de su hilo.
+    EditComments,
+    /// La anotación con un solo color abre el selector de color.
+    ChooseColor,
+    /// No hay nada que editar: el doble clic solo deja la anotación elegida.
+    None,
+}
+
+/// Qué abre el doble clic sobre `annotation`. Es la misma decisión que el menú
+/// contextual ofrece con sus botones: la nota de texto y la nota adhesiva editan
+/// lo suyo, las que tienen un color propio abren el cambio de color —el mismo de
+/// `Ctrl+Alt+C`— y la imagen, que no tiene ni texto ni color propio, no abre nada.
+pub(crate) fn double_click_action(annotation: &Annotation) -> DoubleClickAction {
+    match annotation {
+        Annotation::Note(_) => DoubleClickAction::EditText,
+        // La nota adhesiva tiene color, pero su doble clic ya abría el hilo:
+        // conserva ese comportamiento.
+        Annotation::Sticky(_) => DoubleClickAction::EditComments,
+        Annotation::Image(_) => DoubleClickAction::None,
+        Annotation::Mark(_) | Annotation::Ink(_) | Annotation::Shape(_) | Annotation::Stamp(_) => {
+            DoubleClickAction::ChooseColor
         }
     }
 }
@@ -2478,6 +2593,289 @@ mod tests {
                 "{kind:?}: mover no toca el grosor ni el color"
             );
             assert_eq!(moved.page, 2, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn every_shape_reports_the_handles_it_is_resized_from() {
+        let box_rect = (10.0, 20.0, 50.0, 60.0);
+        let corners = vec![(10.0, 20.0), (50.0, 20.0), (10.0, 60.0), (50.0, 60.0)];
+        for kind in [ShapeKind::Rectangle, ShapeKind::Ellipse] {
+            let shape = Shape::new(0, kind, (10.0, 20.0), (50.0, 60.0), [0.0, 0.0, 0.0], 2.0);
+            assert_eq!(shape.rect(), box_rect, "{kind:?}");
+            assert_eq!(
+                shape.handles(),
+                corners,
+                "{kind:?}: las cuatro esquinas, en el orden en que se dibujan las asas"
+            );
+        }
+
+        // Con las dos esquinas cruzadas, `rect()` sigue dando mínimo y máximo y
+        // las asas son las de esa caja normalizada.
+        let crossed = Shape::new(
+            0,
+            ShapeKind::Rectangle,
+            (50.0, 60.0),
+            (10.0, 20.0),
+            [0.0, 0.0, 0.0],
+            2.0,
+        );
+        assert_eq!(crossed.rect(), box_rect);
+        assert_eq!(crossed.handles(), corners);
+
+        for kind in [ShapeKind::Line, ShapeKind::Arrow] {
+            let shape = Shape::new(0, kind, (10.0, 40.0), (50.0, 20.0), [0.0, 0.0, 0.0], 2.0);
+            assert_eq!(
+                shape.handles(),
+                vec![(10.0, 40.0), (50.0, 20.0)],
+                "{kind:?}: los dos extremos, `from` y después `to`"
+            );
+        }
+    }
+
+    #[test]
+    fn a_handle_is_found_only_within_the_tolerance() {
+        let rectangle = Shape::new(
+            0,
+            ShapeKind::Rectangle,
+            (10.0, 20.0),
+            (50.0, 60.0),
+            [0.0, 0.0, 0.0],
+            2.0,
+        );
+        assert_eq!(rectangle.handle_at((10.0, 20.0), 3.0), Some(0));
+        assert_eq!(
+            rectangle.handle_at((51.5, 59.0), 3.0),
+            Some(3),
+            "un punto cerca de la esquina inferior derecha agarra su asa"
+        );
+        assert_eq!(
+            rectangle.handle_at((30.0, 20.0), 3.0),
+            None,
+            "el medio de un lado no es un asa"
+        );
+        assert_eq!(
+            rectangle.handle_at((14.0, 20.0), 3.0),
+            None,
+            "más lejos que la tolerancia no hay asa"
+        );
+
+        let line = Shape::new(0, ShapeKind::Line, (10.0, 10.0), (50.0, 10.0), [0.0, 0.0, 0.0], 2.0);
+        assert_eq!(line.handle_at((49.0, 11.0), 3.0), Some(1));
+        assert_eq!(line.handle_at((10.0, 10.0), 3.0), Some(0));
+        assert_eq!(line.handle_at((30.0, 10.0), 3.0), None);
+    }
+
+    #[test]
+    fn dragging_a_corner_keeps_the_opposite_corner_fixed() {
+        let shape = Shape::new(
+            0,
+            ShapeKind::Rectangle,
+            (10.0, 20.0),
+            (50.0, 60.0),
+            [0.25, 0.5, 0.75],
+            3.5,
+        );
+        let handles = shape.handles();
+        for (handle, opposite, point) in [
+            (0, 3, (20.0, 30.0)),
+            (1, 2, (40.0, 30.0)),
+            (2, 1, (20.0, 50.0)),
+            (3, 0, (40.0, 50.0)),
+        ] {
+            let moved = shape.with_handle_at(handle, point);
+            let moved_handles = moved.handles();
+            assert_eq!(moved_handles[handle], point, "el asa {handle} sigue al puntero");
+            assert_eq!(
+                moved_handles[opposite], handles[opposite],
+                "la esquina opuesta al asa {handle} queda fija"
+            );
+            assert_eq!(moved.rect(), {
+                let (x1, y1) = point;
+                let (x2, y2) = handles[opposite];
+                (x1.min(x2), y1.min(y2), x1.max(x2), y1.max(y2))
+            });
+            assert_eq!(
+                (moved.page, moved.kind, moved.width, moved.color),
+                (shape.page, shape.kind, shape.width, shape.color),
+                "redimensionar no toca nada más"
+            );
+        }
+
+        // La elipse se redimensiona igual: las asas son las esquinas de su caja.
+        let ellipse = Shape::new(
+            1,
+            ShapeKind::Ellipse,
+            (10.0, 20.0),
+            (50.0, 60.0),
+            [0.0, 0.0, 0.0],
+            2.0,
+        );
+        let moved = ellipse.with_handle_at(1, (80.0, 30.0));
+        assert_eq!(moved.rect(), (10.0, 30.0, 80.0, 60.0));
+    }
+
+    #[test]
+    fn dragging_a_line_end_changes_only_that_end() {
+        for kind in [ShapeKind::Line, ShapeKind::Arrow] {
+            let shape = Shape::new(1, kind, (10.0, 40.0), (50.0, 20.0), [0.1, 0.2, 0.3], 3.0);
+
+            let from = shape.with_handle_at(0, (5.0, 45.0));
+            assert_eq!(from.from, (5.0, 45.0), "{kind:?}: el primer extremo sigue al puntero");
+            assert_eq!(from.to, shape.to, "{kind:?}: el otro extremo no se mueve");
+
+            let to = shape.with_handle_at(1, (55.0, 10.0));
+            assert_eq!(to.from, shape.from, "{kind:?}: el primer extremo queda quieto");
+            assert_eq!(to.to, (55.0, 10.0), "{kind:?}: el segundo extremo sigue al puntero");
+
+            assert_eq!(
+                shape.with_handle_at(7, (0.0, 0.0)),
+                shape,
+                "{kind:?}: un asa que no existe no cambia la forma"
+            );
+            assert_eq!(
+                (to.page, to.kind, to.width, to.color),
+                (shape.page, shape.kind, shape.width, shape.color),
+                "{kind:?}: los extremos no tocan el resto"
+            );
+        }
+    }
+
+    #[test]
+    fn crossing_a_corner_leaves_a_normalized_box() {
+        let rectangle = Shape::new(
+            0,
+            ShapeKind::Rectangle,
+            (10.0, 20.0),
+            (50.0, 60.0),
+            [0.0, 0.0, 0.0],
+            2.0,
+        );
+        // La esquina superior izquierda pasa más allá de la inferior derecha: la
+        // caja se da vuelta y sigue siendo un rectángulo válido.
+        let crossed = rectangle.with_handle_at(0, (70.0, 90.0));
+        assert_eq!(
+            crossed.rect(),
+            (50.0, 60.0, 70.0, 90.0),
+            "rect() devuelve mínimo y máximo también al cruzar"
+        );
+        assert!(!crossed.is_empty(), "la caja cruzada sigue teniendo qué pintar");
+        assert!(crossed.contains((50.0, 75.0), 0.5), "el lado izquierdo es el nuevo");
+        assert!(crossed.contains((70.0, 75.0), 0.5), "y el derecho también");
+
+        let ellipse = Shape::new(
+            0,
+            ShapeKind::Ellipse,
+            (10.0, 20.0),
+            (50.0, 60.0),
+            [0.0, 0.0, 0.0],
+            2.0,
+        );
+        let crossed = ellipse.with_handle_at(3, (-30.0, -10.0));
+        assert_eq!(crossed.rect(), (-30.0, -10.0, 10.0, 20.0));
+        assert!(!crossed.is_empty());
+    }
+
+    #[test]
+    fn a_tiny_shape_is_still_valid() {
+        let rectangle = Shape::new(
+            0,
+            ShapeKind::Rectangle,
+            (10.0, 20.0),
+            (50.0, 60.0),
+            [0.0, 0.0, 0.0],
+            2.0,
+        );
+        let tiny = rectangle.with_handle_at(0, (49.5, 59.5));
+        assert_eq!(tiny.rect(), (49.5, 59.5, 50.0, 60.0));
+        assert!(!tiny.is_empty(), "una caja de medio punto sigue teniendo lados");
+        assert!(tiny.contains((50.0, 60.0), 0.5), "y se puede volver a agarrar");
+
+        // Una línea con los dos extremos en el mismo punto no tiene largo: es el
+        // único caso que deja de ser válido.
+        let line = Shape::new(0, ShapeKind::Line, (10.0, 10.0), (50.0, 10.0), [0.0, 0.0, 0.0], 2.0);
+        let dot = line.with_handle_at(0, (50.0, 10.0));
+        assert!(dot.is_empty(), "sin largo no hay línea que pintar");
+    }
+
+    #[test]
+    fn a_shape_is_covered_inside_its_box_and_not_around_it() {
+        let rectangle = Shape::new(
+            0,
+            ShapeKind::Rectangle,
+            (10.0, 20.0),
+            (50.0, 60.0),
+            [0.0, 0.0, 0.0],
+            2.0,
+        );
+        assert!(rectangle.covers((30.0, 40.0), 0.5), "el interior se agarra");
+        assert!(rectangle.covers((10.0, 40.0), 0.5), "el borde también");
+        assert!(!rectangle.covers((80.0, 40.0), 0.5), "afuera no hay forma");
+
+        let ellipse = Shape::new(
+            0,
+            ShapeKind::Ellipse,
+            (10.0, 20.0),
+            (50.0, 60.0),
+            [0.0, 0.0, 0.0],
+            2.0,
+        );
+        assert!(ellipse.covers((30.0, 40.0), 0.5), "el centro de la elipse");
+        assert!(
+            !ellipse.covers((11.0, 21.0), 0.5),
+            "la esquina de la caja queda fuera de la elipse"
+        );
+
+        let line = Shape::new(0, ShapeKind::Line, (10.0, 40.0), (50.0, 40.0), [0.0, 0.0, 0.0], 2.0);
+        assert!(line.covers((30.0, 40.0), 0.5), "el segmento se agarra sobre él");
+        assert!(!line.covers((30.0, 45.0), 0.5), "lejos del segmento no hay nada");
+    }
+
+    #[test]
+    fn the_double_click_action_depends_on_what_the_annotation_edits() {
+        let cases = [
+            (
+                Annotation::Note(colored_note((0.0, 0.0, 0.0))),
+                DoubleClickAction::EditText,
+            ),
+            (
+                Annotation::Sticky(colored_sticky((0.5, 0.5, 0.5))),
+                DoubleClickAction::EditComments,
+            ),
+            (
+                colored_mark(MarkKind::Underline, (0.9, 0.6, 0.0)),
+                DoubleClickAction::ChooseColor,
+            ),
+            (
+                colored_mark(MarkKind::Highlight, (0.9, 0.8, 0.0)),
+                DoubleClickAction::ChooseColor,
+            ),
+            (
+                colored_mark(MarkKind::StrikeOut, (0.1, 0.1, 0.1)),
+                DoubleClickAction::ChooseColor,
+            ),
+            (
+                Annotation::Ink(colored_ink((0.2, 0.3, 0.4))),
+                DoubleClickAction::ChooseColor,
+            ),
+            (
+                Annotation::Shape(colored_shape((0.3, 0.4, 0.5))),
+                DoubleClickAction::ChooseColor,
+            ),
+            (
+                Annotation::Stamp(Stamp::new(0, (10.0, 10.0), StampKind::Approved)),
+                DoubleClickAction::ChooseColor,
+            ),
+            // La imagen no tiene color propio y no tiene nada que editar.
+            (Annotation::Image(colored_image()), DoubleClickAction::None),
+        ];
+
+        for (annotation, expected) in cases {
+            assert_eq!(
+                double_click_action(&annotation),
+                expected,
+                "doble clic sobre {annotation:?}"
+            );
         }
     }
 

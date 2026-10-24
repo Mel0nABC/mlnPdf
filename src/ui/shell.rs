@@ -415,6 +415,12 @@ pub(crate) struct AnnotationState {
     pub(crate)     note_drag: RefCell<Option<NoteDrag>>,
     /// Arrastre de una imagen en curso, si hay uno.
     pub(crate)     image_drag: RefCell<Option<ImageDrag>>,
+    /// Arrastre de una forma en curso, si hay uno: moverla entera o una de sus
+    /// asas.
+    pub(crate)     shape_drag: RefCell<Option<ShapeDrag>>,
+    /// Menú contextual de una anotación abierto, si hay uno: un doble clic tiene
+    /// que cerrarlo antes de abrir su diálogo modal.
+    pub(crate)     annotation_menu: RefCell<Option<gtk::Popover>>,
     /// Anotación bajo el puntero y cursor que le corresponde, para no
     /// reescribirlo en cada movimiento.
     pub(crate)     hover: RefCell<Option<(String, &'static str)>>,
@@ -483,6 +489,26 @@ pub(crate) struct ImageDrag {
     pub(crate) moved: bool,
 }
 
+/// Arrastre de una forma en curso: qué forma, desde dónde se agarró, qué asa se
+/// mueve y cómo era al empezar.
+///
+/// El gesto no cambia la forma de página: sus asas y su caja se escriben en la
+/// página a la que pertenece.
+#[derive(Clone, Debug)]
+pub(crate) struct ShapeDrag {
+    pub(crate) id: String,
+    pub(crate) page: usize,
+    /// Punto de la vista donde empezó el arrastre, en píxeles lógicos.
+    pub(crate) grab: (f64, f64),
+    /// Asa que se arrastra, o `None` cuando el gesto mueve la forma entera.
+    pub(crate) handle: Option<usize>,
+    /// La forma tal como estaba al empezar: cada movimiento se calcula desde acá,
+    /// así el asa no acumula desplazamientos ni se pierde al cruzar una esquina.
+    pub(crate) start: Shape,
+    /// True una vez que se empujó la instantánea y la forma se movió.
+    pub(crate) moved: bool,
+}
+
 /// Transient interaction state.
 pub(crate) struct InteractionState {
     pub(crate)     hand_mode: Cell<bool>,
@@ -518,20 +544,6 @@ pub(crate) struct InteractionState {
     /// viewport. `None` cuando el puntero está fuera de las páginas, para que el
     /// zoom por botón o teclado caiga al centro del viewport.
     pub(crate)     pointer: Cell<Option<(f64, f64)>>,
-}
-
-/// Qué se agarró con el puntero, para decidir qué hacer con el clic.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum HitKind {
-    Note,
-    /// Una nota adhesiva: su icono abre el diálogo del hilo.
-    Sticky,
-    /// Un sello predefinido: se arrastra para moverlo y se borra con `Supr`.
-    Stamp,
-    Image,
-    Mark,
-    /// Un trazo del lápiz o una forma de las de dibujo.
-    Stroke,
 }
 
 /// Punto del documento que se mantiene bajo el puntero mientras cambia el zoom.
@@ -832,6 +844,8 @@ impl Viewer {
                 id_prefix: format!("mlnpdf-{}-{}", std::process::id(), session_nanos()),
                 note_drag: RefCell::new(None),
                 image_drag: RefCell::new(None),
+                shape_drag: RefCell::new(None),
+                annotation_menu: RefCell::new(None),
                 hover: RefCell::new(None),
                 underline: Cell::new(MarkTool {
                     color: UNDERLINE_COLOR,
@@ -2983,6 +2997,45 @@ impl Viewer {
         self.prompt_sticky_note(Some((id, sticky)));
     }
 
+    /// Doble clic sobre la anotación `id`, que el mismo clic ya dejó elegida:
+    /// abre lo que esa anotación sabe editar. La decisión sale de
+    /// `double_click_action`, así que el doble clic y el menú contextual ofrecen
+    /// lo mismo. Un menú contextual abierto se cierra antes, y el diálogo espera a
+    /// que el popover suelte el grab: presentar el modal con el menú vivo deja la
+    /// ventana detrás de él.
+    pub(crate) fn double_click_annotation(self: &Rc<Self>, id: &str) {
+        let Some(annotation) = self.annotation(id) else {
+            return;
+        };
+        let action = double_click_action(&annotation);
+        if action == DoubleClickAction::None {
+            return;
+        }
+        let open_menu = self.annot.annotation_menu.borrow_mut().take();
+        if let Some(menu) = open_menu {
+            menu.popdown();
+            let weak = Rc::downgrade(self);
+            glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
+                if let Some(viewer) = weak.upgrade() {
+                    viewer.run_double_click_action(action);
+                }
+            });
+            return;
+        }
+        self.run_double_click_action(action);
+    }
+
+    /// Abre el diálogo o el selector de color que pide `action` para la anotación
+    /// elegida.
+    fn run_double_click_action(self: &Rc<Self>, action: DoubleClickAction) {
+        match action {
+            DoubleClickAction::EditText => self.prompt_note_edit(),
+            DoubleClickAction::EditComments => self.prompt_sticky_note_edit(),
+            DoubleClickAction::ChooseColor => self.prompt_selection_color(),
+            DoubleClickAction::None => {}
+        }
+    }
+
     /// Diálogo de la nota adhesiva: un editor para el comentario raíz, uno por
     /// respuesta y el botón «Responder» que agrega la siguiente, con `Aceptar` y
     /// `Cancelar`. Al aceptar, el hilo se guarda de una sola vez.
@@ -3768,6 +3821,12 @@ impl Viewer {
         self.annot.draft.borrow_mut().take();
         self.annot.note_drag.borrow_mut().take();
         self.annot.image_drag.borrow_mut().take();
+        self.annot.shape_drag.borrow_mut().take();
+        // El menú de una anotación del documento anterior ya no tiene a qué
+        // apuntar: se cierra antes de soltar la lista.
+        if let Some(menu) = self.annot.annotation_menu.borrow_mut().take() {
+            menu.popdown();
+        }
         self.annot.stroke_drag.borrow_mut().take();
         self.annot.stroke_tool.borrow_mut().take();
         self.annot.sticky_tool.set(false);
@@ -3904,6 +3963,35 @@ impl Viewer {
                 | Annotation::Note(_)
                 | Annotation::Ink(_)
                 | Annotation::Shape(_)
+                | Annotation::Sticky(_)
+                | Annotation::Stamp(_) => None,
+            })
+    }
+
+    /// Copia de la anotación `id`, sea del tipo que sea, si todavía está en la
+    /// lista.
+    pub(crate) fn annotation(&self, id: &str) -> Option<Annotation> {
+        self.annot
+            .edits
+            .borrow()
+            .iter()
+            .find(|edit| edit.id == id)
+            .map(|edit| edit.value.clone())
+    }
+
+    /// Copia de la forma `id`, si esa anotación existe y es una forma.
+    pub(crate) fn shape(&self, id: &str) -> Option<Shape> {
+        self.annot
+            .edits
+            .borrow()
+            .iter()
+            .find(|edit| edit.id == id)
+            .and_then(|edit| match &edit.value {
+                Annotation::Shape(shape) => Some(shape.clone()),
+                Annotation::Mark(_)
+                | Annotation::Note(_)
+                | Annotation::Image(_)
+                | Annotation::Ink(_)
                 | Annotation::Sticky(_)
                 | Annotation::Stamp(_) => None,
             })
@@ -4445,6 +4533,111 @@ impl Viewer {
         self.annot.image_drag.borrow_mut().take().is_some()
     }
 
+    /// Empieza a arrastrar la forma elegida que está bajo `(x, y)` y devuelve si
+    /// el gesto es un arrastre de forma. Un asa de la **principal** redimensiona
+    /// desde esa esquina o extremo; el interior de esa misma forma la mueve
+    /// entera. Cualquier otra cosa sigue el gesto de siempre: seleccionar texto.
+    pub(crate) fn shape_drag_begin(&self, page: usize, x: f64, y: f64) -> bool {
+        let zoom = self.view.zoom.get();
+        if zoom <= 0.0 {
+            return false;
+        }
+        // Solo la forma principal responde: es la que muestra sus asas. El asa
+        // agarra con la tolerancia del tirador; el interior, con la del clic.
+        let Some(id) = self.selected_shape_at(page, x, y) else {
+            return false;
+        };
+        let Some(start) = self.shape(&id) else {
+            return false;
+        };
+        let Some(point) = self.view_to_pdf(page, x, y) else {
+            return false;
+        };
+        let handle = start.handle_at(point, IMAGE_HANDLE_SIZE / zoom);
+        // La selección de texto anterior se suelta: este gesto mueve la forma.
+        if self.sel.selection.borrow_mut().take().is_some() {
+            self.sel.selection_rects.borrow_mut().clear();
+        }
+        self.select_annotation(Some(id.clone()));
+        *self.annot.shape_drag.borrow_mut() = Some(ShapeDrag {
+            id,
+            page,
+            grab: (x, y),
+            handle,
+            start,
+            moved: false,
+        });
+        self.queue_page_draw(page);
+        true
+    }
+
+    /// True mientras se está arrastrando una forma.
+    pub(crate) fn shape_drag_active(&self) -> bool {
+        self.annot.shape_drag.borrow().is_some()
+    }
+
+    /// Mueve la forma o el asa agarrada con el desplazamiento del puntero. El
+    /// desplazamiento se mide en puntos de la página y la forma nueva sale
+    /// siempre del estado del principio del arrastre, así que el asa no acumula
+    /// corrimientos. La instantánea para deshacer se empuja una sola vez por
+    /// arrastre.
+    pub(crate) fn shape_drag_update(&self, offset_x: f64, offset_y: f64) -> bool {
+        if offset_x == 0.0 && offset_y == 0.0 {
+            return false;
+        }
+        let Some((page, id, next)) = self.shape_drag_target(offset_x, offset_y) else {
+            return false;
+        };
+        if !self
+            .annot
+            .shape_drag
+            .borrow()
+            .as_ref()
+            .is_some_and(|drag| drag.moved)
+        {
+            self.begin_edit();
+            if let Some(drag) = self.annot.shape_drag.borrow_mut().as_mut() {
+                drag.moved = true;
+            }
+        }
+        {
+            let mut edits = self.annot.edits.borrow_mut();
+            let Some(edit) = edits.iter_mut().find(|edit| edit.id == id) else {
+                return false;
+            };
+            let Annotation::Shape(shape) = &mut edit.value else {
+                return false;
+            };
+            *shape = next;
+        }
+        self.queue_page_draw(page);
+        true
+    }
+
+    /// Página, identificador y forma nueva de lo que se está arrastrando. Con asa
+    /// se mueve esa asa al punto que le toca —su posición al empezar más el
+    /// desplazamiento, así el agarre no salta—; sin asa se mueve la forma entera.
+    fn shape_drag_target(&self, offset_x: f64, offset_y: f64) -> Option<(usize, String, Shape)> {
+        let drag = self.annot.shape_drag.borrow();
+        let drag = drag.as_ref()?;
+        let grab = self.view_to_pdf(drag.page, drag.grab.0, drag.grab.1)?;
+        let now = self.view_to_pdf(drag.page, drag.grab.0 + offset_x, drag.grab.1 + offset_y)?;
+        let delta = (now.0 - grab.0, now.1 - grab.1);
+        let next = match drag.handle {
+            Some(handle) => {
+                let (x, y) = *drag.start.handles().get(handle)?;
+                drag.start.with_handle_at(handle, (x + delta.0, y + delta.1))
+            }
+            None => drag.start.moved(delta),
+        };
+        Some((drag.page, drag.id.clone(), next))
+    }
+
+    /// Suelta la forma que se estaba arrastrando; devuelve si había una.
+    pub(crate) fn shape_drag_end(&self) -> bool {
+        self.annot.shape_drag.borrow_mut().take().is_some()
+    }
+
     /// Empieza un trazo con la herramienta de dibujo armada y devuelve si el
     /// gesto es un dibujo: si lo es, no hay selección de texto.
     pub(crate) fn stroke_drag_begin(&self, page: usize, x: f64, y: f64) -> bool {
@@ -4585,12 +4778,14 @@ impl Viewer {
         }
         // Las asas de la imagen elegida ganan sobre lo demás: son el tirador que
         // se ve. Después la nota, que se apila encima de la imagen, la nota
-        // adhesiva, el sello y al final el interior de la imagen.
+        // adhesiva, el sello, las asas de la forma elegida y al final el interior
+        // de la imagen.
         let current = self
             .image_handle_cursor_hit(page, x, y)
             .or_else(|| self.note_cursor_hit(page, x, y))
             .or_else(|| self.sticky_cursor_hit(page, x, y))
             .or_else(|| self.stamp_cursor_hit(page, x, y))
+            .or_else(|| self.shape_cursor_hit(page, x, y))
             .or_else(|| self.image_cursor_hit(page, x, y));
         let mut hover = self.annot.hover.borrow_mut();
         if *hover == current {
@@ -4674,6 +4869,53 @@ impl Viewer {
     /// Sello bajo el puntero, con el cursor de mover: su marco entero se arrastra.
     fn stamp_cursor_hit(&self, page: usize, x: f64, y: f64) -> Option<(String, &'static str)> {
         self.stamp_at(page, x, y).map(|id| (id, "move"))
+    }
+
+    /// Forma principal bajo el puntero, si la hay: sus asas y su interior cuentan.
+    /// Es la forma que ya está elegida, así que un clic dentro la mantiene elegida
+    /// y el arrastre que sigue la mueve. Una forma que no está elegida no agarra el
+    /// clic: sobre su interior se sigue seleccionando texto.
+    pub(crate) fn selected_shape_at(&self, page: usize, x: f64, y: f64) -> Option<String> {
+        let zoom = self.view.zoom.get();
+        if zoom <= 0.0 {
+            return None;
+        }
+        let point = self.view_to_pdf(page, x, y)?;
+        let id = self.primary_selection()?;
+        let shape = self.shape(&id).filter(|shape| shape.page == page)?;
+        let on_handle = shape.handle_at(point, IMAGE_HANDLE_SIZE / zoom).is_some();
+        (on_handle || shape.covers(point, STROKE_HIT_TOLERANCE / zoom)).then_some(id)
+    }
+
+    /// Forma elegida bajo el puntero, con el cursor que le corresponde: sus asas
+    /// redimensionan en la diagonal de esa esquina —o señalan con `pointer` los
+    /// extremos de la línea y la flecha, que no son esquinas— y el interior mueve.
+    /// Solo la forma principal muestra sus asas, así que solo ella responde.
+    pub(crate) fn shape_cursor_hit(
+        &self,
+        page: usize,
+        x: f64,
+        y: f64,
+    ) -> Option<(String, &'static str)> {
+        let zoom = self.view.zoom.get();
+        if zoom <= 0.0 {
+            return None;
+        }
+        let point = self.view_to_pdf(page, x, y)?;
+        let id = self.primary_selection()?;
+        let shape = self.shape(&id).filter(|shape| shape.page == page)?;
+        if let Some(handle) = shape.handle_at(point, IMAGE_HANDLE_SIZE / zoom) {
+            let cursor = match (shape.kind, Corner::ALL.get(handle).copied()) {
+                (ShapeKind::Rectangle | ShapeKind::Ellipse, Some(corner)) => {
+                    resize_cursor(corner, self.view.rotation.get())
+                }
+                _ => "pointer",
+            };
+            return Some((id, cursor));
+        }
+        shape
+            .covers(point, STROKE_HIT_TOLERANCE / zoom)
+            .then_some((id, "move"))
     }
 
     /// Pone el cursor en todas las capas de la página. El lienzo de la selección
@@ -4787,9 +5029,23 @@ impl Viewer {
 
         popover.set_child(Some(&content));
         // El menú cuelga de la página y se suelta al cerrarse: un popover sin padre
-        // no se puede abrir, y dejarlo colgado acumularía widgets.
+        // no se puede abrir, y dejarlo colgado acumularía widgets. Queda anotado
+        // mientras está abierto para que un doble clic pueda cerrarlo antes de
+        // presentar su diálogo modal.
         popover.set_parent(anchor);
-        popover.connect_closed(|popover| popover.unparent());
+        let weak = Rc::downgrade(self);
+        popover.connect_closed(move |popover| {
+            popover.unparent();
+            if let Some(viewer) = weak.upgrade() {
+                // Solo se suelta si el que se cerró es el que está anotado: otro
+                // menú pudo abrirse antes de que llegara este cierre.
+                let mut menu = viewer.annot.annotation_menu.borrow_mut();
+                if menu.as_ref().is_some_and(|current| current == popover) {
+                    menu.take();
+                }
+            }
+        });
+        *self.annot.annotation_menu.borrow_mut() = Some(popover.clone());
         let place = gdk::Rectangle::new(x as i32, y as i32, 1, 1);
         popover.set_pointing_to(Some(&place));
         popover.popup();
@@ -4986,7 +5242,7 @@ impl Viewer {
                     }
                 }
                 Annotation::Shape(shape) if shape.page == page => {
-                    draw_bounds_selection(context, shape.rect(), size, rotation, zoom);
+                    draw_shape_selection(context, shape, size, rotation, zoom);
                 }
                 _ => {}
             }
@@ -5832,6 +6088,12 @@ impl Viewer {
             if viewer.active_mark_tool().is_none() && viewer.image_drag_begin(page, x, y) {
                 return;
             }
+            // Y con la forma elegida: sus asas la redimensionan y su interior la
+            // mueve entera. Va antes de la selección de texto porque el gesto ya
+            // agarró la forma.
+            if viewer.active_mark_tool().is_none() && viewer.shape_drag_begin(page, x, y) {
+                return;
+            }
             viewer.begin_selection(page, x, y);
         });
 
@@ -5850,6 +6112,8 @@ impl Viewer {
                 viewer.image_drag_update(offset_x, offset_y, keep_aspect);
             } else if viewer.stroke_drag_active() {
                 viewer.stroke_drag_update(page, offset_x, offset_y);
+            } else if viewer.shape_drag_active() {
+                viewer.shape_drag_update(offset_x, offset_y);
             } else {
                 viewer.update_selection(page, offset_x, offset_y);
             }
@@ -5860,10 +6124,11 @@ impl Viewer {
             let Some(viewer) = weak.upgrade() else {
                 return;
             };
-            // Un arrastre de nota, de imagen o de dibujo no termina en una
-            // selección de texto.
+            // Un arrastre de nota, de imagen, de forma o de dibujo no termina en
+            // una selección de texto.
             if !viewer.note_drag_end()
                 && !viewer.image_drag_end()
+                && !viewer.shape_drag_end()
                 && !viewer.stroke_drag_end()
             {
                 viewer.finish_selection();
@@ -5892,18 +6157,20 @@ impl Viewer {
             // al final el marcado y el trazo.
             let hit = viewer
                 .note_at(page, x, y)
-                .map(|id| (id, HitKind::Note))
-                .or_else(|| viewer.sticky_at(page, x, y).map(|id| (id, HitKind::Sticky)))
-                .or_else(|| viewer.stamp_at(page, x, y).map(|id| (id, HitKind::Stamp)))
-                .or_else(|| viewer.image_at(page, x, y).map(|id| (id, HitKind::Image)))
-                .or_else(|| viewer.mark_at(page, x, y).map(|id| (id, HitKind::Mark)))
-                .or_else(|| viewer.stroke_at(page, x, y).map(|id| (id, HitKind::Stroke)));
+                .or_else(|| viewer.sticky_at(page, x, y))
+                .or_else(|| viewer.stamp_at(page, x, y))
+                .or_else(|| viewer.image_at(page, x, y))
+                .or_else(|| viewer.mark_at(page, x, y))
+                .or_else(|| viewer.stroke_at(page, x, y))
+                // La forma ya elegida tampoco se suelta: dentro de ella el clic la
+                // mantiene elegida, que es lo que habilita sus asas y su arrastre.
+                .or_else(|| viewer.selected_shape_at(page, x, y));
             // `Ctrl` suma o saca de la selección en vez de reemplazarla.
             let with_ctrl = gesture
                 .current_event_state()
                 .contains(gdk::ModifierType::CONTROL_MASK);
             match (gesture.current_button(), hit) {
-                (gdk::BUTTON_SECONDARY, Some((id, _))) => {
+                (gdk::BUTTON_SECONDARY, Some(id)) => {
                     viewer.release_text_focus();
                     // El clic derecho agarra la anotación: si no estaba elegida,
                     // la selección pasa a ser esa sola, para que «Eliminar»
@@ -5914,21 +6181,21 @@ impl Viewer {
                     viewer.open_annotation_menu(id, &canvas_for_menu, x, y);
                     gesture.set_state(gtk::EventSequenceState::Claimed);
                 }
-                (gdk::BUTTON_PRIMARY, Some((id, kind))) => {
+                (gdk::BUTTON_PRIMARY, Some(id)) => {
                     viewer.release_text_focus();
                     if with_ctrl {
                         viewer.toggle_annotation_selection(&id);
                     } else {
-                        viewer.select_annotation(Some(id));
+                        // Un doble clic sobre algo que no estaba elegido lo elige
+                        // primero: lo que abra el diálogo actúa sobre la
+                        // selección nueva.
+                        viewer.select_annotation(Some(id.clone()));
                     }
-                    // El doble clic abre el editor solo para una nota y fuera de
-                    // las herramientas de marcado, donde el clic arma un marcado.
+                    // El doble clic abre lo que la anotación sabe editar, y nada
+                    // fuera de las herramientas de marcado, donde el clic arma un
+                    // marcado.
                     if presses >= 2 && !with_ctrl && viewer.active_mark_tool().is_none() {
-                        match kind {
-                            HitKind::Note => viewer.prompt_note_edit(),
-                            HitKind::Sticky => viewer.prompt_sticky_note_edit(),
-                            HitKind::Image | HitKind::Mark | HitKind::Stroke | HitKind::Stamp => {}
-                        }
+                        viewer.double_click_annotation(&id);
                     }
                 }
                 (gdk::BUTTON_PRIMARY, None) => {
@@ -8127,6 +8394,42 @@ fn draw_bounds_selection(
     let _ = context.restore();
 }
 
+/// Contorno punteado y asas de una forma elegida: el contorno dice que responde
+/// a `Supr` y al menú, y las asas que se redimensiona desde ellas. Las esquinas
+/// del rectángulo y la elipse se dibujan en las cuatro esquinas de la caja; la
+/// línea y la flecha, en sus dos extremos.
+fn draw_shape_selection(
+    context: &cairo::Context,
+    shape: &Shape,
+    page: (f64, f64),
+    rotation: i32,
+    zoom: f64,
+) {
+    draw_bounds_selection(context, shape.rect(), page, rotation, zoom);
+    draw_handles(context, shape.handles(), page, rotation, zoom);
+}
+
+/// Asas de una anotación elegida: un cuadrado lleno del azul de la selección en
+/// cada punto, del tamaño que se agarra con el ratón y sin rotar, como los
+/// tiradores de cualquier editor.
+fn draw_handles(
+    context: &cairo::Context,
+    handles: Vec<(f64, f64)>,
+    page: (f64, f64),
+    rotation: i32,
+    zoom: f64,
+) {
+    let half = (IMAGE_HANDLE_SIZE * zoom / 2.0).max(2.0);
+    let _ = context.save();
+    context.set_source_rgba(0.20, 0.45, 0.95, 0.9);
+    for (x, y) in handles {
+        let (x, y) = forward_rotation((x, y), page, rotation);
+        context.rectangle(x * zoom - half, y * zoom - half, half * 2.0, half * 2.0);
+    }
+    let _ = context.fill();
+    let _ = context.restore();
+}
+
 /// Prepara el contexto para pintar un trazo o una forma: color opaco, punta y
 /// unión redondeadas y el grosor escalado por el zoom, como el resto de la capa.
 fn prepare_stroke(context: &cairo::Context, color: [f64; 3], width: f64, zoom: f64) {
@@ -8329,16 +8632,18 @@ fn draw_image_selection(
     }
     context.close_path();
     let _ = context.stroke();
-
-    // Asas: un cuadrado lleno en cada esquina, del tamaño que se agarra con el
-    // ratón. Van sin rotar, como los tiradores de cualquier editor.
-    let half = (IMAGE_HANDLE_SIZE * zoom / 2.0).max(2.0);
-    for corner in Corner::ALL {
-        let (x, y) = forward_rotation(corner.point(rect), page, rotation);
-        context.rectangle(x * zoom - half, y * zoom - half, half * 2.0, half * 2.0);
-    }
-    let _ = context.fill();
     let _ = context.restore();
+
+    draw_handles(
+        context,
+        Corner::ALL
+            .into_iter()
+            .map(|corner| corner.point(rect))
+            .collect(),
+        page,
+        rotation,
+        zoom,
+    );
 }
 
 /// Agrega una respuesta al diálogo de la nota adhesiva: su etiqueta y un editor

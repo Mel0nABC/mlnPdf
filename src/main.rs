@@ -31,9 +31,10 @@ mod tests {
     use crate::engine::geometry::*;
     use crate::engine::render::render_page_surface;
     use crate::engine::annotation::{
-        Annotation, Corner, FontChoice, IMAGE_BOX_FRACTION, ImageNote, ImagePixels, MarkKind,
-        NOTE_COLOR, STAMP_SIZE, STICKY_COLOR, STICKY_SIDE, STROKE_MAX_WIDTH, STROKE_MIN_WIDTH,
-        ShapeKind, StampKind, TextMark, TextNote, TextRun,
+        Annotation, Corner, DoubleClickAction, FontChoice, IMAGE_BOX_FRACTION, ImageNote,
+        ImagePixels, InkStroke, MarkKind, NOTE_COLOR, STAMP_SIZE, STICKY_COLOR, STICKY_SIDE,
+        STROKE_MAX_WIDTH, STROKE_MIN_WIDTH, Shape, ShapeKind, Stamp, StampKind, StickyNote,
+        TextMark, TextNote, TextRun, double_click_action,
     };
     use crate::services::annotations::{open_for_editing, read_annotations, write_annotations};
     use crate::ui::shell::*;
@@ -3486,6 +3487,340 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         assert!(!viewer.has_pending_marks());
         assert!(viewer.selected_ids().is_empty());
 
+        // S3 (T5): el doble clic abre lo que la anotación sabe editar, y solo eso.
+        // Se juntan las siete variantes para comprobar el mapeo que usa el
+        // manejador de clics, sin abrir ningún diálogo modal.
+        viewer.open(&two_path).expect("volver al documento de la prueba");
+        viewer.apply_zoom(1.0);
+
+        let double_note = "mlnpdf-dobleclic-nota".to_string();
+        let double_sticky = "mlnpdf-dobleclic-adhesiva".to_string();
+        let double_mark = "mlnpdf-dobleclic-subrayado".to_string();
+        let double_ink = "mlnpdf-dobleclic-lapiz".to_string();
+        let double_shape = "mlnpdf-dobleclic-forma".to_string();
+        let double_stamp = "mlnpdf-dobleclic-sello".to_string();
+        let double_image = "mlnpdf-dobleclic-imagen".to_string();
+        viewer.annot.edits.borrow_mut().extend([
+            Edit {
+                id: double_note.clone(),
+                value: Annotation::Note(TextNote::new(
+                    0,
+                    (20.0, 20.0),
+                    60.0,
+                    16.0,
+                    vec![TextRun {
+                        text: "Hola".to_string(),
+                        font: FontChoice {
+                            family: "Sans".to_string(),
+                            size: 12.0,
+                            bold: false,
+                            italic: false,
+                        },
+                        color: [0.0, 0.0, 0.0],
+                    }],
+                )),
+            },
+            Edit {
+                id: double_sticky.clone(),
+                value: Annotation::Sticky(StickyNote::new(0, (150.0, 20.0), STICKY_COLOR)),
+            },
+            Edit {
+                id: double_mark.clone(),
+                value: Annotation::Mark(TextMark::underline(
+                    0,
+                    vec![(20.0, 50.0, 120.0, 60.0)],
+                    UNDERLINE_COLOR,
+                )),
+            },
+            Edit {
+                id: double_ink.clone(),
+                value: Annotation::Ink(InkStroke::new(
+                    0,
+                    vec![vec![(20.0, 70.0), (60.0, 90.0)]],
+                    [0.0, 0.0, 0.0],
+                    2.0,
+                )),
+            },
+            Edit {
+                id: double_shape.clone(),
+                value: Annotation::Shape(Shape::new(
+                    0,
+                    ShapeKind::Ellipse,
+                    (90.0, 70.0),
+                    (140.0, 110.0),
+                    [0.0, 0.0, 0.0],
+                    2.0,
+                )),
+            },
+            Edit {
+                id: double_stamp.clone(),
+                value: Annotation::Stamp(Stamp::new(0, (20.0, 120.0), StampKind::Draft)),
+            },
+            Edit {
+                id: double_image.clone(),
+                value: Annotation::Image(ImageNote::new(
+                    0,
+                    (120.0, 130.0),
+                    20.0,
+                    20.0,
+                    ImagePixels::new(1, 1, vec![0, 255, 0, 255]).expect("un píxel opaco"),
+                )),
+            },
+        ]);
+        for (name, id, expected) in [
+            ("la nota de texto", &double_note, DoubleClickAction::EditText),
+            (
+                "la nota adhesiva",
+                &double_sticky,
+                DoubleClickAction::EditComments,
+            ),
+            ("el subrayado", &double_mark, DoubleClickAction::ChooseColor),
+            ("el lápiz", &double_ink, DoubleClickAction::ChooseColor),
+            ("la forma", &double_shape, DoubleClickAction::ChooseColor),
+            ("el sello", &double_stamp, DoubleClickAction::ChooseColor),
+            ("la imagen", &double_image, DoubleClickAction::None),
+        ] {
+            let annotation = viewer
+                .annotation(id)
+                .unwrap_or_else(|| panic!("{name} sigue en la lista"));
+            assert_eq!(
+                double_click_action(&annotation),
+                expected,
+                "doble clic sobre {name}"
+            );
+            viewer.select_annotation(Some(id.clone()));
+            assert_eq!(
+                viewer.primary_selection().as_deref(),
+                Some(id.as_str()),
+                "el clic deja elegida {name}: el diálogo actúa sobre la selección"
+            );
+        }
+
+        // En una imagen el doble clic no abre nada nuevo: elige y nada más.
+        let windows_before = gtk::Window::list_toplevels().len();
+        viewer.select_annotation(Some(double_image.clone()));
+        viewer.double_click_annotation(&double_image);
+        for _ in 0..10 {
+            gtk::glib::MainContext::default().iteration(false);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            gtk::Window::list_toplevels().len(),
+            windows_before,
+            "el doble clic en una imagen no abre ninguna ventana"
+        );
+        assert_eq!(
+            viewer.primary_selection().as_deref(),
+            Some(double_image.as_str()),
+            "solo la deja elegida"
+        );
+
+        // Con el menú contextual abierto, el doble clic lo cierra antes de
+        // presentar el modal: el diálogo no puede quedar detrás del menú.
+        viewer.select_annotation(Some(double_note.clone()));
+        let double_anchor = viewer.doc.slots.borrow()[0].canvas.clone();
+        let double_menu = viewer.open_annotation_menu(double_note.clone(), &double_anchor, 20.0, 20.0);
+        assert!(
+            viewer.annot.annotation_menu.borrow().is_some(),
+            "el menú queda anotado mientras está abierto"
+        );
+        viewer.double_click_annotation(&double_note);
+        assert!(
+            viewer.annot.annotation_menu.borrow().is_none(),
+            "el doble clic cierra el menú que estaba abierto"
+        );
+        assert!(
+            !double_menu.is_visible(),
+            "el popover se cierra de verdad, no solo se olvida"
+        );
+        let mut double_dialog: Option<gtk::Window> = None;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while double_dialog.is_none() && std::time::Instant::now() < deadline {
+            gtk::glib::MainContext::default().iteration(false);
+            double_dialog = gtk::Window::list_toplevels()
+                .into_iter()
+                .filter(|widget| *widget != viewer.ui.window)
+                .find_map(|widget| widget.downcast::<gtk::Window>().ok());
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            double_dialog.is_some(),
+            "el doble clic en la nota abre su editor"
+        );
+        assert!(
+            click_dialog_button(&viewer, "Cancelar"),
+            "el editor de la nota se cierra con Cancelar"
+        );
+        drop(double_menu);
+
+        // El doble clic sobre una forma abre el mismo cambio de color que
+        // `Ctrl+Alt+C`, así que no hace falta un diálogo propio: la decisión
+        // —`ChooseColor`— ya está comprobada arriba.
+        viewer.discard_edits();
+        assert!(viewer.annot.edits.borrow().is_empty());
+        assert!(viewer.selected_ids().is_empty());
+
+        // S4 (T6): la forma elegida muestra sus asas y se modifica arrastrándolas.
+        assert!(viewer.annot.edits.borrow().is_empty(), "la forma arranca en una página limpia");
+        viewer.apply_zoom(1.0);
+        let zoom = viewer.view.zoom.get();
+        assert!(zoom > 0.0, "hay un zoom con el que pasar a puntos");
+
+        let handle_rect = "mlnpdf-forma-asas".to_string();
+        viewer.annot.edits.borrow_mut().push(Edit {
+            id: handle_rect.clone(),
+            value: Annotation::Shape(Shape::new(
+                0,
+                ShapeKind::Rectangle,
+                (40.0, 40.0),
+                (120.0, 90.0),
+                [0.0, 0.0, 0.0],
+                2.0,
+            )),
+        });
+        viewer.select_annotation(Some(handle_rect.clone()));
+        let rectangle = shape_of(&viewer, &handle_rect);
+        assert_eq!(
+            rectangle.handles(),
+            vec![(40.0, 40.0), (120.0, 40.0), (40.0, 90.0), (120.0, 90.0)],
+            "la forma elegida informa las cuatro asas de su caja"
+        );
+        assert_eq!(
+            viewer.shape_cursor_hit(0, 40.0 * zoom, 40.0 * zoom),
+            Some((handle_rect.clone(), "nwse-resize")),
+            "sobre el asa superior izquierda el cursor redimensiona en su diagonal"
+        );
+        assert_eq!(
+            viewer.shape_cursor_hit(0, 120.0 * zoom, 40.0 * zoom),
+            Some((handle_rect.clone(), "nesw-resize")),
+            "la otra diagonal usa el cursor cruzado"
+        );
+        assert_eq!(
+            viewer.shape_cursor_hit(0, 80.0 * zoom, 65.0 * zoom),
+            Some((handle_rect.clone(), "move")),
+            "dentro de la forma el cursor dice que se mueve"
+        );
+
+        // El clic dentro de la forma elegida la mantiene elegida —es lo que
+        // habilita las asas y el arrastre— y una forma sin elegir no agarra el
+        // clic, así que su interior sigue sirviendo para seleccionar texto.
+        assert_eq!(
+            viewer.selected_shape_at(0, 80.0 * zoom, 65.0 * zoom),
+            Some(handle_rect.clone()),
+            "dentro de la forma elegida el clic la mantiene elegida"
+        );
+        viewer.clear_selection();
+        assert_eq!(
+            viewer.selected_shape_at(0, 80.0 * zoom, 65.0 * zoom),
+            None,
+            "sin elegir, el interior de la forma no agarra el clic"
+        );
+        viewer.select_annotation(Some(handle_rect.clone()));
+
+        // Arrastrar la esquina inferior derecha cambia la caja y deja la opuesta
+        // fija, con una sola instantánea de deshacer.
+        let undo_before = viewer.annot.undo_stack.borrow().len();
+        assert!(
+            viewer.shape_drag_begin(0, 120.0 * zoom, 90.0 * zoom),
+            "el arrastre empieza en el asa"
+        );
+        assert!(viewer.shape_drag_active(), "el arrastre de forma queda vivo");
+        assert!(
+            viewer.shape_drag_update(20.0 * zoom, 30.0 * zoom),
+            "el asa redimensiona la forma"
+        );
+        assert!(viewer.shape_drag_end(), "el arrastre termina");
+        assert!(!viewer.shape_drag_active(), "soltar cierra el arrastre");
+        assert_eq!(
+            viewer.annot.undo_stack.borrow().len(),
+            undo_before + 1,
+            "un arrastre deja una sola instantánea de deshacer"
+        );
+        let resized = shape_of(&viewer, &handle_rect);
+        assert_eq!(
+            resized.rect(),
+            (40.0, 40.0, 140.0, 120.0),
+            "el asa arrastrada cambia la caja en puntos de la página"
+        );
+        assert_eq!(
+            resized.handles()[0],
+            (40.0, 40.0),
+            "la esquina opuesta a la agarrada queda fija"
+        );
+        assert!(viewer.undo(), "un solo deshacer devuelve la forma anterior");
+        assert_eq!(
+            shape_of(&viewer, &handle_rect),
+            rectangle,
+            "deshacer repone la caja original, sin cambiar el resto"
+        );
+
+        // Las asas se dibujan: con la forma elegida, el cuadrado del asa pinta
+        // un píxel que el contorno punteado no toca.
+        viewer.select_annotation(Some(handle_rect.clone()));
+        let painted = annotation_pixels(&viewer, 0, 200, 200);
+        assert!(
+            is_outline(painted[87 * 200 + 117]),
+            "el asa de la esquina inferior derecha se dibuja con la forma elegida"
+        );
+        viewer.clear_selection();
+        let unselected = annotation_pixels(&viewer, 0, 200, 200);
+        assert!(
+            !is_outline(unselected[87 * 200 + 117]),
+            "sin elegir la forma no queda ningún asa dibujada"
+        );
+
+        // Un extremo de la flecha cambia solo ese extremo.
+        viewer.discard_edits();
+        let handle_arrow = "mlnpdf-flecha-extremos".to_string();
+        viewer.annot.edits.borrow_mut().push(Edit {
+            id: handle_arrow.clone(),
+            value: Annotation::Shape(Shape::new(
+                0,
+                ShapeKind::Arrow,
+                (40.0, 140.0),
+                (120.0, 140.0),
+                [0.0, 0.0, 0.0],
+                2.0,
+            )),
+        });
+        viewer.select_annotation(Some(handle_arrow.clone()));
+        let arrow = shape_of(&viewer, &handle_arrow);
+        assert_eq!(
+            arrow.handles(),
+            vec![(40.0, 140.0), (120.0, 140.0)],
+            "la flecha informa sus dos extremos como asas"
+        );
+        assert_eq!(
+            viewer.shape_cursor_hit(0, 120.0 * zoom, 140.0 * zoom),
+            Some((handle_arrow.clone(), "pointer")),
+            "sobre el extremo de la flecha el cursor es pointer"
+        );
+        assert!(
+            viewer.shape_drag_begin(0, 120.0 * zoom, 140.0 * zoom),
+            "el arrastre empieza en el extremo"
+        );
+        assert!(
+            viewer.shape_drag_update(0.0, 30.0 * zoom),
+            "el extremo sigue al puntero"
+        );
+        assert!(viewer.shape_drag_end());
+        let dragged = shape_of(&viewer, &handle_arrow);
+        assert_eq!(dragged.to, (120.0, 170.0), "el segundo extremo se mueve");
+        assert_eq!(
+            dragged.from, arrow.from,
+            "el primer extremo queda donde estaba"
+        );
+        assert!(viewer.undo(), "mover un extremo se deshace de una vez");
+        assert_eq!(shape_of(&viewer, &handle_arrow), arrow);
+
+        // El estado queda como estaba: documento de la prueba, sin anotaciones y
+        // sin ningún arrastre vivo.
+        viewer.discard_edits();
+        assert!(viewer.annot.edits.borrow().is_empty());
+        assert!(!viewer.has_pending_marks());
+        assert!(viewer.selected_ids().is_empty());
+        assert!(!viewer.shape_drag_active(), "no queda un arrastre de forma vivo");
+
         // Pulsar la herramienta abre el selector de color del sistema. Es la
         // única parte del flujo que no se puede probar sin un clic real, así que
         // se comprueba que la ventana del selector aparezca.
@@ -3618,6 +3953,13 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
     /// Identificador de la anotación de la posición `index`.
     fn edit_id(viewer: &Viewer, index: usize) -> String {
         viewer.annot.edits.borrow()[index].id.clone()
+    }
+
+    /// Forma de la anotación `id`.
+    fn shape_of(viewer: &Viewer, id: &str) -> Shape {
+        viewer
+            .shape(id)
+            .unwrap_or_else(|| panic!("la anotación {id} tenía que ser una forma"))
     }
 
     /// `/Contents` de la nota `/FreeText` del archivo: el texto que lee cualquier
