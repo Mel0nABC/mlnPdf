@@ -11,9 +11,10 @@ use lopdf::{Dictionary, Document, Object, ObjectId, Stream};
 
 use crate::engine::annotation::{
     Annotation, FontChoice, ImageAppearance, ImageNote, ImagePixels, InkStroke, MarkKind, NOTE_COLOR,
-    PageBox, Rect, Shape, ShapeKind, StickyComment, StickyNote, TextMark, TextNote, TextRun,
-    bounds_rect, clamp_stroke_width, image_appearance, mark_quads, note_rect, parse_da,
-    quads_to_rects, sticky_rect, user_point, user_rect_to_display, user_to_display,
+    PageBox, Rect, STAMP_FONT_SIZE, Shape, ShapeKind, Stamp, StampKind, StickyComment, StickyNote,
+    TextMark, TextNote, TextRun, bounds_rect, clamp_stroke_width, image_appearance, mark_quads,
+    note_rect, parse_da, quads_to_rects, stamp_rect, sticky_rect, user_point, user_rect_to_display,
+    user_to_display,
 };
 
 /// Prefijo de `/NM` que distingue una anotación propia de la de otro programa.
@@ -141,6 +142,7 @@ pub fn write_annotations(
             Annotation::Image(image) => image_dictionary(&mut document, image, page_box, id)?,
             Annotation::Ink(stroke) => ink_dictionary(stroke, page_box, id),
             Annotation::Shape(shape) => shape_dictionary(shape, page_box, id),
+            Annotation::Stamp(stamp) => stamp_dictionary(&mut document, stamp, page_box, id)?,
             Annotation::Sticky(_) => continue,
         };
         push_annotation(&mut document, page_id, object)?;
@@ -381,6 +383,183 @@ fn shape_dictionary(shape: &Shape, page: PageBox, id: &str) -> Object {
         }
     }
     Object::Dictionary(dictionary)
+}
+
+/// Nombre del recurso de fuente dentro de la apariencia de un sello.
+const STAMP_FONT: &str = "F1";
+
+/// Nombre del tipo base con el que se escribe el texto del sello: negrita, para
+/// que el marco se lea como un sello y no como una nota.
+const STAMP_BASE_FONT: &str = "Helvetica-Bold";
+
+/// Diccionario de un sello predefinido: `/Stamp` con su `/Name`, su `/NM`, su
+/// `/Rect` en espacio de usuario y una apariencia `/AP` propia que dibuja el
+/// marco y el texto del sello.
+///
+/// La apariencia es un form XObject con su fuente base y su contenido, así que
+/// cualquier lector lo pinta igual: no depende de que el visor sepa reconstruir
+/// el sello ni de una imagen incrustada.
+fn stamp_dictionary(
+    document: &mut Document,
+    stamp: &Stamp,
+    page: PageBox,
+    id: &str,
+) -> Result<Object, String> {
+    let rect = stamp_rect(stamp, page);
+    let form = stamp_appearance_stream(document, stamp, rect)?;
+
+    let mut dictionary = Dictionary::new();
+    dictionary.set("Type", Object::Name(b"Annot".to_vec()));
+    dictionary.set("Subtype", Object::Name(b"Stamp".to_vec()));
+    set_identifier(&mut dictionary, id);
+    dictionary.set(
+        "Rect",
+        Object::Array(vec![real(rect.0), real(rect.1), real(rect.2), real(rect.3)]),
+    );
+    // El nombre distingue nuestros sellos de las imágenes pegadas, que también se
+    // escriben como `/Stamp`, y es lo que un lector muestra como etiqueta.
+    dictionary.set(
+        "Name",
+        Object::Name(stamp.kind.pdf_name().as_bytes().to_vec()),
+    );
+    dictionary.set("C", color_array(stamp.kind.color()));
+    // Print flag sin borde de anotación: el marco lo dibuja la apariencia.
+    dictionary.set("F", Object::Integer(4));
+    dictionary.set(
+        "Border",
+        Object::Array(vec![
+            Object::Integer(0),
+            Object::Integer(0),
+            Object::Integer(0),
+        ]),
+    );
+    let mut appearance = Dictionary::new();
+    appearance.set("N", Object::Reference(form));
+    dictionary.set("AP", Object::Dictionary(appearance));
+    Ok(Object::Dictionary(dictionary))
+}
+
+/// Apariencia del sello: un form XObject cuyo `/BBox` es el mismo rectángulo en
+/// espacio de usuario, con la fuente base del texto en sus `/Resources` y el
+/// contenido que dibuja el doble marco y el texto centrado.
+fn stamp_appearance_stream(
+    document: &mut Document,
+    stamp: &Stamp,
+    rect: Rect,
+) -> Result<ObjectId, String> {
+    let content = stamp_content(stamp, rect);
+    let font = base_font(document, STAMP_BASE_FONT)?;
+
+    let mut fonts = Dictionary::new();
+    fonts.set(STAMP_FONT, Object::Reference(font));
+    let mut resources = Dictionary::new();
+    resources.set("Font", Object::Dictionary(fonts));
+
+    let mut dictionary = Dictionary::new();
+    dictionary.set("Type", Object::Name(b"XObject".to_vec()));
+    dictionary.set("Subtype", Object::Name(b"Form".to_vec()));
+    let (x1, y1, x2, y2) = rect;
+    dictionary.set(
+        "BBox",
+        Object::Array(vec![real(x1), real(y1), real(x2), real(y2)]),
+    );
+    dictionary.set("Resources", Object::Dictionary(resources));
+
+    add_stream(document, dictionary, content)
+}
+
+/// Objeto de una de las 14 fuentes base del PDF, con su nombre completo.
+fn base_font(document: &mut Document, name: &str) -> Result<ObjectId, String> {
+    let mut font = Dictionary::new();
+    font.set("Type", Object::Name(b"Font".to_vec()));
+    font.set("Subtype", Object::Name(b"Type1".to_vec()));
+    font.set("BaseFont", Object::Name(name.as_bytes().to_vec()));
+    document
+        .try_add_object(Object::Dictionary(font))
+        .map_err(|error| format!("no se pudo agregar la fuente del sello al PDF: {error}"))
+}
+
+/// Contenido de la apariencia: un doble marco del color del sello y su texto
+/// centrado, en el mismo espacio del `/BBox`.
+///
+/// Los dos rectángulos concéntricos son el marco; la separación entre ellos y el
+/// borde se mide en puntos y no depende del tamaño, así un sello chico sigue
+/// leyéndose. El texto va con la fuente base de la apariencia y su color, y se
+/// centra con el ancho que le da la tabla de anchos de Helvetica-Bold.
+fn stamp_content(stamp: &Stamp, rect: Rect) -> Vec<u8> {
+    let (x1, y1, x2, y2) = rect;
+    let (width, height) = ((x2 - x1).abs(), (y2 - y1).abs());
+    let [red, green, blue] = stamp.kind.color();
+    let color = format!("{} {} {}", number(red), number(green), number(blue));
+    let stroke = (width.min(height) / 24.0).clamp(0.6, 2.0);
+
+    // Doble línea: el marco exterior y el interior, separados del borde del
+    // rectángulo para que ninguno quede cortado por el recorte del lector.
+    let outer = 3.0;
+    let inner = 8.0;
+    let label = stamp.kind.label();
+    let text_x = x1 + (width - stamp_text_width(label, STAMP_FONT_SIZE)) / 2.0;
+    // La línea base se corre desde el centro para que el alto de las mayúsculas
+    // quede centrado en el marco.
+    let text_y = y1 + (height - STAMP_FONT_SIZE) / 2.0 + STAMP_FONT_SIZE * 0.14;
+
+    format!(
+        "q {color} RG {} w {} {} {} {} re {} {} {} {} re S Q \
+         BT /{} {STAMP_FONT_SIZE:.1} Tf {color} rg {} {} Td ({label}) Tj ET",
+        number(stroke),
+        number(x1 + outer),
+        number(y1 + outer),
+        number((width - 2.0 * outer).max(0.0)),
+        number((height - 2.0 * outer).max(0.0)),
+        number(x1 + inner),
+        number(y1 + inner),
+        number((width - 2.0 * inner).max(0.0)),
+        number((height - 2.0 * inner).max(0.0)),
+        STAMP_FONT,
+        number(text_x),
+        number(text_y),
+    )
+    .into_bytes()
+}
+
+/// Ancho del texto del sello, en puntos, con la tabla de anchos de Helvetica-Bold
+/// (unidades de 1/1000 de em). Los sellos se escriben en mayúsculas, así que
+/// alcanza con las letras y el espacio.
+fn stamp_text_width(text: &str, size: f64) -> f64 {
+    let units: u32 = text
+        .chars()
+        .map(|character| match character {
+            ' ' => 278,
+            'A' => 722,
+            'B' => 722,
+            'C' => 722,
+            'D' => 722,
+            'E' => 667,
+            'F' => 611,
+            'G' => 778,
+            'H' => 722,
+            'I' => 278,
+            'J' => 556,
+            'K' => 722,
+            'L' => 611,
+            'M' => 833,
+            'N' => 722,
+            'O' => 778,
+            'P' => 667,
+            'Q' => 778,
+            'R' => 722,
+            'S' => 667,
+            'T' => 611,
+            'U' => 722,
+            'V' => 667,
+            'W' => 944,
+            'X' => 667,
+            'Y' => 667,
+            'Z' => 611,
+            _ => 611,
+        })
+        .sum();
+    f64::from(units) * size / 1000.0
 }
 
 /// Número para el contenido de un stream: cuatro decimales bastan para la matriz
@@ -1141,7 +1320,7 @@ fn read_annotation(
         b"Highlight" => read_mark(document, dictionary, page, page_box, MarkKind::Highlight),
         b"StrikeOut" => read_mark(document, dictionary, page, page_box, MarkKind::StrikeOut),
         b"FreeText" => read_note(document, dictionary, page, page_box),
-        b"Stamp" => read_image(document, dictionary, page, page_box),
+        b"Stamp" => read_stamp(document, dictionary, page, page_box),
         b"Ink" => read_ink(document, dictionary, page, page_box),
         b"Square" => read_shape(document, dictionary, page, page_box, ShapeKind::Rectangle),
         b"Circle" => read_shape(document, dictionary, page, page_box, ShapeKind::Ellipse),
@@ -1333,6 +1512,35 @@ fn read_note(
     )))
 }
 
+/// Sello o imagen leídos de un `/Stamp` propio: el `/Name` decide cuál de los
+/// dos es. Las imágenes pegadas se escriben como `/Stamp` sin `/Name`, así que
+/// un nombre desconocido vuelve a la lectura de imagen de siempre; si esa
+/// apariencia tampoco trae su `/Im0`, la anotación se saltea.
+fn read_stamp(
+    document: &Document,
+    dictionary: &Dictionary,
+    page: usize,
+    page_box: PageBox,
+) -> Option<Annotation> {
+    let name = dictionary
+        .get(b"Name")
+        .ok()
+        .and_then(|value| resolve(document, value))
+        .and_then(|value| value.as_name().ok())
+        .and_then(|bytes| std::str::from_utf8(bytes).ok());
+    if let Some(kind) = name.and_then(StampKind::from_pdf_name) {
+        let rect = user_rect_to_display(rect_of(document, dictionary, b"Rect")?, page_box);
+        return Some(Annotation::Stamp(Stamp {
+            page,
+            at: (rect.0, rect.1),
+            width: rect.2 - rect.0,
+            height: rect.3 - rect.1,
+            kind,
+        }));
+    }
+    read_image(document, dictionary, page, page_box)
+}
+
 /// Imagen leída de su `/Rect` y de la apariencia `/AP /N`, que es el form XObject
 /// con el que el lector dibuja el sello.
 fn read_image(
@@ -1509,7 +1717,7 @@ fn contents_text(dictionary: &Dictionary) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::annotation::{BaseFont, STICKY_SIDE};
+    use crate::engine::annotation::{BaseFont, STAMP_SIZE, STICKY_SIDE};
     use lopdf::{Stream, dictionary};
 
     /// Directorio de trabajo de las pruebas, dentro del proyecto.
@@ -3978,5 +4186,272 @@ mod tests {
         assert_eq!(back.comments[0].text, "Solo la nota");
         assert_same_color(back.color, sticky.color);
         assert_same_rect(back.rect(), sticky.rect());
+    }
+
+    #[test]
+    fn a_stamp_is_written_with_its_name_its_box_and_its_appearance() {
+        let source = scratch("stamp.pdf");
+        let target = scratch("stamp-out.pdf");
+        std::fs::write(&source, fixture([0.0, 0.0, 200.0, 100.0], 0)).expect("escribir el PDF");
+
+        let stamp = Stamp::new(0, (20.0, 10.0), StampKind::Approved);
+        let written = write_fresh(&source, &target, &[Annotation::Stamp(stamp)])
+            .expect("el sello tiene que escribirse");
+        assert_eq!(written, 1);
+
+        let document = Document::load(&target).expect("el archivo escrito tiene que cargarse");
+        let page_id = *document.get_pages().get(&1).expect("página 1");
+        let annotations = document.get_page_annotations(page_id).expect("anotaciones");
+        assert_eq!(annotations.len(), 1, "una anotación por sello");
+        let annotation = annotations[0];
+
+        assert_eq!(
+            annotation
+                .get(b"Subtype")
+                .and_then(Object::as_name)
+                .expect("Subtype"),
+            b"Stamp",
+            "el lector de PDF tiene que reconocer el sello"
+        );
+        assert_eq!(
+            annotation
+                .get(b"Name")
+                .and_then(Object::as_name)
+                .expect("Name"),
+            b"Approved",
+            "el tipo viaja en /Name"
+        );
+        assert_eq!(name_of(annotation), "mlnpdf-prueba-0", "con su /NM propio");
+        assert_eq!(
+            numbers(annotation, b"Rect"),
+            vec![20.0, 50.0, 140.0, 90.0],
+            "el marco va en espacio de usuario"
+        );
+        assert_eq!(
+            annotation.get(b"F").and_then(Object::as_i64).expect("F"),
+            4,
+            "la anotación se imprime"
+        );
+        assert_eq!(
+            numbers(annotation, b"Border"),
+            vec![0.0, 0.0, 0.0],
+            "sin borde de anotación: el marco lo dibuja la apariencia"
+        );
+
+        // La apariencia: un form XObject con el mismo rectángulo, la fuente base
+        // del texto y el contenido que dibuja el marco y el texto del sello.
+        let appearance = annotation
+            .get(b"AP")
+            .expect("sin apariencia el sello no se ve")
+            .as_dict()
+            .expect("AP es un diccionario");
+        let form = resolve(&document, appearance.get(b"N").expect("N"))
+            .and_then(|value| value.as_stream().ok())
+            .expect("la apariencia es un form XObject");
+        assert_eq!(
+            numbers(&form.dict, b"BBox"),
+            numbers(annotation, b"Rect"),
+            "el /BBox es el mismo rectángulo: el lector lo lleva a /Rect sin escalar"
+        );
+        let resources = form
+            .dict
+            .get(b"Resources")
+            .expect("Resources")
+            .as_dict()
+            .expect("diccionario");
+        let fonts = resources
+            .get(b"Font")
+            .expect("Font")
+            .as_dict()
+            .expect("diccionario");
+        let font = resolve(&document, fonts.get(b"F1").expect("F1"))
+            .and_then(|value| value.as_dict().ok())
+            .expect("F1 es un diccionario de fuente");
+        assert_eq!(
+            font.get(b"Subtype").and_then(Object::as_name).expect("Subtype"),
+            b"Type1",
+            "una de las 14 fuentes base"
+        );
+        assert_eq!(
+            font.get(b"BaseFont").and_then(Object::as_name).expect("BaseFont"),
+            b"Helvetica-Bold",
+            "el texto del sello va en negrita"
+        );
+
+        let content = String::from_utf8(
+            form.decompressed_content()
+                .expect("el contenido de la apariencia se descomprime"),
+        )
+        .expect("el contenido es texto ASCII");
+        assert!(
+            content.contains("(APROBADO)"),
+            "el texto del sello va en su apariencia: {content}"
+        );
+        assert!(
+            content.contains("/F1 16.0 Tf"),
+            "con la fuente base y el tamaño del sello: {content}"
+        );
+    }
+
+    #[test]
+    fn poppler_paints_the_frame_text_of_the_written_stamp() {
+        // La prueba de que el sello se ve en otro lector: el texto y las dos
+        // líneas del marco van en el color del tipo, así que rasterizar el archivo
+        // los tiene que mostrar pintados. Se cuentan por separado en el centro del
+        // marco, donde solo puede haber texto, y en todo el marco.
+        let size = (300.0, 200.0);
+        for kind in StampKind::ALL {
+            let source = scratch(&format!("stamp-painted-{}.pdf", kind.index()));
+            let target = scratch(&format!("stamp-painted-{}-out.pdf", kind.index()));
+            std::fs::write(&source, fixture([0.0, 0.0, 300.0, 200.0], 0))
+                .expect("escribir el PDF");
+
+            write_fresh(
+                &source,
+                &target,
+                &[Annotation::Stamp(Stamp::new(0, (40.0, 60.0), kind))],
+            )
+            .expect("el sello tiene que escribirse");
+
+            assert_eq!(
+                stamp_colour_pixels(
+                    &std::fs::read(&source).expect("original"),
+                    size,
+                    kind,
+                    (0.0, 0.0, 300.0, 200.0)
+                ),
+                0,
+                "la página vacía no tiene el color del sello"
+            );
+            let bytes = std::fs::read(&target).expect("leer el resultado");
+            assert!(
+                stamp_colour_pixels(&bytes, size, kind, (0.0, 0.0, 300.0, 200.0)) > 0,
+                "{kind:?}: poppler pinta el marco y el texto"
+            );
+            let centre = stamp_colour_pixels(&bytes, size, kind, (55.0, 70.0, 145.0, 90.0));
+            assert!(
+                centre > 10,
+                "{kind:?}: el texto del marco aparece pintado ({centre} píxeles)"
+            );
+        }
+    }
+
+    /// Cuenta los píxeles del color de un sello dentro de `region`, en píxeles de
+    /// la página rasterizada con el origen arriba. El antialiasing mezcla el color
+    /// con el papel, así que se acepta un tono alrededor del color del tipo.
+    fn stamp_colour_pixels(
+        bytes: &[u8],
+        size: (f64, f64),
+        kind: StampKind,
+        region: (f64, f64, f64, f64),
+    ) -> usize {
+        let document = poppler::Document::from_data(bytes, None).expect("poppler abre el PDF");
+        let page = document.page(0).expect("página 0");
+        let mut surface = cairo::ImageSurface::create(
+            cairo::Format::ARgb32,
+            size.0.ceil() as i32,
+            size.1.ceil() as i32,
+        )
+        .expect("crear la superficie");
+        {
+            let context = cairo::Context::new(&surface).expect("contexto");
+            context.set_source_rgb(1.0, 1.0, 1.0);
+            context.paint().expect("fondo blanco");
+            page.render(&context);
+        }
+        surface.flush();
+
+        let [wanted_red, wanted_green, wanted_blue] =
+            kind.color().map(|component| (component * 255.0).round() as i32);
+        let stride = usize::try_from(surface.stride()).expect("stride");
+        let (width, height) = (surface.width() as usize, surface.height() as usize);
+        let data = surface.data().expect("píxeles");
+        let mut painted = 0;
+        for row in 0..height {
+            for column in 0..width {
+                let (x, y) = (column as f64, row as f64);
+                if x < region.0 || x > region.2 || y < region.1 || y > region.3 {
+                    continue;
+                }
+                let offset = row * stride + column * 4;
+                let (blue, green, red) = (data[offset], data[offset + 1], data[offset + 2]);
+                let near = |component: u8, wanted: i32| (i32::from(component) - wanted).abs() <= 60;
+                if near(red, wanted_red) && near(green, wanted_green) && near(blue, wanted_blue) {
+                    painted += 1;
+                }
+            }
+        }
+        painted
+    }
+
+    #[test]
+    fn the_three_stamps_come_back_with_their_kind_and_their_box() {
+        let current: Vec<(String, Annotation)> = StampKind::ALL
+            .into_iter()
+            .enumerate()
+            .map(|(index, kind)| {
+                owned(
+                    &format!("mlnpdf-ida-sello-{index}"),
+                    Annotation::Stamp(Stamp::new(
+                        0,
+                        (20.0 + index as f64 * 5.0, 10.0),
+                        kind,
+                    )),
+                )
+            })
+            .collect();
+
+        let (_, read) = round_trip(
+            "rt-stamps",
+            fixture([0.0, 0.0, 200.0, 100.0], 0),
+            &current,
+        );
+        assert_eq!(read.len(), 3, "vuelven los tres sellos: {read:?}");
+        for (index, (id, value)) in read.iter().enumerate() {
+            let Annotation::Stamp(back) = value else {
+                panic!("se esperaba un sello y se leyó {value:?}");
+            };
+            assert_eq!(*id, format!("mlnpdf-ida-sello-{index}"), "mismo /NM");
+            assert_eq!(back.kind, StampKind::ALL[index], "mismo tipo");
+            assert_eq!(back.page, 0, "misma página");
+            assert!(
+                (back.at.0 - (20.0 + index as f64 * 5.0)).abs() <= 0.01
+                    && (back.at.1 - 10.0).abs() <= 0.01
+                    && (back.width - STAMP_SIZE.0).abs() <= 0.01
+                    && (back.height - STAMP_SIZE.1).abs() <= 0.01,
+                "el sello vuelve con su caja: {back:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stamp_with_a_foreign_name_and_no_image_is_skipped() {
+        // Un `/Stamp` con nuestro `/NM` cuyo `/Name` no es de los tres y cuya
+        // apariencia no trae `/Im0` no se puede reconstruir: se saltea sin romper
+        // la lectura del resto.
+        let path = scratch("stamp-foreign.pdf");
+        let mut document = Document::load_mem(&fixture([0.0, 0.0, 200.0, 100.0], 0))
+            .expect("cargar el fixture");
+        let page_id = *document.get_pages().get(&1).expect("página 1");
+        let foreign = Object::Dictionary(dictionary! {
+            "Type" => "Annot",
+            "Subtype" => "Stamp",
+            "NM" => Object::string_literal("mlnpdf-sello-ajeno"),
+            "Name" => "Confidential",
+            "Rect" => Object::Array(vec![10.into(), 10.into(), 60.into(), 20.into()]),
+        });
+        document
+            .get_dictionary_mut(page_id)
+            .expect("página")
+            .set("Annots", Object::Array(vec![foreign]));
+        let mut bytes = Vec::new();
+        document.save_to(&mut bytes).expect("serializar el fixture");
+        std::fs::write(&path, bytes).expect("escribir el fixture");
+
+        let read = read_annotations(&path).expect("leer el archivo");
+        assert!(
+            read.is_empty(),
+            "un sello ajeno sin imagen no entra en la lista editable: {read:?}"
+        );
     }
 }

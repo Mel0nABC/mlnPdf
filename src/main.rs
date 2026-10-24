@@ -32,8 +32,8 @@ mod tests {
     use crate::engine::render::render_page_surface;
     use crate::engine::annotation::{
         Annotation, Corner, FontChoice, IMAGE_BOX_FRACTION, ImageNote, ImagePixels, MarkKind,
-        NOTE_COLOR, STICKY_SIDE, STROKE_MAX_WIDTH, STROKE_MIN_WIDTH, ShapeKind, TextMark, TextNote,
-        TextRun,
+        NOTE_COLOR, STAMP_SIZE, STICKY_SIDE, STROKE_MAX_WIDTH, STROKE_MIN_WIDTH, ShapeKind,
+        StampKind, TextMark, TextNote, TextRun,
     };
     use crate::services::annotations::{open_for_editing, read_annotations, write_annotations};
     use crate::ui::shell::*;
@@ -2619,6 +2619,187 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             "el documento de la prueba sigue sin anotaciones"
         );
         assert!(!viewer.sticky_tool_active());
+
+        // S5: sello predefinido. El popover de dibujo ofrece la sección «Sellos»
+        // y pulsar un botón lo estampa en el acto, sin herramienta que armar.
+        let stamp_button = labeled_button(stroke_popover.upcast_ref::<gtk::Widget>(), "Aprobado")
+            .expect("el popover ofrece el sello aprobado");
+        assert_eq!(
+            stamp_button.tooltip_text().as_deref(),
+            Some("Sello aprobado (Ctrl+Alt+1)"),
+            "el sello se anuncia con su atajo"
+        );
+        stamp_button.emit_by_name::<()>("clicked", &[]);
+        assert_eq!(
+            viewer.annot.edits.borrow().len(),
+            1,
+            "el sello entra en la acto, sin herramienta que armar"
+        );
+        let stamp_id = edit_id(&viewer, 0);
+        let stamped = match viewer.annot.edits.borrow()[0].value.clone() {
+            Annotation::Stamp(stamp) => stamp,
+            other => panic!("se esperaba un sello y se leyó {other:?}"),
+        };
+        assert_eq!(stamped.kind, StampKind::Approved, "el sello es el aprobado");
+        assert_eq!(
+            (stamped.width, stamped.height),
+            STAMP_SIZE,
+            "el marco conserva el tamaño por omisión"
+        );
+        assert_eq!(
+            viewer.annot.selected.borrow().clone(),
+            Some(stamp_id.clone()),
+            "el sello queda elegido, con su contorno"
+        );
+        assert!(
+            viewer.has_pending_marks(),
+            "el sello queda pendiente de guardar"
+        );
+
+        // La capa pinta el marco y el texto con el color del tipo, no solo el
+        // contorno punteado de la selección.
+        let stamp_zoom = viewer.view.zoom.get();
+        assert!(stamp_zoom > 0.0, "hay un zoom con el que pasar a puntos");
+        let stamp_side = 400usize;
+        let stamp_pixels = annotation_pixels(&viewer, stamped.page, stamp_side, stamp_side);
+        let painted_stamp = pixel_box(stamp_side, &stamp_pixels, |[red, green, blue]| {
+            // El verde del sello, con las mezclas del antialiasing: la suma
+            // saturante evita que el papel blanco se dé vuelta en u8.
+            green > red.saturating_add(40) && green > blue.saturating_add(40)
+        })
+        .expect("el sello se pinta en la capa de anotaciones");
+        let expected_stamp = (
+            (stamped.at.0 * stamp_zoom) as usize,
+            (stamped.at.1 * stamp_zoom) as usize,
+            ((stamped.at.0 + STAMP_SIZE.0) * stamp_zoom) as usize,
+            ((stamped.at.1 + STAMP_SIZE.1) * stamp_zoom) as usize,
+        );
+        assert!(
+            (painted_stamp.0 as f64 - expected_stamp.0 as f64).abs() <= 4.0
+                && (painted_stamp.1 as f64 - expected_stamp.1 as f64).abs() <= 4.0
+                && (painted_stamp.2 as f64 - expected_stamp.2 as f64).abs() <= 4.0
+                && (painted_stamp.3 as f64 - expected_stamp.3 as f64).abs() <= 4.0,
+            "el sello {painted_stamp:?} tiene que llenar su marco {expected_stamp:?}"
+        );
+
+        // Arrastrar desde dentro del marco lo mueve, sin cambiarle el tamaño.
+        viewer.select_annotation(Some(stamp_id.clone()));
+        let stamp_centre = (
+            (stamped.at.0 + STAMP_SIZE.0 / 2.0) * stamp_zoom,
+            (stamped.at.1 + STAMP_SIZE.1 / 2.0) * stamp_zoom,
+        );
+        assert!(
+            viewer.note_drag_begin(stamped.page, stamp_centre.0, stamp_centre.1),
+            "el arrastre empieza dentro del sello"
+        );
+        assert!(viewer.note_drag_active(), "el arrastre del sello queda vivo");
+        let (stamp_dx, stamp_dy) = (20.0, 12.0);
+        assert!(
+            viewer.note_drag_update(stamp_dx, stamp_dy),
+            "el arrastre mueve el sello"
+        );
+        assert!(viewer.note_drag_end(), "el arrastre termina");
+        let moved_stamp = match viewer.annot.edits.borrow()[0].value.clone() {
+            Annotation::Stamp(stamp) => stamp,
+            other => panic!("se esperaba un sello y se leyó {other:?}"),
+        };
+        assert!(
+            (moved_stamp.at.0 - (stamped.at.0 + stamp_dx / stamp_zoom)).abs() < 1e-6
+                && (moved_stamp.at.1 - (stamped.at.1 + stamp_dy / stamp_zoom)).abs() < 1e-6,
+            "el sello se mueve el desplazamiento del puntero en puntos: {:?} -> {:?}",
+            stamped.at,
+            moved_stamp.at
+        );
+        assert_eq!(
+            (moved_stamp.width, moved_stamp.height),
+            (STAMP_SIZE.0, STAMP_SIZE.1),
+            "mover no cambia el tamaño del sello"
+        );
+        assert!(viewer.undo(), "mover el sello se deshace");
+        let restored_stamp = match viewer.annot.edits.borrow()[0].value.clone() {
+            Annotation::Stamp(stamp) => stamp,
+            other => panic!("se esperaba un sello y se leyó {other:?}"),
+        };
+        assert_eq!(
+            restored_stamp.at, stamped.at,
+            "deshacer devuelve el sello a donde estaba"
+        );
+
+        // `Supr` (el mismo camino del controlador de teclas) lo borra y
+        // deshacer lo recupera con su tipo y su caja.
+        viewer.select_annotation(Some(stamp_id.clone()));
+        assert!(
+            viewer.delete_selected_annotation(),
+            "Supr borra el sello elegido"
+        );
+        assert!(
+            viewer.annot.edits.borrow().is_empty(),
+            "el sello se va de la lista"
+        );
+        assert!(viewer.undo(), "deshacer lo recupera");
+        let back_stamp = match viewer.annot.edits.borrow()[0].value.clone() {
+            Annotation::Stamp(stamp) => stamp,
+            other => panic!("se esperaba un sello y se leyó {other:?}"),
+        };
+        assert_eq!(back_stamp.kind, StampKind::Approved, "vuelve con su tipo");
+        assert_eq!(back_stamp.at, stamped.at, "y con su caja");
+
+        // Guardar y reabrir: el sello vuelve del `/Name` y de su `/Rect`.
+        let stamp_path = dir.join("stamp-ui.pdf");
+        std::fs::remove_file(&stamp_path).ok();
+        assert!(
+            viewer.save_pending_edits(&stamp_path),
+            "el sello se guarda en la copia"
+        );
+        let saved = read_annotations(&stamp_path).expect("leer el sello guardado");
+        assert_eq!(
+            saved.len(),
+            1,
+            "en el archivo es una sola anotación: {saved:?}"
+        );
+        assert!(
+            matches!(&saved[0].1, Annotation::Stamp(stamp) if stamp.kind == StampKind::Approved),
+            "el archivo guarda el sello como /Stamp con su tipo: {saved:?}"
+        );
+        viewer.open(&stamp_path).expect("reabrir la copia guardada");
+        assert_eq!(
+            viewer.annot.edits.borrow().len(),
+            1,
+            "al reabrir, el sello vuelve a la lista editable"
+        );
+        let reopened_stamp = match &viewer.annot.edits.borrow()[0].value {
+            Annotation::Stamp(stamp) => stamp.clone(),
+            other => panic!("se esperaba un sello y se leyó {other:?}"),
+        };
+        assert_eq!(
+            reopened_stamp.kind, StampKind::Approved,
+            "el tipo vuelve del /Name"
+        );
+        assert!(
+            (reopened_stamp.at.0 - stamped.at.0).abs() <= 0.01
+                && (reopened_stamp.at.1 - stamped.at.1).abs() <= 0.01
+                && (reopened_stamp.width - STAMP_SIZE.0).abs() <= 0.01
+                && (reopened_stamp.height - STAMP_SIZE.1).abs() <= 0.01,
+            "la caja vuelve del /Rect: {reopened_stamp:?} no es {stamped:?}"
+        );
+        assert!(
+            !viewer.has_pending_marks(),
+            "lo reabierto coincide con el archivo"
+        );
+        std::fs::remove_file(&stamp_path).ok();
+
+        // Y el estado queda como estaba: el documento de la prueba, sin
+        // anotaciones ni sello elegido.
+        viewer.open(&two_path).expect("volver al documento de la prueba");
+        assert!(
+            viewer.annot.edits.borrow().is_empty(),
+            "el documento de la prueba sigue sin anotaciones"
+        );
+        assert!(
+            viewer.annot.selected.borrow().is_none(),
+            "no queda ningún sello elegido"
+        );
+        assert!(!viewer.has_pending_marks());
 
         // Pulsar la herramienta abre el selector de color del sistema. Es la
         // única parte del flujo que no se puede probar sin un clic real, así que

@@ -664,6 +664,136 @@ impl StickyNote {
     }
 }
 
+/// Tamaño de un sello al entrar en la página, en puntos: ancho y alto del marco.
+/// No se redimensiona: el sello conserva el tamaño con el que se escribe.
+pub const STAMP_SIZE: (f64, f64) = (120.0, 40.0);
+
+/// Tamaño del texto del sello, en puntos. Es el mismo que usa la apariencia
+/// escrita en el PDF y el que pinta la interfaz, escalado por el zoom.
+pub const STAMP_FONT_SIZE: f64 = 16.0;
+
+/// Sello predefinido que se estampa sobre la página. Cada uno se escribe con su
+/// nombre en `/Name` y su propio color, que es el del marco y el del texto.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StampKind {
+    /// Visto bueno: el verde que en el papel se lee como aprobación.
+    Approved,
+    /// Documento ya revisado: azul, el color de las correcciones.
+    Revised,
+    /// Borrador de trabajo: rojo, el aviso de que todavía no es la versión final.
+    Draft,
+}
+
+impl StampKind {
+    /// Los tres sellos, en el orden en que se ofrecen en la interfaz.
+    pub const ALL: [Self; 3] = [Self::Approved, Self::Revised, Self::Draft];
+
+    /// Nombre que viaja en el `/Name` de la anotación. Los dos primeros son los
+    /// nombres estándar del formato; `Revised` no lo es, pero se escribe como
+    /// nombre propio y el lector lo muestra igual.
+    pub fn pdf_name(self) -> &'static str {
+        match self {
+            Self::Approved => "Approved",
+            Self::Revised => "Revised",
+            Self::Draft => "Draft",
+        }
+    }
+
+    /// Tipo de sello a partir del `/Name` leído del archivo. `None` cuando el
+    /// nombre no es de los nuestros: es una imagen u otro sello, y lo decide la
+    /// lectura del archivo.
+    pub fn from_pdf_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|kind| kind.pdf_name() == name)
+    }
+
+    /// Texto que se pinta centrado en el marco, ya en mayúsculas como un sello.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Approved => "APROBADO",
+            Self::Revised => "REVISADO",
+            Self::Draft => "BORRADOR",
+        }
+    }
+
+    /// Color del marco y del texto, en `0..=1` como lo toma `/C`. Los tres son
+    /// oscuros: un sello tiene que leerse sobre el papel blanco.
+    pub fn color(self) -> [f64; 3] {
+        match self {
+            Self::Approved => [0.06, 0.55, 0.24],
+            Self::Revised => [0.10, 0.35, 0.75],
+            Self::Draft => [0.78, 0.12, 0.12],
+        }
+    }
+
+    /// Posición en la lista de sellos de la interfaz.
+    pub fn index(self) -> usize {
+        match self {
+            Self::Approved => 0,
+            Self::Revised => 1,
+            Self::Draft => 2,
+        }
+    }
+}
+
+/// Un sello predefinido estampado en la página.
+/// `at` es la esquina superior izquierda del marco en puntos PDF con el origen
+/// arriba a la izquierda, el mismo espacio que la selección y las notas.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Stamp {
+    pub page: usize,
+    pub at: (f64, f64),
+    pub width: f64,
+    pub height: f64,
+    pub kind: StampKind,
+}
+
+impl Stamp {
+    /// Sello del tamaño por omisión (`STAMP_SIZE`) en la esquina `at`.
+    pub fn new(page: usize, at: (f64, f64), kind: StampKind) -> Self {
+        Self {
+            page,
+            at,
+            width: STAMP_SIZE.0,
+            height: STAMP_SIZE.1,
+            kind,
+        }
+    }
+
+    /// Caja del sello en el espacio de la selección: `(x1, y1, x2, y2)`.
+    pub fn rect(&self) -> Rect {
+        (
+            self.at.0,
+            self.at.1,
+            self.at.0 + self.width,
+            self.at.1 + self.height,
+        )
+    }
+
+    /// True cuando `point` cae sobre el marco, con la tolerancia en puntos del
+    /// PDF que deja agarrarlo desde su borde. Todo el marco se agarra: es lo que
+    /// se arrastra para moverlo.
+    pub fn contains(&self, point: (f64, f64), tolerance: f64) -> bool {
+        let (x1, y1, x2, y2) = self.rect();
+        point.0 >= x1 - tolerance
+            && point.0 <= x2 + tolerance
+            && point.1 >= y1 - tolerance
+            && point.1 <= y2 + tolerance
+    }
+
+    /// Mueve el sello `delta` puntos, en el espacio de la página. El tipo y el
+    /// tamaño no cambian.
+    // El arrastre del visor mueve el sello cambiando su esquina; esta API existe
+    // para las pruebas de geometría y para cualquier gesto que la reutilice.
+    #[allow(dead_code)]
+    pub fn moved(&self, delta: (f64, f64)) -> Self {
+        let mut moved = self.clone();
+        moved.at = (self.at.0 + delta.0, self.at.1 + delta.1);
+        moved
+    }
+}
+
 /// Píxeles de una imagen ya decodificados, en el orden que espera cairo para una
 /// superficie `ARGB32`: BGRA con el alfa ya multiplicado, cuatro bytes por píxel
 /// y las filas seguidas, sin relleno.
@@ -945,6 +1075,8 @@ pub enum Annotation {
     Shape(Shape),
     /// Nota adhesiva con su hilo de respuestas.
     Sticky(StickyNote),
+    /// Sello predefinido: aprobado, revisado o borrador.
+    Stamp(Stamp),
 }
 
 impl Annotation {
@@ -957,12 +1089,14 @@ impl Annotation {
             Self::Ink(stroke) => stroke.page,
             Self::Shape(shape) => shape.page,
             Self::Sticky(sticky) => sticky.page,
+            Self::Stamp(stamp) => stamp.page,
         }
     }
 
     /// True cuando no hay nada que escribir: una nota sin texto, un marcado
     /// sin rectángulos, una imagen sin caja, un trazo sin puntos, una forma
-    /// sin lados o una nota adhesiva sin ningún comentario con texto.
+    /// sin lados, una nota adhesiva sin ningún comentario con texto o un sello
+    /// sin ancho o sin alto.
     pub fn is_empty(&self) -> bool {
         match self {
             Self::Mark(mark) => mark.is_empty(),
@@ -971,6 +1105,7 @@ impl Annotation {
             Self::Ink(stroke) => stroke.is_empty(),
             Self::Shape(shape) => shape.is_empty(),
             Self::Sticky(sticky) => sticky.is_empty(),
+            Self::Stamp(stamp) => stamp.width <= 0.0 || stamp.height <= 0.0,
         }
     }
 
@@ -1066,6 +1201,17 @@ pub fn image_rect(image: &ImageNote, page: PageBox) -> Rect {
 pub fn sticky_rect(sticky: &StickyNote, page: PageBox) -> Rect {
     let corner = sticky.at;
     let opposite = (sticky.at.0 + sticky.width, sticky.at.1 + sticky.height);
+    let (x1, y1) = user_point(corner, page);
+    let (x2, y2) = user_point(opposite, page);
+    (x1.min(x2), y1.min(y2), x1.max(x2), y1.max(y2))
+}
+
+/// `/Rect` del sello: las dos esquinas opuestas de su marco, en el espacio de
+/// usuario del archivo. Se convierten por separado por el mismo motivo que en una
+/// nota: con `/Rotate` los ejes se intercambian.
+pub fn stamp_rect(stamp: &Stamp, page: PageBox) -> Rect {
+    let corner = stamp.at;
+    let opposite = (stamp.at.0 + stamp.width, stamp.at.1 + stamp.height);
     let (x1, y1) = user_point(corner, page);
     let (x2, y2) = user_point(opposite, page);
     (x1.min(x2), y1.min(y2), x1.max(x2), y1.max(y2))
@@ -2325,5 +2471,137 @@ mod tests {
                 "el identificador de las demás variantes es el del par: {other:?}"
             );
         }
+    }
+
+    #[test]
+    fn every_stamp_kind_declares_the_name_the_format_recognizes() {
+        // El nombre viaja en `/Name` y es lo que la lectura del archivo usa para
+        // saber qué sello volvió; cada uno tiene que reconocerse a sí mismo.
+        assert_eq!(StampKind::Approved.pdf_name(), "Approved");
+        assert_eq!(StampKind::Revised.pdf_name(), "Revised");
+        assert_eq!(StampKind::Draft.pdf_name(), "Draft");
+        for kind in StampKind::ALL {
+            assert_eq!(
+                StampKind::from_pdf_name(kind.pdf_name()),
+                Some(kind),
+                "{kind:?} se reconoce por su /Name"
+            );
+        }
+        assert_eq!(
+            StampKind::from_pdf_name("Confidential"),
+            None,
+            "otro sello del formato no es de los nuestros"
+        );
+        assert_eq!(
+            StampKind::from_pdf_name(""),
+            None,
+            "un sello sin nombre tampoco"
+        );
+    }
+
+    #[test]
+    fn every_stamp_kind_carries_its_label_its_colour_and_its_place() {
+        assert_eq!(StampKind::Approved.label(), "APROBADO");
+        assert_eq!(StampKind::Revised.label(), "REVISADO");
+        assert_eq!(StampKind::Draft.label(), "BORRADOR");
+        assert_eq!(StampKind::Approved.index(), 0);
+        assert_eq!(StampKind::Revised.index(), 1);
+        assert_eq!(StampKind::Draft.index(), 2);
+
+        // Los tres colores son distintos y oscuros: un sello se lee sobre papel.
+        let colors = StampKind::ALL.map(|kind| kind.color());
+        for (index, color) in colors.iter().enumerate() {
+            for value in color {
+                assert!(
+                    (0.0..=1.0).contains(value),
+                    "el color {index} tiene una componente fuera de rango: {value}"
+                );
+            }
+            for other in &colors[index + 1..] {
+                assert_ne!(color, other, "dos sellos no pueden compartir color");
+            }
+        }
+        // Aprobado es verde, revisado azul y borrador rojo.
+        assert!(colors[0][1] > colors[0][0] && colors[0][1] > colors[0][2]);
+        assert!(colors[1][2] > colors[1][0] && colors[1][2] > colors[1][1]);
+        assert!(colors[2][0] > colors[2][1] && colors[2][0] > colors[2][2]);
+    }
+
+    #[test]
+    fn a_stamp_box_is_its_frame_and_is_hit_inside_it() {
+        let stamp = Stamp::new(2, (10.0, 20.0), StampKind::Approved);
+        assert_eq!(stamp.page, 2);
+        assert_eq!(
+            (stamp.width, stamp.height),
+            STAMP_SIZE,
+            "nace con el tamaño por omisión"
+        );
+        assert_eq!(stamp.rect(), (10.0, 20.0, 130.0, 60.0));
+
+        assert!(stamp.contains((70.0, 40.0), 0.0), "dentro del marco");
+        assert!(
+            stamp.contains((9.0, 40.0), 2.0),
+            "la tolerancia llega al borde"
+        );
+        assert!(!stamp.contains((5.0, 40.0), 2.0), "más lejos ya no");
+        assert!(!stamp.contains((70.0, 70.0), 2.0), "por debajo del marco no");
+    }
+
+    #[test]
+    fn moving_a_stamp_only_changes_its_corner() {
+        let stamp = Stamp::new(1, (10.0, 20.0), StampKind::Draft);
+        let moved = stamp.moved((5.0, -3.0));
+        assert_eq!(moved.at, (15.0, 17.0));
+        assert_eq!(
+            (moved.width, moved.height),
+            (stamp.width, stamp.height),
+            "mover no cambia el tamaño"
+        );
+        assert_eq!(moved.kind, stamp.kind, "ni el tipo");
+        assert_eq!(moved.page, stamp.page);
+    }
+
+    #[test]
+    fn the_stamp_rectangle_flips_the_corner_into_user_space() {
+        // Un sello de 120x40 pt en (10, 20) de una página de 200x100: el borde
+        // superior está a 20 pt del borde de arriba, o sea y=80 desde abajo.
+        let stamp = Stamp::new(0, (10.0, 20.0), StampKind::Revised);
+        assert_eq!(stamp_rect(&stamp, PLAIN), (10.0, 40.0, 130.0, 80.0));
+
+        // Con /Rotate 90 el marco se acuesta: los ejes se intercambian.
+        let turned = stamp_rect(
+            &stamp,
+            PageBox {
+                rotation: 90,
+                ..PLAIN
+            },
+        );
+        assert_eq!(turned, (20.0, 10.0, 60.0, 130.0));
+    }
+
+    #[test]
+    fn a_stamp_reports_its_page_and_is_empty_without_a_box() {
+        let stamp = Annotation::Stamp(stamp_value());
+        assert_eq!(stamp.page(), 0);
+        assert!(!stamp.is_empty());
+        assert!(
+            stamp.annotation_ids().is_empty(),
+            "el sello usa solo el identificador del par"
+        );
+
+        let flat = Annotation::Stamp(Stamp {
+            page: 1,
+            at: (10.0, 10.0),
+            width: 0.0,
+            height: 40.0,
+            kind: StampKind::Approved,
+        });
+        assert_eq!(flat.page(), 1);
+        assert!(flat.is_empty(), "un sello sin ancho no se escribe");
+    }
+
+    /// Sello con un marco conocido, para las pruebas de geometría.
+    fn stamp_value() -> Stamp {
+        Stamp::new(0, (10.0, 20.0), StampKind::Approved)
     }
 }

@@ -174,6 +174,9 @@ pub(crate) struct UiHandles {
     pub(crate)     stroke_width: gtk::SpinButton,
     /// Selector de color del trazo, también recordado entre trazos.
     pub(crate)     stroke_color: gtk::ColorDialogButton,
+    /// Los tres botones de la sección «Sellos» del popover de dibujo, en el orden
+    /// de `StampKind`.
+    pub(crate)     stamp_buttons: [gtk::Button; 3],
 }
 
 /// Widgets de una herramienta de marcado: el botón y el selector de color de
@@ -488,6 +491,8 @@ pub(crate) enum HitKind {
     Note,
     /// Una nota adhesiva: su icono abre el diálogo del hilo.
     Sticky,
+    /// Un sello predefinido: se arrastra para moverlo y se borra con `Supr`.
+    Stamp,
     Image,
     Mark,
     /// Un trazo del lápiz o una forma de las de dibujo.
@@ -574,8 +579,9 @@ impl Viewer {
         accessible_label(&image_button, "Insertar imagen en la página");
 
         // Quinta herramienta: dibujar. Un solo botón abre el popover con el
-        // lápiz, las cuatro formas, el grosor libre, el color y la nota adhesiva.
-        let (stroke_button, stroke_tools, stroke_width, stroke_color, sticky_button) =
+        // lápiz, las cuatro formas, el grosor libre, el color, la nota adhesiva y
+        // los sellos predefinidos.
+        let (stroke_button, stroke_tools, stroke_width, stroke_color, sticky_button, stamp_buttons) =
             build_stroke_menu();
 
         let title = gtk::Label::new(Some(WINDOW_TITLE));
@@ -738,6 +744,7 @@ impl Viewer {
                 stroke_tools: stroke_tools.clone(),
                 stroke_width: stroke_width.clone(),
                 stroke_color: stroke_color.clone(),
+                stamp_buttons: stamp_buttons.clone(),
             },
             doc: DocumentState {
                 document: RefCell::new(None),
@@ -905,6 +912,22 @@ impl Viewer {
                     popover.popdown();
                 }
                 viewer.set_sticky_tool(true);
+            });
+        }
+        // Los sellos no arman herramienta: al pulsar uno entra en el acto,
+        // centrado en la zona visible de la página actual.
+        for kind in StampKind::ALL {
+            let weak = Rc::downgrade(&viewer);
+            viewer.ui.stamp_buttons[kind.index()].connect_clicked(move |_| {
+                let Some(viewer) = weak.upgrade() else {
+                    return;
+                };
+                if let Some(popover) = viewer.ui.stroke_button.popover()
+                    && popover.is_visible()
+                {
+                    popover.popdown();
+                }
+                viewer.insert_stamp(kind);
             });
         }
         for index in 0..viewer.ui.navs.len() {
@@ -1193,6 +1216,15 @@ impl Viewer {
         });
         Self::install_action(viewer, "draw-arrow", |viewer| {
             viewer.start_stroke_tool(StrokeKind::Shape(ShapeKind::Arrow));
+        });
+        Self::install_action(viewer, "insert-stamp-approved", |viewer| {
+            viewer.insert_stamp(StampKind::Approved);
+        });
+        Self::install_action(viewer, "insert-stamp-revised", |viewer| {
+            viewer.insert_stamp(StampKind::Revised);
+        });
+        Self::install_action(viewer, "insert-stamp-draft", |viewer| {
+            viewer.insert_stamp(StampKind::Draft);
         });
         Self::install_action(viewer, "undo", |viewer| {
             let undone = viewer.undo();
@@ -2500,7 +2532,8 @@ impl Viewer {
                 | Annotation::Note(_)
                 | Annotation::Image(_)
                 | Annotation::Ink(_)
-                | Annotation::Shape(_) => None,
+                | Annotation::Shape(_)
+                | Annotation::Stamp(_) => None,
             })
     }
 
@@ -2520,6 +2553,26 @@ impl Viewer {
             Annotation::Sticky(sticky)
                 if sticky.page == page && sticky.contains(point, tolerance) =>
             {
+                Some(edit.id.clone())
+            }
+            _ => None,
+        })
+    }
+
+    /// Sello bajo el punto `(x, y)` de la vista, si hay uno. Se busca sobre su
+    /// marco entero, que es lo que se ve y lo que se arrastra; la última dibujada
+    /// gana.
+    pub(crate) fn stamp_at(&self, page: usize, x: f64, y: f64) -> Option<String> {
+        let point = self.view_to_pdf(page, x, y)?;
+        let zoom = self.view.zoom.get();
+        let tolerance = if zoom > 0.0 {
+            NOTE_HIT_TOLERANCE / zoom
+        } else {
+            0.0
+        };
+        let edits = self.annot.edits.borrow();
+        edits.iter().rev().find_map(|edit| match &edit.value {
+            Annotation::Stamp(stamp) if stamp.page == page && stamp.contains(point, tolerance) => {
                 Some(edit.id.clone())
             }
             _ => None,
@@ -2624,6 +2677,35 @@ impl Viewer {
         self.queue_page_draw(page);
         self.announce_change("Imagen insertada");
         true
+    }
+
+    /// Estampa un sello predefinido y lo deja elegido, con su contorno. No arma
+    /// ninguna herramienta: el sello entra en el acto, centrado en la zona visible
+    /// de la página actual, y lo que sigue es moverlo o borrarlo.
+    ///
+    /// El marco se queda dentro de la página aunque el centro visible caiga en un
+    /// borde: un sello recortado no se puede volver a agarrar entero.
+    pub(crate) fn insert_stamp(&self, kind: StampKind) -> Option<String> {
+        if self.doc.document.borrow().is_none() {
+            return None;
+        }
+        let (page, center) = self.visible_page_point()?;
+        let size = self.doc.page_sizes.borrow().get(page).copied()?;
+        let at = (
+            (center.0 - STAMP_SIZE.0 / 2.0).clamp(0.0, (size.0 - STAMP_SIZE.0).max(0.0)),
+            (center.1 - STAMP_SIZE.1 / 2.0).clamp(0.0, (size.1 - STAMP_SIZE.1).max(0.0)),
+        );
+
+        self.begin_edit();
+        let id = self.new_id();
+        self.annot.edits.borrow_mut().push(Edit {
+            id: id.clone(),
+            value: Annotation::Stamp(Stamp::new(page, at, kind)),
+        });
+        self.select_annotation(Some(id.clone()));
+        self.queue_page_draw(page);
+        self.announce_change("Sello insertado");
+        Some(id)
     }
 
     /// Inserta la primera imagen de un arrastre soltado sobre la página `page`,
@@ -3607,7 +3689,8 @@ impl Viewer {
                 | Annotation::Image(_)
                 | Annotation::Ink(_)
                 | Annotation::Shape(_)
-                | Annotation::Sticky(_) => None,
+                | Annotation::Sticky(_)
+                | Annotation::Stamp(_) => None,
             })
     }
 
@@ -3622,6 +3705,25 @@ impl Viewer {
                 Annotation::Image(image) => Some(image.clone()),
                 Annotation::Mark(_)
                 | Annotation::Note(_)
+                | Annotation::Ink(_)
+                | Annotation::Shape(_)
+                | Annotation::Sticky(_)
+                | Annotation::Stamp(_) => None,
+            })
+    }
+
+    /// Copia del sello `id`, si esa anotación existe y es un sello.
+    pub(crate) fn stamp(&self, id: &str) -> Option<Stamp> {
+        self.annot
+            .edits
+            .borrow()
+            .iter()
+            .find(|edit| edit.id == id)
+            .and_then(|edit| match &edit.value {
+                Annotation::Stamp(stamp) => Some(stamp.clone()),
+                Annotation::Mark(_)
+                | Annotation::Note(_)
+                | Annotation::Image(_)
                 | Annotation::Ink(_)
                 | Annotation::Shape(_)
                 | Annotation::Sticky(_) => None,
@@ -3705,6 +3807,7 @@ impl Viewer {
         let Some(id) = self
             .note_at(page, x, y)
             .or_else(|| self.sticky_at(page, x, y))
+            .or_else(|| self.stamp_at(page, x, y))
         else {
             return false;
         };
@@ -3712,6 +3815,7 @@ impl Viewer {
             .note(&id)
             .map(|note| note.at)
             .or_else(|| self.sticky(&id).map(|sticky| sticky.at))
+            .or_else(|| self.stamp(&id).map(|stamp| stamp.at))
         else {
             return false;
         };
@@ -3839,6 +3943,12 @@ impl Viewer {
             Annotation::Sticky(sticky) => {
                 sticky.page = page;
                 sticky.at = at;
+                true
+            }
+            // Y un sello: es su marco el que cambia de lugar y de página.
+            Annotation::Stamp(stamp) => {
+                stamp.page = page;
+                stamp.at = at;
                 true
             }
             Annotation::Mark(_)
@@ -4111,11 +4221,12 @@ impl Viewer {
         }
         // Las asas de la imagen elegida ganan sobre lo demás: son el tirador que
         // se ve. Después la nota, que se apila encima de la imagen, la nota
-        // adhesiva y al final el interior de la imagen.
+        // adhesiva, el sello y al final el interior de la imagen.
         let current = self
             .image_handle_cursor_hit(page, x, y)
             .or_else(|| self.note_cursor_hit(page, x, y))
             .or_else(|| self.sticky_cursor_hit(page, x, y))
+            .or_else(|| self.stamp_cursor_hit(page, x, y))
             .or_else(|| self.image_cursor_hit(page, x, y));
         let mut hover = self.annot.hover.borrow_mut();
         if *hover == current {
@@ -4195,6 +4306,11 @@ impl Viewer {
     /// icono que se abre con un clic.
     fn sticky_cursor_hit(&self, page: usize, x: f64, y: f64) -> Option<(String, &'static str)> {
         self.sticky_at(page, x, y).map(|id| (id, "pointer"))
+    }
+
+    /// Sello bajo el puntero, con el cursor de mover: su marco entero se arrastra.
+    fn stamp_cursor_hit(&self, page: usize, x: f64, y: f64) -> Option<(String, &'static str)> {
+        self.stamp_at(page, x, y).map(|id| (id, "move"))
     }
 
     /// Pone el cursor en todas las capas de la página. El lienzo de la selección
@@ -4352,7 +4468,7 @@ impl Viewer {
     /// Pinta las anotaciones de la página: el subrayado sobre el borde inferior
     /// de cada línea de texto, el resaltado como fondo translúcido, el tachado por
     /// el medio de cada línea, las notas de texto en negro con su fuente, los
-    /// trazos del lápiz y las formas.
+    /// trazos del lápiz, las formas, las notas adhesivas y los sellos.
     pub(crate) fn draw_annotations(&self, page: usize, context: &cairo::Context) {
         let edits = self.annot.edits.borrow();
         let drafting = self
@@ -4396,6 +4512,11 @@ impl Viewer {
                 Annotation::Sticky(sticky) => {
                     let chosen = selected.as_deref() == Some(edit.id.as_str());
                     draw_sticky(context, sticky, size, rotation, zoom, chosen);
+                    continue;
+                }
+                Annotation::Stamp(stamp) => {
+                    let chosen = selected.as_deref() == Some(edit.id.as_str());
+                    draw_stamp(context, stamp, size, rotation, zoom, chosen);
                     continue;
                 }
             };
@@ -5388,6 +5509,7 @@ impl Viewer {
                 .note_at(page, x, y)
                 .map(|id| (id, HitKind::Note))
                 .or_else(|| viewer.sticky_at(page, x, y).map(|id| (id, HitKind::Sticky)))
+                .or_else(|| viewer.stamp_at(page, x, y).map(|id| (id, HitKind::Stamp)))
                 .or_else(|| viewer.image_at(page, x, y).map(|id| (id, HitKind::Image)))
                 .or_else(|| viewer.mark_at(page, x, y).map(|id| (id, HitKind::Mark)))
                 .or_else(|| viewer.stroke_at(page, x, y).map(|id| (id, HitKind::Stroke)));
@@ -5407,7 +5529,7 @@ impl Viewer {
                         match kind {
                             HitKind::Note => viewer.prompt_note_edit(),
                             HitKind::Sticky => viewer.prompt_sticky_note_edit(),
-                            HitKind::Image | HitKind::Mark | HitKind::Stroke => {}
+                            HitKind::Image | HitKind::Mark | HitKind::Stroke | HitKind::Stamp => {}
                         }
                     }
                 }
@@ -7945,6 +8067,71 @@ fn draw_sticky(
     let _ = context.restore();
 }
 
+/// Pinta un sello predefinido: el doble marco y el texto centrado con el color
+/// del tipo, escalado por el zoom y acostado con la página como el resto de la
+/// capa. El sello elegido lleva el mismo contorno punteado que las demás
+/// anotaciones.
+fn draw_stamp(
+    context: &cairo::Context,
+    stamp: &Stamp,
+    page: (f64, f64),
+    rotation: i32,
+    zoom: f64,
+    selected: bool,
+) {
+    let color = stamp.kind.color();
+    let (x, y) = forward_rotation(stamp.at, page, rotation);
+    let width = (stamp.width * zoom).max(1.0);
+    let height = (stamp.height * zoom).max(1.0);
+
+    let _ = context.save();
+    // El sistema de coordenadas queda en la esquina del marco, acostado con la
+    // página: el marco y el texto se miden desde aquí, como en una nota.
+    context.translate(x * zoom, y * zoom);
+    context.rotate(view_angle(rotation));
+
+    context.set_source_rgba(color[0], color[1], color[2], 1.0);
+    context.set_line_width((2.0 * zoom).max(1.0));
+    // Doble marco, con las mismas separaciones que la apariencia del PDF.
+    for inset in [3.0, 8.0] {
+        let inset = inset * zoom;
+        context.rectangle(
+            inset,
+            inset,
+            (width - 2.0 * inset).max(0.0),
+            (height - 2.0 * inset).max(0.0),
+        );
+    }
+    let _ = context.stroke();
+
+    // El texto se centra como el de una nota, con la misma familia y el mismo
+    // alto de letra que la apariencia del archivo.
+    let layout = pangocairo::functions::create_layout(context);
+    pangocairo::functions::context_set_resolution(&layout.context(), 72.0);
+    let mut font = pango::FontDescription::new();
+    font.set_family("Sans");
+    font.set_weight(pango::Weight::Bold);
+    font.set_absolute_size((STAMP_FONT_SIZE * zoom).max(1.0) * f64::from(pango::SCALE));
+    layout.set_font_description(Some(&font));
+    layout.set_text(stamp.kind.label());
+    let (text_width, text_height) = layout.pixel_size();
+    context.move_to(
+        ((width - f64::from(text_width)) / 2.0).max(0.0),
+        ((height - f64::from(text_height)) / 2.0).max(0.0),
+    );
+    pangocairo::functions::show_layout(context, &layout);
+
+    if selected {
+        let dash = (4.0 * zoom).max(2.0);
+        context.set_dash(&[dash, dash * 0.75], 0.0);
+        context.set_line_width((1.0 * zoom).max(1.0));
+        context.set_source_rgba(0.20, 0.45, 0.95, 0.9);
+        context.rectangle(0.0, 0.0, width, height);
+        let _ = context.stroke();
+    }
+    let _ = context.restore();
+}
+
 /// Pinta una nota con pangocairo: cada tramo con su fuente y su color, escalado
 /// por el zoom y girado con la vista como el resto de la capa. La nota elegida
 /// lleva además un contorno punteado, que es lo que dice cuál responde a `Supr`
@@ -8255,15 +8442,34 @@ pub(crate) fn stroke_label(kind: StrokeKind) -> &'static str {
     }
 }
 
+/// Nombre con el que se ofrece cada sello predefinido en la interfaz.
+pub(crate) fn stamp_label(kind: StampKind) -> &'static str {
+    match kind {
+        StampKind::Approved => "Aprobado",
+        StampKind::Revised => "Revisado",
+        StampKind::Draft => "Borrador",
+    }
+}
+
+/// Atajo de teclado de cada sello, el mismo que se anuncia en su botón.
+fn stamp_shortcut(kind: StampKind) -> &'static str {
+    match kind {
+        StampKind::Approved => "Ctrl+Alt+1",
+        StampKind::Revised => "Ctrl+Alt+2",
+        StampKind::Draft => "Ctrl+Alt+3",
+    }
+}
+
 /// Botón de la barra y popover de dibujo: las cinco herramientas, el grosor
-/// libre en puntos y el selector de color. Devuelve las piezas que el visor
-/// tiene que conectar y recordar.
+/// libre en puntos, el selector de color, la nota adhesiva y los tres sellos.
+/// Devuelve las piezas que el visor tiene que conectar y recordar.
 fn build_stroke_menu() -> (
     gtk::MenuButton,
     [gtk::Button; 5],
     gtk::SpinButton,
     gtk::ColorDialogButton,
     gtk::Button,
+    [gtk::Button; 3],
 ) {
     let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
     content.set_margin_top(8);
@@ -8329,6 +8535,32 @@ fn build_stroke_menu() -> (
     accessible_label(&sticky, "Insertar una nota adhesiva en la página");
     content.append(&sticky);
 
+    // Sección «Sellos»: no arman herramienta, el sello entra en el acto.
+    let stamp_title = gtk::Label::new(Some("Sellos"));
+    stamp_title.set_xalign(0.0);
+    stamp_title.add_css_class("dim-label");
+    content.append(&stamp_title);
+
+    let stamps = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    let mut stamp_buttons: Vec<gtk::Button> = Vec::with_capacity(StampKind::ALL.len());
+    for kind in StampKind::ALL {
+        let label = stamp_label(kind);
+        let button = gtk::Button::with_label(label);
+        button.add_css_class("flat");
+        button.set_tooltip_text(Some(&format!(
+            "Sello {} ({})",
+            label.to_lowercase(),
+            stamp_shortcut(kind)
+        )));
+        accessible_label(&button, &format!("Estampar el sello {label} en la página"));
+        stamps.append(&button);
+        stamp_buttons.push(button);
+    }
+    let stamp_buttons: [gtk::Button; 3] = stamp_buttons
+        .try_into()
+        .expect("el popover ofrece los tres sellos");
+    content.append(&stamps);
+
     let popover = gtk::Popover::new();
     popover.set_child(Some(&content));
 
@@ -8340,7 +8572,7 @@ fn build_stroke_menu() -> (
         .build();
     accessible_label(&button, "Dibujar y formas");
 
-    (button, buttons, width, color, sticky)
+    (button, buttons, width, color, sticky, stamp_buttons)
 }
 
 fn toolbar_gap(width: i32) -> gtk::Box {

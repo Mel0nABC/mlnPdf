@@ -7,7 +7,7 @@ use gtk::gio;
 
 /// Keyboard shortcuts bound to the window actions. Declared as data so the
 /// display test can prove every trigger string actually parses.
-pub const SHORTCUTS: [(&str, &str); 48] = [
+pub const SHORTCUTS: [(&str, &str); 51] = [
     ("<Control>plus", "win.zoom-in"),
     ("<Control>equal", "win.zoom-in"),
     ("<Control>minus", "win.zoom-out"),
@@ -59,6 +59,10 @@ pub const SHORTCUTS: [(&str, &str); 48] = [
     ("<Control><Alt>f", "win.draw-arrow"),
     // Nota adhesiva: el clic siguiente crea el icono y abre su hilo.
     ("<Control><Alt>n", "win.sticky-note"),
+    // Sellos predefinidos: entran en el acto, sin herramienta que armar.
+    ("<Control><Alt>1", "win.insert-stamp-approved"),
+    ("<Control><Alt>2", "win.insert-stamp-revised"),
+    ("<Control><Alt>3", "win.insert-stamp-draft"),
     ("<Control>s", "win.save-annotations"),
     ("<Control><Shift>s", "win.save-annotations-as"),
     // Sin `<Control>`: es la tecla de borrar la nota elegida. El visor la maneja
@@ -67,7 +71,7 @@ pub const SHORTCUTS: [(&str, &str); 48] = [
 ];
 
 /// Human-readable shortcut list shown by Help > Atajos de teclado.
-pub const SHORTCUT_HELP: [(&str, &str); 35] = [
+pub const SHORTCUT_HELP: [(&str, &str); 36] = [
     ("Ctrl+O", "Abrir un PDF"),
     ("Ctrl+P", "Imprimir"),
     ("Ctrl+F", "Buscar en el documento"),
@@ -94,6 +98,7 @@ pub const SHORTCUT_HELP: [(&str, &str); 35] = [
     ("Ctrl+Alt+L", "Dibujar una línea"),
     ("Ctrl+Alt+F", "Dibujar una flecha"),
     ("Ctrl+Alt+N", "Insertar una nota adhesiva con su hilo de respuestas"),
+    ("Ctrl+Alt+1 / 2 / 3", "Estampar un sello: aprobado, revisado o borrador"),
     ("Ctrl+S / Ctrl+Shift+S", "Guardar los marcados / guardar como"),
     ("Ctrl+Shift+C", "Copiar el texto de la página actual"),
     ("Ctrl+G / Ctrl+Shift+G", "Siguiente / anterior coincidencia"),
@@ -139,6 +144,9 @@ pub fn build_menu_bar() -> gtk::PopoverMenuBar {
     edit_menu.append(Some("Elipse"), Some("win.draw-ellipse"));
     edit_menu.append(Some("Línea"), Some("win.draw-line"));
     edit_menu.append(Some("Flecha"), Some("win.draw-arrow"));
+    edit_menu.append(Some("Insertar sello aprobado"), Some("win.insert-stamp-approved"));
+    edit_menu.append(Some("Insertar sello revisado"), Some("win.insert-stamp-revised"));
+    edit_menu.append(Some("Insertar sello borrador"), Some("win.insert-stamp-draft"));
     edit_menu.append(Some("Copiar texto de la página"), Some("win.copy-page-text"));
     model.append_submenu(Some("Edit"), &edit_menu);
 
