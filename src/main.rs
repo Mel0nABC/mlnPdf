@@ -320,34 +320,90 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             "el grosor va de 0,5 a 20 puntos en pasos de medio punto"
         );
 
-        // El color del trazo se elige sin perder el menú: mientras el diálogo de
-        // color está abierto el popover no se auto-oculta, y al cerrarse —aceptar
-        // o cancelar— vuelve a su comportamiento normal. El diálogo en sí es
-        // modal y no se puede simular: se prueba la preparación y la restauración.
+        // El color del trazo se elige sin diálogo modal en el caso normal: una
+        // fila de muestras deja el color elegido y no cierra el popover, así el
+        // lector puede elegir después la herramienta. Sin diálogo no hay ventana
+        // congelada.
         assert!(
             stroke_popover.is_autohide(),
             "el popover se cierra al pulsar fuera, como cualquier menú"
-        );
-        let color_button = viewer.ui.stroke_color.button.clone();
-        assert_eq!(
-            color_button.tooltip_text().as_deref(),
-            Some("Color del trazo"),
-            "el popover de dibujo ofrece el color del trazo"
         );
         assert_eq!(
             viewer.ui.stroke_color.value.get(),
             STROKE_COLOR,
             "el color del trazo arranca con el del lápiz"
         );
-        hold_color_popover(&stroke_popover);
-        assert!(
-            !stroke_popover.is_autohide(),
-            "con el diálogo de color abierto el menú tiene que seguir visible"
+        let presets = viewer.ui.stroke_color.presets.clone();
+        assert_eq!(
+            presets.len(),
+            STROKE_PALETTE.len(),
+            "el popover ofrece una muestra por cada color de la paleta"
         );
-        release_color_popover(&stroke_popover);
+        for (index, (name, _)) in STROKE_PALETTE.iter().enumerate() {
+            assert_eq!(
+                presets[index].tooltip_text().as_deref(),
+                Some(*name),
+                "la muestra {index} se anuncia como «{name}»"
+            );
+        }
+        stroke_popover.popup();
+        assert!(
+            stroke_popover.is_visible(),
+            "el popover de dibujo se abre para elegir color"
+        );
+        presets[5].emit_by_name::<()>("clicked", &[]);
+        assert_eq!(
+            viewer.ui.stroke_color.value.get(),
+            STROKE_PALETTE[5].1,
+            "pulsar una muestra deja su color como color del trazo"
+        );
+        assert!(
+            stroke_popover.is_visible(),
+            "elegir color no cierra el popover: todavía falta elegir la herramienta"
+        );
         assert!(
             stroke_popover.is_autohide(),
-            "al cerrar el diálogo el popover vuelve a ocultarse solo"
+            "elegir color no toca el autohide del popover"
+        );
+        // Se vuelve al rojo de arranque, que es el que usan los trazos de abajo.
+        let red = STROKE_PALETTE
+            .iter()
+            .position(|(_, rgb)| *rgb == STROKE_COLOR)
+            .expect("la paleta incluye el color con el que arranca el trazo");
+        presets[red].emit_by_name::<()>("clicked", &[]);
+        assert_eq!(
+            viewer.ui.stroke_color.value.get(),
+            STROKE_COLOR,
+            "la muestra del rojo devuelve el color de arranque"
+        );
+
+        // «Más colores…» cierra el popover —su grab de entrada dejaría el diálogo
+        // modal sin eventos y la ventana parecería colgada— y lo vuelve a abrir
+        // al aceptar, para seguir eligiendo la herramienta. El diálogo de GTK en
+        // sí es modal y no se puede simular: se prueba el cierre y la reapertura.
+        assert_eq!(
+            viewer.ui.stroke_color.button.label().as_deref(),
+            Some("Más colores…"),
+            "el color a medida tiene su botón en el popover"
+        );
+        viewer.close_color_popover();
+        assert!(
+            !stroke_popover.is_visible(),
+            "abrir el diálogo de color suelta el grab cerrando el popover"
+        );
+        assert!(
+            stroke_popover.is_autohide(),
+            "y el popover sigue siendo auto-ocultable"
+        );
+        viewer.reopen_color_popover();
+        assert!(
+            stroke_popover.is_visible(),
+            "al aceptar un color a medida el popover vuelve a abrirse"
+        );
+        viewer.close_color_popover();
+        assert!(
+            !stroke_popover.is_visible(),
+            "el popover queda cerrado, como antes de elegir color"
         );
 
         // El menú File: guardar con nombres cortos. "Guardar" escribe en el
@@ -2291,8 +2347,9 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
                 "el punto {got:?} no es el del arrastre {want:?}"
             );
         }
-        // El color viaja como `f32` por el selector de GTK, así que se compara
-        // con la precisión del canal.
+        // El color del trazo es el de la muestra elegida, que es la misma que el
+        // popover recuerda para el trazo siguiente, así que se compara con la
+        // precisión del color.
         for (got, want) in ink.color.iter().zip([STROKE_COLOR.0, STROKE_COLOR.1, STROKE_COLOR.2]) {
             assert!(
                 (got - want).abs() < 1e-6,
@@ -2350,14 +2407,115 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             "después de Esc no queda herramienta armada"
         );
 
+        // Las cuatro formas se encadenan igual que el lápiz: se arma una vez y
+        // cada arrastre deja su forma, hasta que Esc desarma. Antes cada forma se
+        // desarmaba al soltar y había que volver al popover por cada una.
+        let mut arrow = None;
+        for (kind, first, second) in [
+            (
+                ShapeKind::Rectangle,
+                ((10.0, 10.0), (50.0, 30.0)),
+                ((110.0, 10.0), (150.0, 30.0)),
+            ),
+            (
+                ShapeKind::Ellipse,
+                ((10.0, 140.0), (50.0, 170.0)),
+                ((110.0, 140.0), (150.0, 170.0)),
+            ),
+            (
+                ShapeKind::Line,
+                ((10.0, 180.0), (60.0, 190.0)),
+                ((110.0, 180.0), (160.0, 190.0)),
+            ),
+            (
+                ShapeKind::Arrow,
+                ((40.0, 100.0), (100.0, 130.0)),
+                ((120.0, 100.0), (180.0, 120.0)),
+            ),
+        ] {
+            viewer.start_stroke_tool(StrokeKind::Shape(kind));
+            for (grab, end) in [first, second] {
+                let before = viewer.annot.edits.borrow().len();
+                assert!(
+                    viewer.stroke_drag_begin(0, grab.0 * zoom, grab.1 * zoom),
+                    "con {kind:?} armada el arrastre empieza la forma"
+                );
+                assert!(
+                    viewer.stroke_drag_update(
+                        0,
+                        (end.0 - grab.0) * zoom,
+                        (end.1 - grab.1) * zoom,
+                    ),
+                    "el arrastre mueve la esquina final de {kind:?}"
+                );
+                assert!(viewer.stroke_drag_end(), "soltar cierra la forma");
+                assert_eq!(
+                    viewer.annot.edits.borrow().len(),
+                    before + 1,
+                    "cada arrastre deja una forma {kind:?}"
+                );
+                let drawn = match &viewer.annot.edits.borrow()[before].value {
+                    Annotation::Shape(shape) => shape.clone(),
+                    other => panic!("la forma se guarda como forma: {other:?}"),
+                };
+                assert_eq!(drawn.kind, kind, "la forma guardada es {kind:?}");
+                assert!(
+                    (drawn.from.0 - grab.0).abs() < 1e-9 && (drawn.from.1 - grab.1).abs() < 1e-9,
+                    "la forma {kind:?} guarda la esquina inicial {grab:?}: {:?}",
+                    drawn.from
+                );
+                assert!(
+                    (drawn.to.0 - end.0).abs() < 1e-9 && (drawn.to.1 - end.1).abs() < 1e-9,
+                    "y la final {end:?}: {:?}",
+                    drawn.to
+                );
+                assert_eq!(
+                    viewer.stroke_tool_active().map(|tool| tool.kind),
+                    Some(StrokeKind::Shape(kind)),
+                    "soltar una forma deja la herramienta armada para encadenar otra"
+                );
+                if kind == ShapeKind::Arrow && arrow.is_none() {
+                    arrow = Some(drawn);
+                }
+            }
+            assert_eq!(
+                viewer.escape_pressed(),
+                gtk::glib::Propagation::Stop,
+                "Esc desarma {kind:?}"
+            );
+            assert!(
+                viewer.stroke_tool_active().is_none(),
+                "después de Esc no queda ninguna forma armada"
+            );
+        }
+        // La flecha que se guardó: dos esquinas y una punta en el segundo extremo.
+        let arrow = arrow.expect("la flecha deja su forma guardada");
+        assert_eq!(arrow.kind, ShapeKind::Arrow, "la forma es una flecha");
+        assert_eq!(arrow.from, (40.0, 100.0), "guarda la esquina inicial");
+        assert_eq!(arrow.to, (100.0, 130.0), "y la final");
+        assert_eq!(
+            viewer.annot.edits.borrow().len(),
+            10,
+            "dos trazos de lápiz y dos formas de cada una de las cuatro son diez anotaciones"
+        );
+        let arrow_pixels = annotation_pixels(&viewer, 0, 400, 400);
+        assert!(
+            pixel_box(400, &arrow_pixels, |[red, green, blue]| {
+                red > 120 && green < 80 && blue < 80
+            })
+            .is_some(),
+            "la flecha también se pinta en la capa"
+        );
+
         // Un clic sin arrastre no deja un trazo, y una forma de menos de un punto
-        // de lado tampoco: no se podría ni ver ni volver a agarrar.
+        // de lado tampoco: no se podría ni ver ni volver a agarrar. En los dos
+        // casos la herramienta sigue armada, como después de cualquier arrastre.
         viewer.start_stroke_tool(StrokeKind::Ink);
         assert!(viewer.stroke_drag_begin(0, 10.0 * zoom, 10.0 * zoom));
         assert!(viewer.stroke_drag_end(), "el clic cierra el gesto");
         assert_eq!(
             viewer.annot.edits.borrow().len(),
-            2,
+            10,
             "un trazo de un solo punto no se agrega"
         );
         assert_eq!(
@@ -2371,48 +2529,18 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         assert!(viewer.stroke_drag_end(), "la forma diminuta se descarta");
         assert_eq!(
             viewer.annot.edits.borrow().len(),
-            2,
+            10,
             "una forma de menos de un punto de lado no se agrega"
         );
-        assert!(
-            viewer.stroke_tool_active().is_none(),
-            "soltar una forma desarma la herramienta: un arrastre, una forma"
-        );
-
-        // La flecha: dos esquinas y una punta en el segundo extremo.
-        viewer.start_stroke_tool(StrokeKind::Shape(ShapeKind::Arrow));
-        assert!(
-            viewer.stroke_drag_begin(0, 40.0 * zoom, 100.0 * zoom),
-            "la forma también empieza con el arrastre"
-        );
-        assert!(
-            viewer.stroke_drag_update(0, 60.0 * zoom, 30.0 * zoom),
-            "el arrastre mueve la esquina final"
-        );
-        assert!(viewer.stroke_drag_end(), "soltar cierra la forma");
-        let arrow = match &viewer.annot.edits.borrow()[2].value {
-            Annotation::Shape(shape) => shape.clone(),
-            other => panic!("la flecha se guarda como forma: {other:?}"),
-        };
-        assert_eq!(arrow.kind, ShapeKind::Arrow, "la forma es una flecha");
-        assert_eq!(arrow.from, (40.0, 100.0), "guarda la esquina inicial");
-        assert_eq!(arrow.to, (100.0, 130.0), "y la final");
         assert_eq!(
-            viewer.annot.edits.borrow().len(),
-            3,
-            "los dos trazos del lápiz y la flecha son tres anotaciones"
+            viewer.stroke_tool_active().map(|tool| tool.kind),
+            Some(StrokeKind::Shape(ShapeKind::Rectangle)),
+            "descartar el arrastre demasiado chico no desarma la herramienta"
         );
+        viewer.escape_pressed();
         assert!(
             viewer.stroke_tool_active().is_none(),
-            "soltar la flecha desarma la forma: un arrastre, una forma"
-        );
-        let arrow_pixels = annotation_pixels(&viewer, 0, 400, 400);
-        assert!(
-            pixel_box(400, &arrow_pixels, |[red, green, blue]| {
-                red > 120 && green < 80 && blue < 80
-            })
-            .is_some(),
-            "la flecha también se pinta en la capa"
+            "Esc desarma la forma que sobrevivió al descarte"
         );
 
         // El trazo elegido se borra con Supr y deshacer lo repone, como cualquier
@@ -2426,13 +2554,14 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             "un clic sobre el trazo lo elige"
         );
         viewer.select_annotation(Some(ink_id.clone()));
+        let total = viewer.annot.edits.borrow().len();
         assert!(
             viewer.delete_selected_annotation(),
             "Supr borra el trazo elegido"
         );
-        assert_eq!(viewer.annot.edits.borrow().len(), 2);
+        assert_eq!(viewer.annot.edits.borrow().len(), total - 1);
         assert!(viewer.undo(), "deshacer repone el trazo borrado");
-        assert_eq!(viewer.annot.edits.borrow().len(), 3);
+        assert_eq!(viewer.annot.edits.borrow().len(), total);
         assert!(
             matches!(&viewer.annot.edits.borrow()[0].value, Annotation::Ink(_)),
             "deshacer repone el trazo, no otra anotación"

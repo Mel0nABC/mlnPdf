@@ -63,6 +63,21 @@ pub(crate) const STRIKEOUT_COLOR: (f64, f64, f64) = (0.25, 0.25, 0.25);
 /// que se lee sobre el papel blanco y sobre el oscuro.
 pub(crate) const STROKE_COLOR: (f64, f64, f64) = (0.85, 0.15, 0.15);
 
+/// Muestras de color del popover de dibujo, con el nombre que las anuncia y su
+/// RGB en `0..=1`. Elegir una de ellas no abre ningún diálogo modal, así que no
+/// puede dejar la ventana sin eventos. El rojo es `STROKE_COLOR`, el color con
+/// el que arranca el trazo.
+pub(crate) const STROKE_PALETTE: [(&str, (f64, f64, f64)); 8] = [
+    ("Negro", (0.0, 0.0, 0.0)),
+    ("Gris", (0.5, 0.5, 0.5)),
+    ("Rojo", STROKE_COLOR),
+    ("Naranja", (0.95, 0.55, 0.1)),
+    ("Amarillo", (0.95, 0.8, 0.1)),
+    ("Verde", (0.2, 0.65, 0.3)),
+    ("Azul", (0.15, 0.35, 0.85)),
+    ("Violeta", (0.55, 0.25, 0.8)),
+];
+
 /// Grosor con el que empieza un trazo, en puntos. Después se elige en el popover
 /// de dibujo entre `STROKE_MIN_WIDTH` y `STROKE_MAX_WIDTH`.
 pub(crate) const STROKE_WIDTH: f64 = 2.0;
@@ -186,15 +201,22 @@ pub(crate) struct MarkToolUi {
     pub(crate) dialog: gtk::ColorDialog,
 }
 
-/// Selector de color del trazo: el botón que abre el diálogo, la muestra que
-/// enseña el color elegido y el color recordado entre trazos.
+/// Selector de color del trazo: las muestras de la paleta, el botón que abre el
+/// diálogo para un color a medida, la muestra que enseña el color elegido y el
+/// color recordado entre trazos.
 #[derive(Clone)]
 pub(crate) struct StrokeColorUi {
+    /// Botón «Más colores…»: el único que abre el diálogo de GTK.
     pub(crate) button: gtk::Button,
     /// Muestra del color elegido; se repinta al cambiarlo.
     pub(crate) swatch: gtk::DrawingArea,
     /// Color RGB en `0..=1`, el mismo que viaja en `/C`.
     pub(crate) value: Rc<Cell<(f64, f64, f64)>>,
+    /// Botones de la paleta, en el orden de `STROKE_PALETTE`.
+    pub(crate) presets: [gtk::Button; STROKE_PALETTE.len()],
+    /// Dibujo de cada muestra: lleva el contorno de la que está elegida, así que
+    /// se repinta al cambiar de color.
+    pub(crate) preset_marks: [gtk::DrawingArea; STROKE_PALETTE.len()],
 }
 
 /// The open document and everything derived from it.
@@ -910,8 +932,22 @@ impl Viewer {
             });
         }
         {
-            // Elegir el color no puede cerrar el menú: si el popover desaparece
-            // al abrirse el diálogo, ya no se puede elegir la herramienta.
+            // Elegir un color de la paleta no cierra el menú y no abre ningún
+            // diálogo: deja el color elegido y el lector sigue eligiendo la
+            // herramienta, que es lo que pidió al probarlo a mano.
+            for (index, (_, rgb)) in STROKE_PALETTE.iter().enumerate() {
+                let weak = Rc::downgrade(&viewer);
+                let rgb = *rgb;
+                viewer.ui.stroke_color.presets[index].connect_clicked(move |_| {
+                    if let Some(viewer) = weak.upgrade() {
+                        viewer.set_stroke_color(rgb);
+                    }
+                });
+            }
+        }
+        {
+            // El color a medida sí necesita el diálogo de GTK: su botón lo abre
+            // soltando antes el grab del popover.
             let weak = Rc::downgrade(&viewer);
             viewer.ui.stroke_color.button.connect_clicked(move |_| {
                 if let Some(viewer) = weak.upgrade() {
@@ -2370,20 +2406,13 @@ impl Viewer {
         self.refresh_page_cursor();
     }
 
-    /// Abre el selector de color del trazo con el que ya está elegido. Mientras el
-    /// diálogo está abierto el popover de dibujo se queda visible: si se cerrara,
-    /// el lector perdería la posibilidad de elegir la herramienta después de
-    /// cambiar el color. Al aceptar o cancelar, el popover vuelve a su
-    /// comportamiento normal.
+    /// Abre el selector de color de GTK para un color a medida. El popover de
+    /// dibujo tiene un grab de entrada: se cierra antes de presentar el diálogo
+    /// modal —con el popover vivo, el diálogo no recibiría los eventos y la
+    /// ventana parecería congelada— y se vuelve a abrir al aceptar, para que el
+    /// lector siga eligiendo la herramienta. Al cancelar no se reabre nada.
     pub(crate) fn choose_stroke_color(self: &Rc<Self>) {
-        let Some(popover) = self.ui.stroke_button.popover() else {
-            return;
-        };
-        let dialog = gtk::ColorDialog::builder()
-            .title("Color del trazo")
-            .with_alpha(false)
-            .modal(true)
-            .build();
+        self.close_color_popover();
         let current = self.ui.stroke_color.value.get();
         let initial = gdk::RGBA::new(
             current.0 as f32,
@@ -2391,34 +2420,71 @@ impl Viewer {
             current.2 as f32,
             1.0,
         );
-        hold_color_popover(&popover);
-        let restore = popover.clone();
+        // El modal se presenta cuando el popover ya terminó de cerrarse: si se
+        // abre mientras todavía tiene el grab, la ventana queda detrás del menú.
         let weak = Rc::downgrade(self);
-        dialog.choose_rgba(
-            Some(&self.ui.window),
-            Some(&initial),
-            None::<&gio::Cancellable>,
-            move |result| {
-                release_color_popover(&restore);
-                let Ok(color) = result else {
-                    return;
-                };
-                if let Some(viewer) = weak.upgrade() {
-                    viewer.keep_stroke_color(color);
-                }
-            },
-        );
+        glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
+            let Some(viewer) = weak.upgrade() else {
+                return;
+            };
+            let dialog = gtk::ColorDialog::builder()
+                .title("Color del trazo")
+                .with_alpha(false)
+                .modal(true)
+                .build();
+            let weak = Rc::downgrade(&viewer);
+            dialog.choose_rgba(
+                Some(&viewer.ui.window),
+                Some(&initial),
+                None::<&gio::Cancellable>,
+                move |result| {
+                    let Ok(color) = result else {
+                        return;
+                    };
+                    if let Some(viewer) = weak.upgrade() {
+                        viewer.keep_stroke_color(color);
+                        viewer.reopen_color_popover();
+                    }
+                },
+            );
+        });
     }
 
-    /// Guarda el color elegido y repinta la muestra del botón, que es lo que se
-    /// ve junto al grosor antes de elegir la herramienta.
+    /// Cierra el popover de dibujo antes de un diálogo modal, para que suelte el
+    /// grab de entrada y el diálogo reciba los eventos.
+    pub(crate) fn close_color_popover(&self) {
+        if let Some(popover) = self.ui.stroke_button.popover()
+            && popover.is_visible()
+        {
+            popover.popdown();
+        }
+    }
+
+    /// Vuelve a abrir el popover de dibujo después de elegir un color a medida,
+    /// para que el lector siga eligiendo la herramienta.
+    pub(crate) fn reopen_color_popover(&self) {
+        if let Some(popover) = self.ui.stroke_button.popover() {
+            popover.popup();
+        }
+    }
+
+    /// Guarda el color del trazo y repinta la muestra y las muestras de la
+    /// paleta, que marcan cuál está elegida.
+    pub(crate) fn set_stroke_color(&self, color: (f64, f64, f64)) {
+        self.ui.stroke_color.value.set(color);
+        self.ui.stroke_color.swatch.queue_draw();
+        for mark in &self.ui.stroke_color.preset_marks {
+            mark.queue_draw();
+        }
+    }
+
+    /// Guarda el color que dejó el diálogo de GTK, que llega como `gdk::RGBA`.
     pub(crate) fn keep_stroke_color(&self, color: gdk::RGBA) {
-        self.ui.stroke_color.value.set((
+        self.set_stroke_color((
             color.red().into(),
             color.green().into(),
             color.blue().into(),
         ));
-        self.ui.stroke_color.swatch.queue_draw();
     }
 
     /// Recibe lo que dejó el diálogo: si hay texto, guarda el borrador y arma la
@@ -4219,15 +4285,14 @@ impl Viewer {
     }
 
     /// Suelta el trazo en curso: si alcanza, se agrega como una anotación más y
-    /// queda pendiente de guardar. El lápiz queda armado para encadenar trazos sin
-    /// volver al menú; las formas se desarman, porque un arrastre es una forma.
+    /// queda pendiente de guardar. La herramienta queda armada, sea el lápiz o
+    /// una forma, para encadenar trazos sin volver al menú hasta que `Esc` o
+    /// otra herramienta la desarmen. Un arrastre demasiado chico no agrega nada
+    /// y tampoco la desarma.
     pub(crate) fn stroke_drag_end(&self) -> bool {
         let Some(drag) = self.annot.stroke_drag.borrow_mut().take() else {
             return false;
         };
-        if drag.tool.kind != StrokeKind::Ink {
-            self.clear_stroke_tool();
-        }
         self.queue_page_draw(drag.page);
         if !drag.is_worth_adding() {
             return true;
@@ -8586,22 +8651,10 @@ fn stamp_shortcut(kind: StampKind) -> &'static str {
     }
 }
 
-/// Deja el popover de dibujo visible mientras el diálogo de color está abierto:
-/// el diálogo modal le quita el foco y, con `autohide`, el menú se cerraría antes
-/// de que el lector pueda elegir la herramienta.
-pub(crate) fn hold_color_popover(popover: &gtk::Popover) {
-    popover.set_autohide(false);
-}
-
-/// Devuelve el popover a su comportamiento normal cuando el diálogo se cierra,
-/// tanto al aceptar como al cancelar.
-pub(crate) fn release_color_popover(popover: &gtk::Popover) {
-    popover.set_autohide(true);
-}
-
 /// Botón de la barra y popover de dibujo: las cinco herramientas, el grosor
-/// libre en puntos, el selector de color, la nota adhesiva y los tres sellos.
-/// Devuelve las piezas que el visor tiene que conectar y recordar.
+/// libre en puntos, la paleta de colores, el color a medida, la nota adhesiva y
+/// los tres sellos. Devuelve las piezas que el visor tiene que conectar y
+/// recordar.
 fn build_stroke_menu() -> (
     gtk::MenuButton,
     [gtk::Button; 5],
@@ -8645,6 +8698,8 @@ fn build_stroke_menu() -> (
         .width_request(18)
         .height_request(18)
         .build();
+    color_swatch.set_tooltip_text(Some("Color del trazo elegido"));
+    accessible_label(&color_swatch, "Color del trazo elegido");
     {
         let color_value = color_value.clone();
         color_swatch.set_draw_func(move |_, context, width, height| {
@@ -8658,25 +8713,74 @@ fn build_stroke_menu() -> (
             let _ = context.stroke();
         });
     }
-    let color_button = gtk::Button::builder()
-        .child(&color_swatch)
-        .tooltip_text("Color del trazo")
-        .build();
+    let color_button = gtk::Button::with_label("Más colores…");
     color_button.add_css_class("flat");
-    accessible_label(&color_button, "Color del trazo");
+    color_button.set_tooltip_text(Some("Más colores…"));
+    accessible_label(&color_button, "Elegir un color a medida para el trazo");
+
+    // Paleta del popover: elegir color sin diálogo modal en el caso normal. La
+    // muestra elegida lleva un contorno oscuro, y la que se pulse deja el color
+    // sin cerrar el menú, así después se elige la herramienta.
+    let presets_row = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+    let mut preset_buttons: Vec<gtk::Button> = Vec::with_capacity(STROKE_PALETTE.len());
+    let mut preset_marks: Vec<gtk::DrawingArea> = Vec::with_capacity(STROKE_PALETTE.len());
+    for (name, rgb) in STROKE_PALETTE {
+        let mark = gtk::DrawingArea::builder()
+            .width_request(16)
+            .height_request(16)
+            .build();
+        {
+            let color_value = color_value.clone();
+            mark.set_draw_func(move |_, context, width, height| {
+                let (width, height) = (f64::from(width), f64::from(height));
+                context.set_source_rgb(rgb.0, rgb.1, rgb.2);
+                context.rectangle(2.0, 2.0, (width - 4.0).max(1.0), (height - 4.0).max(1.0));
+                let _ = context.fill();
+                if color_value.get() == rgb {
+                    // El contorno marca cuál está elegida.
+                    context.set_source_rgb(0.15, 0.15, 0.15);
+                    context.set_line_width(2.0);
+                    context.rectangle(1.0, 1.0, (width - 2.0).max(1.0), (height - 2.0).max(1.0));
+                    let _ = context.stroke();
+                }
+            });
+        }
+        let button = gtk::Button::builder().child(&mark).tooltip_text(name).build();
+        button.add_css_class("flat");
+        accessible_label(&button, &format!("Color {name} del trazo"));
+        presets_row.append(&button);
+        preset_buttons.push(button);
+        preset_marks.push(mark);
+    }
+    let presets: [gtk::Button; STROKE_PALETTE.len()] = preset_buttons
+        .try_into()
+        .expect("el popover ofrece una muestra por cada color de la paleta");
+    let preset_marks: [gtk::DrawingArea; STROKE_PALETTE.len()] = preset_marks
+        .try_into()
+        .expect("cada muestra de la paleta tiene su dibujo");
     let color = StrokeColorUi {
         button: color_button,
         swatch: color_swatch,
         value: color_value,
+        presets,
+        preset_marks,
     };
 
     let settings = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     settings.append(&width_label);
     settings.append(&width);
-    settings.append(&color.button);
+    settings.append(&color.swatch);
+
+    let colors = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let color_label = gtk::Label::new(Some("Color"));
+    color_label.set_xalign(0.0);
+    colors.append(&color_label);
+    colors.append(&presets_row);
+    colors.append(&color.button);
 
     content.append(&tools);
     content.append(&settings);
+    content.append(&colors);
 
     // La nota adhesiva comparte este popover: no es un trazo, pero también se
     // coloca con un clic sobre la página y es otra forma de anotar.
