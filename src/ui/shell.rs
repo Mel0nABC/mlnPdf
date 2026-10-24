@@ -59,6 +59,14 @@ pub(crate) const HIGHLIGHT_ALPHA: f64 = 0.4;
 /// blanco y no se confunde con la línea ámbar del subrayado.
 pub(crate) const STRIKEOUT_COLOR: (f64, f64, f64) = (0.25, 0.25, 0.25);
 
+/// Color con el que empieza un trazo a mano alzada o una forma: un rojo de lápiz
+/// que se lee sobre el papel blanco y sobre el oscuro.
+pub(crate) const STROKE_COLOR: (f64, f64, f64) = (0.85, 0.15, 0.15);
+
+/// Grosor con el que empieza un trazo, en puntos. Después se elige en el popover
+/// de dibujo entre `STROKE_MIN_WIDTH` y `STROKE_MAX_WIDTH`.
+pub(crate) const STROKE_WIDTH: f64 = 2.0;
+
 /// Width in logical pixels of the border band of a note where the cursor turns
 /// into the four-arrow move cursor, measured towards the inside of the note.
 const NOTE_CURSOR_BORDER: f64 = 5.0;
@@ -76,6 +84,14 @@ const NOTE_HIT_TOLERANCE: f64 = 2.0;
 /// Tolerance around an underline line or a highlight rectangle, in logical
 /// pixels, so the mark can be clicked to select it.
 const MARK_HIT_TOLERANCE: f64 = 4.0;
+
+/// Tolerancia alrededor del trazado de un lápiz o de una forma, en píxeles
+/// lógicos: el clic lo elige desde el borde del trazo, como a un marcado.
+const STROKE_HIT_TOLERANCE: f64 = 4.0;
+
+/// Lado mínimo de una forma recién dibujada, en puntos: un clic sin arrastre no
+/// deja una forma que no se puede ni ver ni volver a agarrar.
+const SHAPE_MIN_SIDE: f64 = 1.0;
 
 /// Lado de las asas de una imagen elegida, en píxeles lógicos: se dibujan
 /// centradas en cada esquina y se agarran con la misma tolerancia que el clic.
@@ -149,6 +165,15 @@ pub(crate) struct UiHandles {
     /// Botón de la herramienta «insertar imagen»: no es un modo, abre el selector
     /// de archivos y la imagen aparece en el acto.
     pub(crate)     image_button: gtk::Button,
+    /// Botón de la barra que abre el popover de dibujo.
+    pub(crate)     stroke_button: gtk::MenuButton,
+    /// Los cinco botones del popover de dibujo, en el orden de `STROKE_KINDS`.
+    pub(crate)     stroke_tools: [gtk::Button; 5],
+    /// Grosor en puntos que comparten el lápiz y las formas; se recuerda entre
+    /// trazos.
+    pub(crate)     stroke_width: gtk::SpinButton,
+    /// Selector de color del trazo, también recordado entre trazos.
+    pub(crate)     stroke_color: gtk::ColorDialogButton,
 }
 
 /// Widgets de una herramienta de marcado: el botón y el selector de color de
@@ -229,6 +254,98 @@ pub(crate) struct MarkTool {
     pub(crate) active: bool,
 }
 
+/// Qué herramienta de dibujo está armada: el lápiz o una de las formas.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StrokeKind {
+    /// Dibujo a mano alzada: se acumulan los puntos del arrastre.
+    Ink,
+    /// Forma geométrica: se guardan la esquina inicial y la final.
+    Shape(ShapeKind),
+}
+
+/// La herramienta de dibujo armada, con el color y el grosor que se recuerdan
+/// para el trazo siguiente.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct StrokeTool {
+    pub(crate) kind: StrokeKind,
+    /// Color RGB en `0..=1`, el mismo que viaja en `/C`.
+    pub(crate) color: (f64, f64, f64),
+    /// Grosor en puntos, dentro de `STROKE_MIN_WIDTH..=STROKE_MAX_WIDTH`.
+    pub(crate) width: f64,
+}
+
+impl StrokeTool {
+    /// Color como arreglo, que es lo que toman las anotaciones.
+    fn rgb(&self) -> [f64; 3] {
+        [self.color.0, self.color.1, self.color.2]
+    }
+}
+
+/// Arrastre de dibujo en curso: lo que se está trazando, todavía sin guardar.
+#[derive(Clone, Debug)]
+pub(crate) struct StrokeDrag {
+    pub(crate) page: usize,
+    pub(crate) tool: StrokeTool,
+    /// Punto donde empezó el arrastre, en píxeles lógicos de la página: cada
+    /// movimiento llega como desplazamiento desde acá.
+    pub(crate) grab: (f64, f64),
+    /// Puntos del lápiz, en puntos de la página y sin suavizar.
+    pub(crate) points: Vec<(f64, f64)>,
+    /// Extremos de la forma: la esquina donde empezó y la que sigue al puntero.
+    /// Para línea y flecha son sus dos extremos.
+    pub(crate) from: (f64, f64),
+    pub(crate) to: (f64, f64),
+}
+
+impl StrokeDrag {
+    /// La anotación que corresponde a lo trazado hasta ahora. El lápiz necesita
+    /// al menos dos puntos para tener un segmento; la forma se dibuja desde la
+    /// primera esquina, aunque todavía sea diminuta.
+    fn draft(&self) -> Option<Annotation> {
+        match self.tool.kind {
+            StrokeKind::Ink => {
+                if self.points.len() < 2 {
+                    return None;
+                }
+                Some(Annotation::Ink(InkStroke::new(
+                    self.page,
+                    vec![self.points.clone()],
+                    self.tool.rgb(),
+                    self.tool.width,
+                )))
+            }
+            StrokeKind::Shape(kind) => Some(Annotation::Shape(Shape::new(
+                self.page,
+                kind,
+                self.from,
+                self.to,
+                self.tool.rgb(),
+                self.tool.width,
+            ))),
+        }
+    }
+
+    /// True cuando lo trazado alcanza para agregarse: dos puntos de lápiz o una
+    /// forma con al menos un punto de lado (el largo, en línea y flecha).
+    fn is_worth_adding(&self) -> bool {
+        match self.tool.kind {
+            StrokeKind::Ink => self.points.len() >= 2,
+            StrokeKind::Shape(kind) => {
+                let width = (self.to.0 - self.from.0).abs();
+                let height = (self.to.1 - self.from.1).abs();
+                match kind {
+                    ShapeKind::Rectangle | ShapeKind::Ellipse => {
+                        width >= SHAPE_MIN_SIDE && height >= SHAPE_MIN_SIDE
+                    }
+                    ShapeKind::Line | ShapeKind::Arrow => {
+                        (width * width + height * height).sqrt() >= SHAPE_MIN_SIDE
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Una anotación del lector con su identificador estable, el que se escribe
 /// como /NM en el PDF para poder reemplazarla o quitarla en un guardado
 /// posterior.
@@ -266,6 +383,12 @@ pub(crate) struct AnnotationState {
     pub(crate)     underline: Cell<MarkTool>,
     pub(crate)     highlight: Cell<MarkTool>,
     pub(crate)     strikeout: Cell<MarkTool>,
+    /// Herramienta de dibujo armada (lápiz o forma), con su color y su grosor.
+    /// Es excluyente con el modo mano, los marcados y el texto.
+    pub(crate)     stroke_tool: RefCell<Option<StrokeTool>>,
+    /// Arrastre de dibujo en curso, si hay uno: es el borrador que se pinta
+    /// mientras se traza.
+    pub(crate)     stroke_drag: RefCell<Option<StrokeDrag>>,
     /// Herramienta «insertar texto» armada: el próximo clic coloca la nota.
     pub(crate)     text_tool: Cell<bool>,
     /// Texto y fuente que dejó el diálogo, esperando ese clic.
@@ -362,6 +485,8 @@ pub(crate) enum HitKind {
     Note,
     Image,
     Mark,
+    /// Un trazo del lápiz o una forma de las de dibujo.
+    Stroke,
 }
 
 /// Punto del documento que se mantiene bajo el puntero mientras cambia el zoom.
@@ -443,6 +568,10 @@ impl Viewer {
             .build();
         accessible_label(&image_button, "Insertar imagen en la página");
 
+        // Quinta herramienta: dibujar. Un solo botón abre el popover con el
+        // lápiz, las cuatro formas, el grosor libre y el color.
+        let (stroke_button, stroke_tools, stroke_width, stroke_color) = build_stroke_menu();
+
         let title = gtk::Label::new(Some(WINDOW_TITLE));
 
         let header = gtk::HeaderBar::new();
@@ -510,6 +639,7 @@ impl Viewer {
         controls.append(&tools[2].button);
         controls.append(&text_button);
         controls.append(&image_button);
+        controls.append(&stroke_button);
 
         // Secondary toolbar: the group stays centred, whatever the window width.
         let toolbar = gtk::Box::builder()
@@ -598,6 +728,10 @@ impl Viewer {
                 tools,
                 text_button: text_button.clone(),
                 image_button: image_button.clone(),
+                stroke_button: stroke_button.clone(),
+                stroke_tools: stroke_tools.clone(),
+                stroke_width: stroke_width.clone(),
+                stroke_color: stroke_color.clone(),
             },
             doc: DocumentState {
                 document: RefCell::new(None),
@@ -663,6 +797,8 @@ impl Viewer {
                     color: STRIKEOUT_COLOR,
                     active: false,
                 }),
+                stroke_tool: RefCell::new(None),
+                stroke_drag: RefCell::new(None),
                 text_tool: Cell::new(false),
                 draft: RefCell::new(None),
                 image_surfaces: RefCell::new(HashMap::new()),
@@ -730,6 +866,22 @@ impl Viewer {
                 if let Some(viewer) = weak.upgrade() {
                     viewer.prompt_insert_image();
                 }
+            });
+        }
+        // Cada botón del popover arma su herramienta y cierra el menú: el
+        // siguiente arrastre sobre la página es el trazo.
+        for (index, kind) in STROKE_KINDS.into_iter().enumerate() {
+            let weak = Rc::downgrade(&viewer);
+            viewer.ui.stroke_tools[index].connect_clicked(move |_| {
+                let Some(viewer) = weak.upgrade() else {
+                    return;
+                };
+                if let Some(popover) = viewer.ui.stroke_button.popover()
+                    && popover.is_visible()
+                {
+                    popover.popdown();
+                }
+                viewer.start_stroke_tool(kind);
             });
         }
         for index in 0..viewer.ui.navs.len() {
@@ -1003,6 +1155,21 @@ impl Viewer {
         });
         Self::install_action(viewer, "insert-text", |viewer| viewer.prompt_text_note());
         Self::install_action(viewer, "insert-image", |viewer| viewer.prompt_insert_image());
+        Self::install_action(viewer, "draw-ink", |viewer| {
+            viewer.start_stroke_tool(StrokeKind::Ink);
+        });
+        Self::install_action(viewer, "draw-rectangle", |viewer| {
+            viewer.start_stroke_tool(StrokeKind::Shape(ShapeKind::Rectangle));
+        });
+        Self::install_action(viewer, "draw-ellipse", |viewer| {
+            viewer.start_stroke_tool(StrokeKind::Shape(ShapeKind::Ellipse));
+        });
+        Self::install_action(viewer, "draw-line", |viewer| {
+            viewer.start_stroke_tool(StrokeKind::Shape(ShapeKind::Line));
+        });
+        Self::install_action(viewer, "draw-arrow", |viewer| {
+            viewer.start_stroke_tool(StrokeKind::Shape(ShapeKind::Arrow));
+        });
         Self::install_action(viewer, "undo", |viewer| {
             let undone = viewer.undo();
             viewer.announce_change(if undone {
@@ -1745,9 +1912,8 @@ impl Viewer {
 
         self.apply_page_background();
         self.refresh_visible();
-        if self.input.hand_mode.get() {
-            self.apply_hand_cursor(Some("grab"));
-        }
+        // La página nueva hereda el cursor de la herramienta armada.
+        self.refresh_page_cursor();
         Ok(())
     }
 
@@ -1896,11 +2062,12 @@ impl Viewer {
     /// Turns the hand tool on or off and keeps the cursor consistent.
     pub(crate) fn set_hand_mode(&self, active: bool) {
         if active {
-            // Las cuatro herramientas no pueden estar activas a la vez.
+            // Las herramientas no pueden estar activas a la vez.
             self.set_text_tool(false);
             self.set_mark_mode(MarkKind::Underline, false);
             self.set_mark_mode(MarkKind::Highlight, false);
             self.set_mark_mode(MarkKind::StrikeOut, false);
+            self.clear_stroke_tool();
         }
         self.input.hand_mode.set(active);
         if !active {
@@ -1910,11 +2077,15 @@ impl Viewer {
         self.refresh_page_cursor();
     }
 
-    /// Cursor of the page area, derived from the active tool, so the two never
-    /// disagree about which one owns the next drag.
+    /// Cursor de la página, derivado de la herramienta activa, para que los dos
+    /// nunca discrepen sobre quién se queda con el próximo arrastre.
     pub(crate) fn refresh_page_cursor(&self) {
         if self.input.hand_mode.get() {
             self.apply_hand_cursor(Some("grab"));
+        } else if self.stroke_tool_active().is_some() {
+            // Con el lápiz o una forma armada el arrastre dibuja: la cruz dice
+            // dónde empieza el trazo.
+            self.apply_hand_cursor(Some("crosshair"));
         } else if self.active_mark_tool().is_some() || self.text_tool_active() {
             self.apply_hand_cursor(Some("text"));
         } else {
@@ -1988,6 +2159,8 @@ impl Viewer {
             }
             // Y la de insertar texto también: una sola herramienta armada.
             self.set_text_tool(false);
+            // Y el dibujo, que también se queda con el arrastre.
+            self.clear_stroke_tool();
         }
 
         let mut tool = self.mark_tool(kind);
@@ -2033,11 +2206,55 @@ impl Viewer {
             self.set_mark_mode(MarkKind::Underline, false);
             self.set_mark_mode(MarkKind::Highlight, false);
             self.set_mark_mode(MarkKind::StrikeOut, false);
+            self.clear_stroke_tool();
         }
         self.annot.text_tool.set(active);
         if self.ui.text_button.is_active() != active {
             self.ui.text_button.set_active(active);
         }
+        self.refresh_page_cursor();
+    }
+
+    /// Herramienta de dibujo armada, si hay alguna, con su color y su grosor.
+    pub(crate) fn stroke_tool_active(&self) -> Option<StrokeTool> {
+        self.annot.stroke_tool.borrow().clone()
+    }
+
+    /// Desarma la herramienta de dibujo y descarta el trazo en curso, sin tocar
+    /// las demás herramientas. Es la mitad de la exclusividad: quien arme otra
+    /// cosa llama a esto.
+    pub(crate) fn clear_stroke_tool(&self) {
+        let drag = self.annot.stroke_drag.borrow_mut().take();
+        let armed = self.annot.stroke_tool.borrow_mut().take().is_some();
+        if let Some(drag) = &drag {
+            self.queue_page_draw(drag.page);
+        }
+        if armed || drag.is_some() {
+            self.refresh_page_cursor();
+        }
+    }
+
+    /// Arma el lápiz o una forma con el grosor y el color que el popover
+    /// recuerda. Es excluyente con el modo mano, los marcados y el texto.
+    pub(crate) fn start_stroke_tool(&self, kind: StrokeKind) {
+        if self.doc.document.borrow().is_none() {
+            return;
+        }
+        self.set_hand_mode(false);
+        self.set_mark_mode(MarkKind::Underline, false);
+        self.set_mark_mode(MarkKind::Highlight, false);
+        self.set_mark_mode(MarkKind::StrikeOut, false);
+        self.set_text_tool(false);
+
+        // El grosor y el color salen de los controles del popover, que conservan
+        // lo último que se eligió para el trazo siguiente.
+        let rgba = self.ui.stroke_color.rgba();
+        let tool = StrokeTool {
+            kind,
+            color: (rgba.red().into(), rgba.green().into(), rgba.blue().into()),
+            width: clamp_stroke_width(self.ui.stroke_width.value()),
+        };
+        *self.annot.stroke_tool.borrow_mut() = Some(tool);
         self.refresh_page_cursor();
     }
 
@@ -2916,6 +3133,9 @@ impl Viewer {
         self.annot.image_surfaces.borrow_mut().clear();
         self.annot.draft.borrow_mut().take();
         self.annot.note_drag.borrow_mut().take();
+        self.annot.image_drag.borrow_mut().take();
+        self.annot.stroke_drag.borrow_mut().take();
+        self.annot.stroke_tool.borrow_mut().take();
         self.annot.hover.borrow_mut().take();
         *self.annot.selected.borrow_mut() = None;
         self.set_text_tool(false);
@@ -2995,6 +3215,29 @@ impl Viewer {
         })
     }
 
+    /// Trazo del lápiz o forma bajo el punto `(x, y)` de la vista, si hay alguno.
+    /// Se agarra cerca del trazado, con la tolerancia del clic más la mitad del
+    /// grosor; la última anotación dibujada gana, como con los marcados.
+    pub(crate) fn stroke_at(&self, page: usize, x: f64, y: f64) -> Option<String> {
+        let point = self.view_to_pdf(page, x, y)?;
+        let zoom = self.view.zoom.get();
+        let tolerance = if zoom > 0.0 {
+            STROKE_HIT_TOLERANCE / zoom
+        } else {
+            0.0
+        };
+        let edits = self.annot.edits.borrow();
+        edits.iter().rev().find_map(|edit| match &edit.value {
+            Annotation::Ink(stroke) if stroke.page == page && stroke.contains(point, tolerance) => {
+                Some(edit.id.clone())
+            }
+            Annotation::Shape(shape) if shape.page == page && shape.contains(point, tolerance) => {
+                Some(edit.id.clone())
+            }
+            _ => None,
+        })
+    }
+
     /// Copia de la nota `id`, si esa anotación existe y es una nota de texto.
     pub(crate) fn note(&self, id: &str) -> Option<TextNote> {
         self.annot
@@ -3004,7 +3247,10 @@ impl Viewer {
             .find(|edit| edit.id == id)
             .and_then(|edit| match &edit.value {
                 Annotation::Note(note) => Some(note.clone()),
-                Annotation::Mark(_) | Annotation::Image(_) => None,
+                Annotation::Mark(_)
+                | Annotation::Image(_)
+                | Annotation::Ink(_)
+                | Annotation::Shape(_) => None,
             })
     }
 
@@ -3017,7 +3263,10 @@ impl Viewer {
             .find(|edit| edit.id == id)
             .and_then(|edit| match &edit.value {
                 Annotation::Image(image) => Some(image.clone()),
-                Annotation::Mark(_) | Annotation::Note(_) => None,
+                Annotation::Mark(_)
+                | Annotation::Note(_)
+                | Annotation::Ink(_)
+                | Annotation::Shape(_) => None,
             })
     }
 
@@ -3223,7 +3472,7 @@ impl Viewer {
                 note.at = at;
                 true
             }
-            Annotation::Mark(_) | Annotation::Image(_) => false,
+            Annotation::Mark(_) | Annotation::Image(_) | Annotation::Ink(_) | Annotation::Shape(_) => false,
         }
     }
 
@@ -3351,6 +3600,94 @@ impl Viewer {
         self.annot.image_drag.borrow_mut().take().is_some()
     }
 
+    /// Empieza un trazo con la herramienta de dibujo armada y devuelve si el
+    /// gesto es un dibujo: si lo es, no hay selección de texto.
+    pub(crate) fn stroke_drag_begin(&self, page: usize, x: f64, y: f64) -> bool {
+        let Some(tool) = self.stroke_tool_active() else {
+            return false;
+        };
+        let Some(point) = self.view_to_pdf(page, x, y) else {
+            return false;
+        };
+        // El gesto dibuja: no selecciona texto ni deja una anotación elegida.
+        if self.sel.selection.borrow_mut().take().is_some() {
+            self.sel.selection_rects.borrow_mut().clear();
+        }
+        self.select_annotation(None);
+        *self.annot.stroke_drag.borrow_mut() = Some(StrokeDrag {
+            page,
+            tool,
+            grab: (x, y),
+            points: vec![point],
+            from: point,
+            to: point,
+        });
+        self.queue_page_draw(page);
+        true
+    }
+
+    /// True mientras se está dibujando un trazo.
+    pub(crate) fn stroke_drag_active(&self) -> bool {
+        self.annot.stroke_drag.borrow().is_some()
+    }
+
+    /// Suma un punto al lápiz o mueve la esquina de la forma. El desplazamiento
+    /// llega en píxeles desde el comienzo del arrastre, como en los demás gestos
+    /// de la página, y se pasa a puntos de la página sin suavizar.
+    pub(crate) fn stroke_drag_update(&self, page: usize, offset_x: f64, offset_y: f64) -> bool {
+        let grab = {
+            let drag = self.annot.stroke_drag.borrow();
+            let Some(drag) = drag.as_ref().filter(|drag| drag.page == page) else {
+                return false;
+            };
+            drag.grab
+        };
+        let Some(point) = self.view_to_pdf(page, grab.0 + offset_x, grab.1 + offset_y) else {
+            return false;
+        };
+        {
+            let mut drag = self.annot.stroke_drag.borrow_mut();
+            let Some(drag) = drag.as_mut() else {
+                return false;
+            };
+            match drag.tool.kind {
+                // Un punto repetido no aporta nada al trazo y engorda el /InkList.
+                StrokeKind::Ink => {
+                    if drag.points.last() != Some(&point) {
+                        drag.points.push(point);
+                    }
+                }
+                StrokeKind::Shape(_) => drag.to = point,
+            }
+        }
+        self.queue_page_draw(page);
+        true
+    }
+
+    /// Suelta el trazo en curso: si alcanza, se agrega como una anotación más y
+    /// queda pendiente de guardar. La herramienta se desarma siempre —también la
+    /// del lápiz—, para no encadenar trazos sin querer.
+    pub(crate) fn stroke_drag_end(&self) -> bool {
+        let Some(drag) = self.annot.stroke_drag.borrow_mut().take() else {
+            return false;
+        };
+        self.clear_stroke_tool();
+        self.queue_page_draw(drag.page);
+        if !drag.is_worth_adding() {
+            return true;
+        }
+        let Some(annotation) = drag.draft() else {
+            return true;
+        };
+        self.begin_edit();
+        let id = self.new_id();
+        self.annot.edits.borrow_mut().push(Edit {
+            id,
+            value: annotation,
+        });
+        true
+    }
+
     /// Cambia el texto de la nota `id` con sus tramos, la vuelve a medir y la
     /// redibuja. Un texto en blanco no la borra: una nota sin texto no se puede
     /// leer ni volver a editar.
@@ -3395,6 +3732,7 @@ impl Viewer {
         if self.input.hand_mode.get()
             || self.active_mark_tool().is_some()
             || self.text_tool_active()
+            || self.stroke_tool_active().is_some()
         {
             return;
         }
@@ -3628,10 +3966,17 @@ impl Viewer {
 
     /// Pinta las anotaciones de la página: el subrayado sobre el borde inferior
     /// de cada línea de texto, el resaltado como fondo translúcido, el tachado por
-    /// el medio de cada línea y las notas de texto en negro con su fuente.
+    /// el medio de cada línea, las notas de texto en negro con su fuente, los
+    /// trazos del lápiz y las formas.
     pub(crate) fn draw_annotations(&self, page: usize, context: &cairo::Context) {
         let edits = self.annot.edits.borrow();
-        if edits.iter().all(|edit| edit.value.page() != page) {
+        let drafting = self
+            .annot
+            .stroke_drag
+            .borrow()
+            .as_ref()
+            .is_some_and(|drag| drag.page == page);
+        if !drafting && edits.iter().all(|edit| edit.value.page() != page) {
             return;
         }
         let Some(size) = self.doc.page_sizes.borrow().get(page).copied() else {
@@ -3653,6 +3998,14 @@ impl Viewer {
                 Annotation::Image(image) => {
                     let chosen = selected.as_deref() == Some(edit.id.as_str());
                     self.draw_image(context, image, size, rotation, zoom, chosen);
+                    continue;
+                }
+                Annotation::Ink(stroke) => {
+                    draw_ink(context, stroke, size, rotation, zoom);
+                    continue;
+                }
+                Annotation::Shape(shape) => {
+                    draw_shape(context, shape, size, rotation, zoom);
                     continue;
                 }
             };
@@ -3706,13 +4059,41 @@ impl Viewer {
             }
         }
 
+        // El trazo en curso se pinta igual que los guardados, para que el lápiz y
+        // la forma se vean mientras se arrastra.
+        if let Some(drag) = self
+            .annot
+            .stroke_drag
+            .borrow()
+            .as_ref()
+            .filter(|drag| drag.page == page)
+            && let Some(draft) = drag.draft()
+        {
+            match &draft {
+                Annotation::Ink(stroke) => draw_ink(context, stroke, size, rotation, zoom),
+                Annotation::Shape(shape) => draw_shape(context, shape, size, rotation, zoom),
+                _ => {}
+            }
+        }
+
         // El contorno de la anotación elegida va al final, sobre todo lo demás.
         if let Some(id) = selected.as_deref()
             && let Some(edit) = edits.iter().find(|edit| edit.id == id)
-            && let Annotation::Mark(mark) = &edit.value
-            && mark.page == page
         {
-            draw_mark_selection(context, mark, size, rotation, zoom);
+            match &edit.value {
+                Annotation::Mark(mark) if mark.page == page => {
+                    draw_mark_selection(context, mark, size, rotation, zoom);
+                }
+                Annotation::Ink(stroke) if stroke.page == page => {
+                    if let Some(rect) = stroke.rect() {
+                        draw_bounds_selection(context, rect, size, rotation, zoom);
+                    }
+                }
+                Annotation::Shape(shape) if shape.page == page => {
+                    draw_bounds_selection(context, shape.rect(), size, rotation, zoom);
+                }
+                _ => {}
+            }
         }
     }
 
@@ -3805,6 +4186,10 @@ impl Viewer {
     pub(crate) fn escape_pressed(&self) -> glib::Propagation {
         if self.view.presentation.get() {
             self.toggle_presentation();
+            return glib::Propagation::Stop;
+        }
+        if self.stroke_tool_active().is_some() {
+            self.clear_stroke_tool();
             return glib::Propagation::Stop;
         }
         if let Some(kind) = self.active_mark_tool() {
@@ -4524,6 +4909,12 @@ impl Viewer {
                 viewer.insert_text_note(page, x, y);
                 return;
             }
+            // Con el lápiz o una forma armada el arrastre entero es el trazo, y
+            // va antes que la selección de texto: así dibujar nunca selecciona.
+            if viewer.stroke_tool_active().is_some() {
+                viewer.stroke_drag_begin(page, x, y);
+                return;
+            }
             // Arrastrar desde dentro de una nota la mueve y no selecciona texto.
             // Con una herramienta de marcado armada el arrastre marca igual.
             if viewer.active_mark_tool().is_none() && viewer.note_drag_begin(page, x, y) {
@@ -4550,6 +4941,8 @@ impl Viewer {
                     .current_event_state()
                     .contains(gdk::ModifierType::SHIFT_MASK);
                 viewer.image_drag_update(offset_x, offset_y, keep_aspect);
+            } else if viewer.stroke_drag_active() {
+                viewer.stroke_drag_update(page, offset_x, offset_y);
             } else {
                 viewer.update_selection(page, offset_x, offset_y);
             }
@@ -4560,8 +4953,12 @@ impl Viewer {
             let Some(viewer) = weak.upgrade() else {
                 return;
             };
-            // Un arrastre de nota o de imagen no termina en una selección de texto.
-            if !viewer.note_drag_end() && !viewer.image_drag_end() {
+            // Un arrastre de nota, de imagen o de dibujo no termina en una
+            // selección de texto.
+            if !viewer.note_drag_end()
+                && !viewer.image_drag_end()
+                && !viewer.stroke_drag_end()
+            {
                 viewer.finish_selection();
             }
         });
@@ -4585,12 +4982,13 @@ impl Viewer {
             }
             // La nota gana sobre lo demás por ser lo más chico y lo que se edita;
             // después la imagen, que tapa lo que tenga debajo, y al final el
-            // subrayado o el resaltado.
+            // marcado y el trazo.
             let hit = viewer
                 .note_at(page, x, y)
                 .map(|id| (id, HitKind::Note))
                 .or_else(|| viewer.image_at(page, x, y).map(|id| (id, HitKind::Image)))
-                .or_else(|| viewer.mark_at(page, x, y).map(|id| (id, HitKind::Mark)));
+                .or_else(|| viewer.mark_at(page, x, y).map(|id| (id, HitKind::Mark)))
+                .or_else(|| viewer.stroke_at(page, x, y).map(|id| (id, HitKind::Stroke)));
             match (gesture.current_button(), hit) {
                 (gdk::BUTTON_SECONDARY, Some((id, _))) => {
                     viewer.release_text_focus();
@@ -6767,11 +7165,22 @@ fn draw_mark_selection(
     rotation: i32,
     zoom: f64,
 ) {
-    let Some((x1, y1, x2, y2)) = mark.bounds() else {
-        return;
-    };
-    let (px1, py1) = forward_rotation((x1, y1), page, rotation);
-    let (px2, py2) = forward_rotation((x2, y2), page, rotation);
+    if let Some(rect) = mark.bounds() {
+        draw_bounds_selection(context, rect, page, rotation, zoom);
+    }
+}
+
+/// Contorno punteado de una caja en el espacio de la página: es lo que marca que
+/// una anotación está elegida y responde a `Supr` y al menú.
+fn draw_bounds_selection(
+    context: &cairo::Context,
+    rect: (f64, f64, f64, f64),
+    page: (f64, f64),
+    rotation: i32,
+    zoom: f64,
+) {
+    let (px1, py1) = forward_rotation((rect.0, rect.1), page, rotation);
+    let (px2, py2) = forward_rotation((rect.2, rect.3), page, rotation);
     let left = px1.min(px2) * zoom;
     let top = py1.min(py2) * zoom;
     let width = ((px1 - px2).abs() * zoom).max(1.0);
@@ -6785,6 +7194,109 @@ fn draw_mark_selection(
     context.rectangle(left, top, width, height);
     let _ = context.stroke();
     let _ = context.restore();
+}
+
+/// Prepara el contexto para pintar un trazo o una forma: color opaco, punta y
+/// unión redondeadas y el grosor escalado por el zoom, como el resto de la capa.
+fn prepare_stroke(context: &cairo::Context, color: [f64; 3], width: f64, zoom: f64) {
+    context.set_line_cap(cairo::LineCap::Round);
+    context.set_line_join(cairo::LineJoin::Round);
+    context.set_line_width((width * zoom).max(1.0));
+    context.set_source_rgba(color[0], color[1], color[2], 1.0);
+}
+
+/// Pinta un trazo del lápiz: cada camino con sus puntos en orden, pasados por la
+/// rotación de la vista y escalados por el zoom. Sin suavizar: los puntos son los
+/// del arrastre.
+fn draw_ink(
+    context: &cairo::Context,
+    stroke: &InkStroke,
+    page: (f64, f64),
+    rotation: i32,
+    zoom: f64,
+) {
+    prepare_stroke(context, stroke.color, stroke.width, zoom);
+    for path in &stroke.paths {
+        let mut first = true;
+        for point in path {
+            let (x, y) = forward_rotation(*point, page, rotation);
+            if first {
+                context.move_to(x * zoom, y * zoom);
+                first = false;
+            } else {
+                context.line_to(x * zoom, y * zoom);
+            }
+        }
+    }
+    let _ = context.stroke();
+}
+
+/// Pinta una forma: el rectángulo y la elipse se trazan sobre su caja, la línea
+/// es un segmento recto y la flecha suma una punta triangular rellena del mismo
+/// color en su segundo extremo.
+fn draw_shape(
+    context: &cairo::Context,
+    shape: &Shape,
+    page: (f64, f64),
+    rotation: i32,
+    zoom: f64,
+) {
+    let from = forward_rotation(shape.from, page, rotation);
+    let to = forward_rotation(shape.to, page, rotation);
+    let (x1, y1) = (from.0 * zoom, from.1 * zoom);
+    let (x2, y2) = (to.0 * zoom, to.1 * zoom);
+    prepare_stroke(context, shape.color, shape.width, zoom);
+
+    match shape.kind {
+        ShapeKind::Rectangle => {
+            context.rectangle(
+                x1.min(x2),
+                y1.min(y2),
+                (x1 - x2).abs(),
+                (y1 - y2).abs(),
+            );
+            let _ = context.stroke();
+        }
+        ShapeKind::Ellipse => {
+            // La elipse se inscribe en la caja con una escala temporal: el
+            // círculo unitario se estira a los dos radios y el trazo se hace
+            // después, con el contexto ya restablecido, para que el grosor no se
+            // deforme con la escala.
+            let (width, height) = ((x1 - x2).abs(), (y1 - y2).abs());
+            let _ = context.save();
+            context.translate(x1.min(x2) + width / 2.0, y1.min(y2) + height / 2.0);
+            context.scale(
+                (width / 2.0).max(f64::MIN_POSITIVE),
+                (height / 2.0).max(f64::MIN_POSITIVE),
+            );
+            context.arc(0.0, 0.0, 1.0, 0.0, std::f64::consts::TAU);
+            let _ = context.restore();
+            let _ = context.stroke();
+        }
+        ShapeKind::Line | ShapeKind::Arrow => {
+            context.move_to(x1, y1);
+            context.line_to(x2, y2);
+            let _ = context.stroke();
+
+            if shape.kind == ShapeKind::Arrow {
+                let (dx, dy) = (x2 - x1, y2 - y1);
+                let length = (dx * dx + dy * dy).sqrt();
+                if length > f64::EPSILON {
+                    // La punta crece con el grosor, así una flecha gruesa no queda
+                    // con una cabeza diminuta.
+                    let (ux, uy) = (dx / length, dy / length);
+                    let size = (shape.width * zoom * 4.0).max(6.0);
+                    let half = size * 0.4;
+                    let (bx, by) = (x2 - ux * size, y2 - uy * size);
+                    context.move_to(x2, y2);
+                    context.line_to(bx - uy * half, by + ux * half);
+                    context.line_to(bx + uy * half, by - ux * half);
+                    context.close_path();
+                    let _ = context.fill();
+                }
+            }
+        }
+    }
 }
 
 /// Pinta la superficie de una imagen dentro de su caja.
@@ -7181,6 +7693,104 @@ fn build_mark_tool(spec: &MarkToolSpec) -> MarkToolUi {
         .build();
 
     MarkToolUi { button, dialog }
+}
+
+/// Herramientas del popover de dibujo, en el orden en que se ofrecen.
+pub(crate) const STROKE_KINDS: [StrokeKind; 5] = [
+    StrokeKind::Ink,
+    StrokeKind::Shape(ShapeKind::Rectangle),
+    StrokeKind::Shape(ShapeKind::Ellipse),
+    StrokeKind::Shape(ShapeKind::Line),
+    StrokeKind::Shape(ShapeKind::Arrow),
+];
+
+/// Nombre con el que se ofrece cada herramienta de dibujo.
+pub(crate) fn stroke_label(kind: StrokeKind) -> &'static str {
+    match kind {
+        StrokeKind::Ink => "Lápiz",
+        StrokeKind::Shape(ShapeKind::Rectangle) => "Rectángulo",
+        StrokeKind::Shape(ShapeKind::Ellipse) => "Elipse",
+        StrokeKind::Shape(ShapeKind::Line) => "Línea",
+        StrokeKind::Shape(ShapeKind::Arrow) => "Flecha",
+    }
+}
+
+/// Botón de la barra y popover de dibujo: las cinco herramientas, el grosor
+/// libre en puntos y el selector de color. Devuelve las piezas que el visor
+/// tiene que conectar y recordar.
+fn build_stroke_menu() -> (
+    gtk::MenuButton,
+    [gtk::Button; 5],
+    gtk::SpinButton,
+    gtk::ColorDialogButton,
+) {
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    content.set_margin_top(8);
+    content.set_margin_bottom(8);
+    content.set_margin_start(8);
+    content.set_margin_end(8);
+
+    let tools = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    let mut buttons: Vec<gtk::Button> = Vec::with_capacity(STROKE_KINDS.len());
+    for kind in STROKE_KINDS {
+        let label = stroke_label(kind);
+        let button = gtk::Button::with_label(label);
+        button.add_css_class("flat");
+        button.set_tooltip_text(Some(label));
+        accessible_label(&button, label);
+        tools.append(&button);
+        buttons.push(button);
+    }
+    let buttons: [gtk::Button; 5] = buttons
+        .try_into()
+        .expect("el popover ofrece las cinco herramientas de dibujo");
+
+    // Grosor libre en puntos: de 0,5 a 20 en pasos de medio punto.
+    let width_label = gtk::Label::new(Some("Grosor"));
+    width_label.set_xalign(0.0);
+    let width = gtk::SpinButton::with_range(STROKE_MIN_WIDTH, STROKE_MAX_WIDTH, 0.5);
+    width.set_digits(1);
+    width.set_value(clamp_stroke_width(STROKE_WIDTH));
+    width.set_tooltip_text(Some("Grosor en puntos"));
+    accessible_label(&width, "Grosor del trazo en puntos");
+
+    let color_dialog = gtk::ColorDialog::builder()
+        .title("Color del trazo")
+        .with_alpha(false)
+        .modal(true)
+        .build();
+    let color = gtk::ColorDialogButton::builder()
+        .dialog(&color_dialog)
+        .rgba(&gdk::RGBA::new(
+            STROKE_COLOR.0 as f32,
+            STROKE_COLOR.1 as f32,
+            STROKE_COLOR.2 as f32,
+            1.0,
+        ))
+        .build();
+    color.set_tooltip_text(Some("Color del trazo"));
+    accessible_label(&color, "Color del trazo");
+
+    let settings = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    settings.append(&width_label);
+    settings.append(&width);
+    settings.append(&color);
+
+    content.append(&tools);
+    content.append(&settings);
+
+    let popover = gtk::Popover::new();
+    popover.set_child(Some(&content));
+
+    let button = gtk::MenuButton::builder()
+        .icon_name("applications-graphics-symbolic")
+        .tooltip_text("Dibujar y formas")
+        .always_show_arrow(false)
+        .popover(&popover)
+        .build();
+    accessible_label(&button, "Dibujar y formas");
+
+    (button, buttons, width, color)
 }
 
 fn toolbar_gap(width: i32) -> gtk::Box {
@@ -7605,6 +8215,136 @@ mod tests {
         assert_eq!(
             cursor_in_note_band(rect, (71.0, 60.0), 5.0, 2.0),
             Some("move")
+        );
+    }
+
+    /// Pinta un trazo o una forma sobre papel blanco a escala 1 y devuelve los
+    /// píxeles como `[r, g, b]`.
+    fn stroke_paint(annotation: &Annotation) -> (usize, Vec<[u8; 3]>) {
+        let side = 200usize;
+        let mut surface =
+            cairo::ImageSurface::create(cairo::Format::ARgb32, side as i32, side as i32)
+                .expect("crear la superficie");
+        {
+            let context = cairo::Context::new(&surface).expect("contexto");
+            context.set_source_rgb(1.0, 1.0, 1.0);
+            context.paint().expect("fondo blanco");
+            match annotation {
+                Annotation::Ink(stroke) => draw_ink(&context, stroke, (200.0, 200.0), 0, 1.0),
+                Annotation::Shape(shape) => draw_shape(&context, shape, (200.0, 200.0), 0, 1.0),
+                other => panic!("la prueba solo pinta trazos y formas: {other:?}"),
+            }
+        }
+        surface.flush();
+
+        let stride = usize::try_from(surface.stride()).expect("stride");
+        let data = surface.data().expect("píxeles");
+        let mut pixels = Vec::with_capacity(side * side);
+        for row in 0..side {
+            for column in 0..side {
+                let offset = row * stride + column * 4;
+                pixels.push([data[offset + 2], data[offset + 1], data[offset]]);
+            }
+        }
+        (side, pixels)
+    }
+
+    #[test]
+    fn a_stroke_paints_its_trace_and_leaves_the_inside_of_a_polygon_empty() {
+        // Lápiz: la línea pasa por sus puntos, de extremo a extremo.
+        let ink = Annotation::Ink(InkStroke::new(
+            0,
+            vec![vec![(20.0, 100.0), (180.0, 100.0)]],
+            [1.0, 0.0, 0.0],
+            2.0,
+        ));
+        let (side, pixels) = stroke_paint(&ink);
+        let line = pixel_box(side, &pixels, is_red).expect("el trazo se pinta");
+        assert!(
+            line.0 <= 22 && line.2 >= 178,
+            "el trazo recorre todos sus puntos: {line:?}"
+        );
+        assert!(
+            (line.1 as f64 - 100.0).abs() <= 2.0 && (line.3 as f64 - 100.0).abs() <= 2.0,
+            "el trazo pasa por la altura de sus puntos: {line:?}"
+        );
+
+        // Rectángulo: sus cuatro bordes, con el interior vacío.
+        let rectangle = Annotation::Shape(Shape::new(
+            0,
+            ShapeKind::Rectangle,
+            (20.0, 20.0),
+            (80.0, 60.0),
+            [1.0, 0.0, 0.0],
+            2.0,
+        ));
+        let (side, pixels) = stroke_paint(&rectangle);
+        let boxed = pixel_box(side, &pixels, is_red).expect("el rectángulo se pinta");
+        assert!(
+            boxed.0 <= 22 && boxed.2 >= 78 && boxed.1 <= 22 && boxed.3 >= 58,
+            "la caja del rectángulo va de esquina a esquina: {boxed:?}"
+        );
+        assert!(
+            !is_red(pixels[40 * side + 50]),
+            "el interior del rectángulo queda vacío"
+        );
+
+        // Elipse: el borde pasa por los extremos de los dos ejes y el centro
+        // queda vacío, que es lo que la distingue de un rectángulo.
+        let ellipse = Annotation::Shape(Shape::new(
+            0,
+            ShapeKind::Ellipse,
+            (20.0, 20.0),
+            (80.0, 60.0),
+            [1.0, 0.0, 0.0],
+            2.0,
+        ));
+        let (side, pixels) = stroke_paint(&ellipse);
+        assert!(
+            is_red(pixels[40 * side + 20]) && is_red(pixels[20 * side + 50]),
+            "la elipse toca los extremos de sus dos ejes"
+        );
+        assert!(
+            !is_red(pixels[40 * side + 50]),
+            "el centro de la elipse queda vacío"
+        );
+
+        // Línea: el segmento entre los extremos y nada fuera de él.
+        let line = Annotation::Shape(Shape::new(
+            0,
+            ShapeKind::Line,
+            (20.0, 20.0),
+            (80.0, 60.0),
+            [1.0, 0.0, 0.0],
+            2.0,
+        ));
+        let (side, pixels) = stroke_paint(&line);
+        assert!(
+            is_red(pixels[40 * side + 50]),
+            "el punto medio del segmento se pinta"
+        );
+        assert!(
+            !is_red(pixels[40 * side + 20]),
+            "fuera del segmento no hay nada"
+        );
+
+        // Flecha: además del segmento, una punta triangular en el segundo extremo.
+        let arrow = Annotation::Shape(Shape::new(
+            0,
+            ShapeKind::Arrow,
+            (20.0, 20.0),
+            (80.0, 20.0),
+            [1.0, 0.0, 0.0],
+            4.0,
+        ));
+        let (side, pixels) = stroke_paint(&arrow);
+        let widest = (60..=80)
+            .map(|column| (0..side).filter(|row| is_red(pixels[row * side + column])).count())
+            .max()
+            .unwrap_or(0);
+        assert!(
+            widest > 8,
+            "la punta es más ancha que el trazo de la flecha: {widest} px"
         );
     }
 

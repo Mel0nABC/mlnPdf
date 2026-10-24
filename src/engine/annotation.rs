@@ -157,6 +157,274 @@ impl TextMark {
     }
 }
 
+/// Grosor mínimo de un trazo, en puntos: menos que esto no se ve ni se puede
+/// volver a agarrar con el ratón.
+pub const STROKE_MIN_WIDTH: f64 = 0.5;
+
+/// Grosor máximo de un trazo, en puntos. Lápiz y formas comparten el rango.
+pub const STROKE_MAX_WIDTH: f64 = 20.0;
+
+/// Recorta un grosor al rango que admiten el lápiz y las formas. Un valor que no
+/// es un número no puede llegar al PDF: cae en el mínimo.
+pub fn clamp_stroke_width(width: f64) -> f64 {
+    if width.is_finite() {
+        width.clamp(STROKE_MIN_WIDTH, STROKE_MAX_WIDTH)
+    } else {
+        STROKE_MIN_WIDTH
+    }
+}
+
+/// Distancia de un punto al segmento `start`-`end`, en puntos. Un segmento de
+/// largo cero se mide como el punto que es.
+fn distance_to_segment(point: (f64, f64), start: (f64, f64), end: (f64, f64)) -> f64 {
+    let (px, py) = point;
+    let (ax, ay) = start;
+    let (dx, dy) = (end.0 - ax, end.1 - ay);
+    let length_squared = dx * dx + dy * dy;
+    let (cx, cy) = if length_squared <= f64::EPSILON {
+        (ax, ay)
+    } else {
+        let t = (((px - ax) * dx + (py - ay) * dy) / length_squared).clamp(0.0, 1.0);
+        (ax + t * dx, ay + t * dy)
+    };
+    ((px - cx).powi(2) + (py - cy).powi(2)).sqrt()
+}
+
+/// Caja `(x1, y1, x2, y2)` que encierra los puntos dados, con el mínimo y el
+/// máximo en cada eje. `None` cuando no hay ningún punto.
+fn points_rect<'a>(points: impl Iterator<Item = &'a (f64, f64)>) -> Option<Rect> {
+    let mut bounds: Option<Rect> = None;
+    for (x, y) in points {
+        let (x, y) = (*x, *y);
+        bounds = Some(match bounds {
+            None => (x, y, x, y),
+            Some((x1, y1, x2, y2)) => (x1.min(x), y1.min(y), x2.max(x), y2.max(y)),
+        });
+    }
+    bounds
+}
+
+/// Puntos con los que se dibuja —y se agarra— el borde de una elipse: los
+/// vértices de un polígono inscrito. La elipse queda inscripta en la caja de
+/// `from`/`to`, con el mismo espacio de la página.
+const ELLIPSE_STEPS: usize = 72;
+
+fn ellipse_outline(from: (f64, f64), to: (f64, f64)) -> Vec<(f64, f64)> {
+    let center = ((from.0 + to.0) / 2.0, (from.1 + to.1) / 2.0);
+    let radius = ((to.0 - from.0).abs() / 2.0, (to.1 - from.1).abs() / 2.0);
+    (0..ELLIPSE_STEPS)
+        .map(|step| {
+            let angle = std::f64::consts::TAU * step as f64 / ELLIPSE_STEPS as f64;
+            (
+                center.0 + radius.0 * angle.cos(),
+                center.1 + radius.1 * angle.sin(),
+            )
+        })
+        .collect()
+}
+
+/// Un trazo a mano alzada: los puntos que dejó el arrastre, sin suavizar, con su
+/// color y su grosor. Un trazo puede tener varios caminos (levantar el lápiz y
+/// volver a apoyarlo), y cada camino conserva su orden.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InkStroke {
+    /// Página, empezando en cero.
+    pub page: usize,
+    /// Caminos del trazo, en el espacio de la página (origen arriba).
+    pub paths: Vec<Vec<(f64, f64)>>,
+    /// Color RGB con componentes en `0..=1`, como los toma `/C`.
+    pub color: [f64; 3],
+    /// Grosor en puntos, recortado a `STROKE_MIN_WIDTH..=STROKE_MAX_WIDTH`.
+    pub width: f64,
+}
+
+impl InkStroke {
+    /// Trazo con su página, sus caminos, su color y su grosor. El color se
+    /// recorta a `0..=1` y el grosor al rango del lápiz, que es lo que admite el
+    /// PDF.
+    pub fn new(page: usize, paths: Vec<Vec<(f64, f64)>>, color: [f64; 3], width: f64) -> Self {
+        Self {
+            page,
+            paths,
+            color: color.map(|component| component.clamp(0.0, 1.0)),
+            width: clamp_stroke_width(width),
+        }
+    }
+
+    /// True cuando no hay ningún punto que dibujar.
+    pub fn is_empty(&self) -> bool {
+        self.paths.iter().all(Vec::is_empty)
+    }
+
+    /// Caja que encierra todos los puntos, en el espacio de la página.
+    pub fn rect(&self) -> Option<Rect> {
+        points_rect(self.paths.iter().flatten())
+    }
+
+    /// True cuando `point` está a menos de `tolerance + width / 2` de algún
+    /// segmento del trazo, que es lo que se agarra con el ratón.
+    pub fn contains(&self, point: (f64, f64), tolerance: f64) -> bool {
+        let limit = tolerance + self.width / 2.0;
+        self.paths.iter().any(|path| match path.len() {
+            0 => false,
+            1 => distance_to_segment(point, path[0], path[0]) <= limit,
+            _ => path
+                .windows(2)
+                .any(|pair| distance_to_segment(point, pair[0], pair[1]) <= limit),
+        })
+    }
+
+    /// Mueve el trazo `delta` puntos, en el espacio de la página. El grosor y el
+    /// color no cambian.
+    // Mover un trazo a mano todavía no tiene gesto propio: la API existe para las
+    // anotaciones que lo reutilizan y para las pruebas de geometría.
+    #[allow(dead_code)]
+    pub fn moved(&self, delta: (f64, f64)) -> Self {
+        let mut moved = self.clone();
+        for point in moved.paths.iter_mut().flatten() {
+            *point = (point.0 + delta.0, point.1 + delta.1);
+        }
+        moved
+    }
+}
+
+/// Forma geométrica que se arrastra sobre la página.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShapeKind {
+    /// Caja de cuatro lados rectos.
+    Rectangle,
+    /// Elipse inscripta en la caja de las dos esquinas.
+    Ellipse,
+    /// Segmento recto entre los dos extremos.
+    Line,
+    /// Segmento recto con punta de flecha en el segundo extremo.
+    Arrow,
+}
+
+impl ShapeKind {
+    /// Nombre del `/Subtype` de la anotación del PDF. La línea y la flecha
+    /// comparten `/Line`: la punta la decide `/LE`.
+    pub fn subtype(self) -> &'static str {
+        match self {
+            Self::Rectangle => "Square",
+            Self::Ellipse => "Circle",
+            Self::Line | Self::Arrow => "Line",
+        }
+    }
+
+    /// Nombre del final de línea que se escribe en `/LE`.
+    pub fn line_end(self) -> &'static str {
+        match self {
+            Self::Arrow => "OpenArrow",
+            _ => "None",
+        }
+    }
+}
+
+/// Una forma dibujada sobre la página. Para la línea y la flecha, `from` y `to`
+/// son los extremos; para el rectángulo y la elipse, dos esquinas opuestas.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Shape {
+    pub page: usize,
+    pub kind: ShapeKind,
+    pub from: (f64, f64),
+    pub to: (f64, f64),
+    /// Color RGB con componentes en `0..=1`, como los toma `/C`.
+    pub color: [f64; 3],
+    /// Grosor en puntos, recortado a `STROKE_MIN_WIDTH..=STROKE_MAX_WIDTH`.
+    pub width: f64,
+}
+
+impl Shape {
+    /// Forma con su página, su tipo, sus dos extremos, su color y su grosor. El
+    /// color se recorta a `0..=1` y el grosor al rango de las formas.
+    pub fn new(
+        page: usize,
+        kind: ShapeKind,
+        from: (f64, f64),
+        to: (f64, f64),
+        color: [f64; 3],
+        width: f64,
+    ) -> Self {
+        Self {
+            page,
+            kind,
+            from,
+            to,
+            color: color.map(|component| component.clamp(0.0, 1.0)),
+            width: clamp_stroke_width(width),
+        }
+    }
+
+    /// Caja de la forma: las dos esquinas opuestas, con el mínimo y el máximo en
+    /// cada eje. Para la línea y la flecha es la caja de sus extremos.
+    pub fn rect(&self) -> Rect {
+        (
+            self.from.0.min(self.to.0),
+            self.from.1.min(self.to.1),
+            self.from.0.max(self.to.0),
+            self.from.1.max(self.to.1),
+        )
+    }
+
+    /// True cuando la forma no tiene nada que pintar: un rectángulo o una elipse
+    /// sin uno de sus lados, o una línea sin largo.
+    pub fn is_empty(&self) -> bool {
+        let rect = self.rect();
+        match self.kind {
+            ShapeKind::Rectangle | ShapeKind::Ellipse => {
+                rect.2 <= rect.0 || rect.3 <= rect.1
+            }
+            ShapeKind::Line | ShapeKind::Arrow => {
+                rect.2 <= rect.0 && rect.3 <= rect.1
+            }
+        }
+    }
+
+    /// True cuando `point` está a menos de `tolerance + width / 2` del trazado:
+    /// el contorno del rectángulo, el borde de la elipse o el segmento de la
+    /// línea y de la flecha.
+    pub fn contains(&self, point: (f64, f64), tolerance: f64) -> bool {
+        if self.is_empty() {
+            return false;
+        }
+        let limit = tolerance + self.width / 2.0;
+        let (x1, y1, x2, y2) = self.rect();
+        match self.kind {
+            ShapeKind::Rectangle => [
+                ((x1, y1), (x2, y1)),
+                ((x2, y1), (x2, y2)),
+                ((x2, y2), (x1, y2)),
+                ((x1, y2), (x1, y1)),
+            ]
+            .into_iter()
+            .any(|(start, end)| distance_to_segment(point, start, end) <= limit),
+            ShapeKind::Ellipse => {
+                let outline = ellipse_outline(self.from, self.to);
+                outline
+                    .iter()
+                    .zip(outline.iter().cycle().skip(1))
+                    .any(|(start, end)| distance_to_segment(point, *start, *end) <= limit)
+            }
+            ShapeKind::Line | ShapeKind::Arrow => {
+                distance_to_segment(point, self.from, self.to) <= limit
+            }
+        }
+    }
+
+    /// Mueve la forma `delta` puntos, en el espacio de la página. El grosor y el
+    /// color no cambian.
+    // Mover una forma a mano todavía no tiene gesto propio: la API existe para las
+    // anotaciones que lo reutilizan y para las pruebas de geometría.
+    #[allow(dead_code)]
+    pub fn moved(&self, delta: (f64, f64)) -> Self {
+        let mut moved = self.clone();
+        moved.from = (self.from.0 + delta.0, self.from.1 + delta.1);
+        moved.to = (self.to.0 + delta.0, self.to.1 + delta.1);
+        moved
+    }
+}
+
 /// Fuente base del PDF para una nota de texto. Las familias arbitrarias del
 /// sistema no se pueden usar sin incrustar el archivo de fuente, así que se
 /// aproximan a una de las 14 estándar.
@@ -581,6 +849,10 @@ pub enum Annotation {
     Mark(TextMark),
     Note(TextNote),
     Image(ImageNote),
+    /// Dibujo a mano alzada: un trazo del lápiz.
+    Ink(InkStroke),
+    /// Forma geométrica: rectángulo, elipse, línea o flecha.
+    Shape(Shape),
 }
 
 impl Annotation {
@@ -590,16 +862,21 @@ impl Annotation {
             Self::Mark(mark) => mark.page,
             Self::Note(note) => note.page,
             Self::Image(image) => image.page,
+            Self::Ink(stroke) => stroke.page,
+            Self::Shape(shape) => shape.page,
         }
     }
 
     /// True cuando no hay nada que escribir: una nota sin texto, un marcado
-    /// sin rectángulos o una imagen sin caja.
+    /// sin rectángulos, una imagen sin caja, un trazo sin puntos o una forma
+    /// sin lados.
     pub fn is_empty(&self) -> bool {
         match self {
             Self::Mark(mark) => mark.is_empty(),
             Self::Note(note) => note.text().trim().is_empty(),
             Self::Image(image) => image.width <= 0.0 || image.height <= 0.0,
+            Self::Ink(stroke) => stroke.is_empty(),
+            Self::Shape(shape) => shape.is_empty(),
         }
     }
 }
@@ -716,7 +993,7 @@ pub fn bounds_rect(quads: &[[f64; 8]]) -> Rect {
 
 /// Pasa un punto medido en pantalla (origen arriba, con la rotación de la
 /// página ya aplicada) al espacio de usuario del archivo (origen abajo).
-fn user_point(point: (f64, f64), page: PageBox) -> (f64, f64) {
+pub fn user_point(point: (f64, f64), page: PageBox) -> (f64, f64) {
     let (x, y) = point;
     let (width, height) = (page.width, page.height);
 
@@ -1604,5 +1881,228 @@ mod tests {
         let (parsed, color) = parse_da("/TiRo 8.0 Tf").expect("la fuente alcanza");
         assert_eq!(parsed.base_font(), BaseFont::Times);
         assert_eq!(color, NOTE_COLOR);
+    }
+
+    /// Trazo de lápiz con un solo camino, para las pruebas de geometría.
+    fn ink(points: &[(f64, f64)]) -> InkStroke {
+        InkStroke::new(0, vec![points.to_vec()], [1.0, 0.0, 0.0], 2.0)
+    }
+
+    #[test]
+    fn an_ink_stroke_box_covers_every_point_of_every_path() {
+        let stroke = InkStroke::new(
+            0,
+            vec![
+                vec![(10.0, 20.0), (30.0, 50.0)],
+                vec![(40.0, 15.0), (60.0, 25.0)],
+            ],
+            [0.0, 0.0, 1.0],
+            3.0,
+        );
+        assert_eq!(
+            stroke.rect(),
+            Some((10.0, 15.0, 60.0, 50.0)),
+            "la caja encierra todos los puntos de todos los trazos"
+        );
+
+        let empty = InkStroke::new(0, Vec::new(), [0.0, 0.0, 0.0], 1.0);
+        assert_eq!(empty.rect(), None, "un trazo sin puntos no tiene caja");
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn an_ink_stroke_is_hit_near_any_of_its_segments() {
+        let stroke = InkStroke::new(
+            0,
+            vec![
+                vec![(10.0, 10.0), (50.0, 10.0)],
+                vec![(10.0, 40.0), (50.0, 40.0)],
+            ],
+            [0.0, 0.0, 0.0],
+            4.0,
+        );
+
+        assert!(stroke.contains((30.0, 10.0), 0.5), "justo sobre el trazo");
+        assert!(
+            stroke.contains((30.0, 12.0), 0.5),
+            "hasta tolerancia + grosor/2 (0.5 + 2)"
+        );
+        assert!(
+            !stroke.contains((30.0, 13.0), 0.5),
+            "más lejos que la tolerancia más la mitad del grosor"
+        );
+        assert!(
+            stroke.contains((10.0, 40.0), 0.5),
+            "el segundo trazo también se agarra"
+        );
+        assert!(
+            !stroke.contains((30.0, 25.0), 0.5),
+            "entre los dos trazos no hay tinta"
+        );
+    }
+
+    #[test]
+    fn every_shape_is_hit_near_its_trace_and_not_inside() {
+        let rectangle = Shape::new(
+            0,
+            ShapeKind::Rectangle,
+            (10.0, 10.0),
+            (50.0, 30.0),
+            [0.0, 0.0, 0.0],
+            2.0,
+        );
+        assert_eq!(rectangle.rect(), (10.0, 10.0, 50.0, 30.0));
+        assert!(rectangle.contains((10.0, 20.0), 0.5), "sobre el lado izquierdo");
+        assert!(rectangle.contains((30.0, 30.0), 0.5), "sobre el lado inferior");
+        assert!(
+            !rectangle.contains((30.0, 20.0), 0.5),
+            "el interior del rectángulo no es su trazado"
+        );
+
+        let ellipse = Shape::new(
+            0,
+            ShapeKind::Ellipse,
+            (10.0, 10.0),
+            (50.0, 30.0),
+            [0.0, 0.0, 0.0],
+            2.0,
+        );
+        assert!(
+            ellipse.contains((50.0, 20.0), 0.5),
+            "el extremo del eje mayor está sobre el borde"
+        );
+        assert!(
+            ellipse.contains((30.0, 10.0), 0.5),
+            "el extremo del eje menor también"
+        );
+        assert!(
+            !ellipse.contains((30.0, 20.0), 0.5),
+            "el centro queda lejos del borde"
+        );
+        assert!(
+            !ellipse.contains((10.0, 10.0), 0.5),
+            "la esquina de la caja queda fuera de la elipse"
+        );
+
+        for kind in [ShapeKind::Line, ShapeKind::Arrow] {
+            let shape = Shape::new(0, kind, (10.0, 40.0), (50.0, 20.0), [0.0, 0.0, 0.0], 2.0);
+            assert!(
+                shape.contains((30.0, 30.0), 0.5),
+                "{kind:?}: el punto medio del segmento se agarra"
+            );
+            assert!(
+                !shape.contains((30.0, 10.0), 0.5),
+                "{kind:?}: lejos del segmento no hay nada"
+            );
+        }
+    }
+
+    #[test]
+    fn moving_a_stroke_only_moves_its_geometry() {
+        let stroke = ink(&[(10.0, 10.0), (40.0, 30.0)]);
+        let moved = stroke.moved((5.0, -3.0));
+        assert_eq!(moved.rect(), Some((15.0, 7.0, 45.0, 27.0)));
+        assert_eq!(moved.width, stroke.width, "mover no toca el grosor");
+        assert_eq!(moved.color, stroke.color, "ni el color");
+        assert_eq!(moved.page, stroke.page);
+
+        for kind in [
+            ShapeKind::Rectangle,
+            ShapeKind::Ellipse,
+            ShapeKind::Line,
+            ShapeKind::Arrow,
+        ] {
+            let shape = Shape::new(2, kind, (10.0, 10.0), (50.0, 30.0), [0.25, 0.5, 0.75], 3.5);
+            let moved = shape.moved((4.0, 6.0));
+            assert_eq!(moved.from, (14.0, 16.0), "{kind:?}");
+            assert_eq!(moved.to, (54.0, 36.0), "{kind:?}");
+            assert_eq!(
+                (moved.width, moved.color),
+                (shape.width, shape.color),
+                "{kind:?}: mover no toca el grosor ni el color"
+            );
+            assert_eq!(moved.page, 2, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn a_stroke_width_is_clamped_to_the_allowed_range() {
+        assert_eq!(clamp_stroke_width(0.1), STROKE_MIN_WIDTH);
+        assert_eq!(clamp_stroke_width(50.0), STROKE_MAX_WIDTH);
+        assert_eq!(clamp_stroke_width(3.5), 3.5);
+        assert_eq!(
+            clamp_stroke_width(f64::NAN),
+            STROKE_MIN_WIDTH,
+            "un grosor inválido no puede llegar al PDF"
+        );
+        assert_eq!(
+            InkStroke::new(0, vec![vec![(0.0, 0.0), (1.0, 1.0)]], [0.0, 0.0, 0.0], 0.0).width,
+            STROKE_MIN_WIDTH,
+            "un trazo nuevo recorta su grosor"
+        );
+        assert_eq!(
+            Shape::new(0, ShapeKind::Line, (0.0, 0.0), (1.0, 1.0), [0.0, 0.0, 0.0], 99.0).width,
+            STROKE_MAX_WIDTH,
+            "una forma nueva también"
+        );
+        assert_eq!(
+            InkStroke::new(0, Vec::new(), [-0.5, 0.5, 2.0], 1.0).color,
+            [0.0, 0.5, 1.0],
+            "el color se recorta a 0..=1, como pide /C"
+        );
+    }
+
+    #[test]
+    fn the_stroke_annotations_report_their_page_and_their_emptiness() {
+        let stroke = Annotation::Ink(ink(&[(10.0, 10.0), (20.0, 20.0)]));
+        assert_eq!(stroke.page(), 0);
+        assert!(!stroke.is_empty());
+
+        let without_points = Annotation::Ink(InkStroke::new(1, vec![Vec::new()], [0.0, 0.0, 0.0], 1.0));
+        assert_eq!(without_points.page(), 1);
+        assert!(
+            without_points.is_empty(),
+            "un trazo sin puntos no se escribe"
+        );
+
+        let line = Annotation::Shape(Shape::new(
+            0,
+            ShapeKind::Line,
+            (10.0, 10.0),
+            (40.0, 10.0),
+            [0.0, 0.0, 0.0],
+            1.0,
+        ));
+        assert!(
+            !line.is_empty(),
+            "una línea horizontal es válida aunque no tenga alto"
+        );
+
+        let flat_box = Annotation::Shape(Shape::new(
+            1,
+            ShapeKind::Rectangle,
+            (10.0, 10.0),
+            (10.0, 30.0),
+            [0.0, 0.0, 0.0],
+            1.0,
+        ));
+        assert_eq!(flat_box.page(), 1);
+        assert!(
+            flat_box.is_empty(),
+            "un rectángulo sin ancho no tiene nada que pintar"
+        );
+
+        let short_arrow = Annotation::Shape(Shape::new(
+            0,
+            ShapeKind::Arrow,
+            (10.0, 10.0),
+            (10.0, 10.0),
+            [0.0, 0.0, 0.0],
+            1.0,
+        ));
+        assert!(
+            short_arrow.is_empty(),
+            "una flecha de largo cero no tiene punta"
+        );
     }
 }

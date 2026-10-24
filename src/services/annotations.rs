@@ -10,9 +10,10 @@ use std::path::{Path, PathBuf};
 use lopdf::{Dictionary, Document, Object, ObjectId, Stream};
 
 use crate::engine::annotation::{
-    Annotation, FontChoice, ImageAppearance, ImageNote, ImagePixels, MarkKind, NOTE_COLOR, PageBox,
-    Rect, TextMark, TextNote, TextRun, bounds_rect, image_appearance, mark_quads, note_rect, parse_da,
-    quads_to_rects, user_rect_to_display,
+    Annotation, FontChoice, ImageAppearance, ImageNote, ImagePixels, InkStroke, MarkKind, NOTE_COLOR,
+    PageBox, Rect, Shape, ShapeKind, TextMark, TextNote, TextRun, bounds_rect, clamp_stroke_width,
+    image_appearance, mark_quads, note_rect, parse_da, quads_to_rects, user_point,
+    user_rect_to_display, user_to_display,
 };
 
 /// Prefijo de `/NM` que distingue una anotación propia de la de otro programa.
@@ -98,6 +99,8 @@ pub fn write_annotations(
             }
             Annotation::Note(note) => note_dictionary(note, page_box, id),
             Annotation::Image(image) => image_dictionary(&mut document, image, page_box, id)?,
+            Annotation::Ink(stroke) => ink_dictionary(stroke, page_box, id),
+            Annotation::Shape(shape) => shape_dictionary(shape, page_box, id),
         };
         push_annotation(&mut document, page_id, object)?;
         written += 1;
@@ -151,6 +154,135 @@ fn mark_dictionary(quads: &[[f64; 8]], color: [f64; 3], kind: MarkKind, id: &str
 
 fn real(value: f64) -> Object {
     Object::Real(value as f32)
+}
+
+/// `/C` de una anotación: las tres componentes del color en `0..=1`.
+fn color_array(color: [f64; 3]) -> Object {
+    Object::Array(vec![real(color[0]), real(color[1]), real(color[2])])
+}
+
+/// `/BS`: el grosor del borde de un trazo o de una forma, que es lo que el
+/// lector usa para pintarlo.
+fn border_width(width: f64) -> Object {
+    let mut border = Dictionary::new();
+    border.set("W", real(width));
+    Object::Dictionary(border)
+}
+
+/// Caja `(x1, y1, x2, y2)` que encierra puntos ya en espacio de usuario.
+fn user_bounds(points: impl Iterator<Item = (f64, f64)>) -> Option<Rect> {
+    let mut bounds: Option<Rect> = None;
+    for (x, y) in points {
+        bounds = Some(match bounds {
+            None => (x, y, x, y),
+            Some((x1, y1, x2, y2)) => (x1.min(x), y1.min(y), x2.max(x), y2.max(y)),
+        });
+    }
+    bounds
+}
+
+/// `/Rect` de una lista de puntos de la página: cada punto se pasa al espacio de
+/// usuario y la caja se toma ahí, así con `/Rotate` los ejes quedan como los ve
+/// el archivo.
+fn stroke_rect(points: impl Iterator<Item = (f64, f64)>, page: PageBox) -> Option<Rect> {
+    user_bounds(points.map(|point| user_point(point, page)))
+}
+
+/// Diccionario de un trazo a mano alzada: un `/Ink` con su `/InkList` en espacio
+/// de usuario (el eje vertical invertido), su caja, su color y su grosor.
+fn ink_dictionary(stroke: &InkStroke, page: PageBox, id: &str) -> Object {
+    let paths: Vec<Vec<(f64, f64)>> = stroke
+        .paths
+        .iter()
+        .map(|path| path.iter().map(|point| user_point(*point, page)).collect())
+        .collect();
+
+    let mut dictionary = Dictionary::new();
+    dictionary.set("Type", Object::Name(b"Annot".to_vec()));
+    dictionary.set("Subtype", Object::Name(b"Ink".to_vec()));
+    set_identifier(&mut dictionary, id);
+    if let Some(rect) = stroke_rect(stroke.paths.iter().flatten().copied(), page) {
+        dictionary.set(
+            "Rect",
+            Object::Array(vec![real(rect.0), real(rect.1), real(rect.2), real(rect.3)]),
+        );
+    }
+    dictionary.set(
+        "InkList",
+        Object::Array(
+            paths
+                .iter()
+                .map(|path| {
+                    Object::Array(
+                        path.iter()
+                            .flat_map(|(x, y)| [real(*x), real(*y)])
+                            .collect(),
+                    )
+                })
+                .collect(),
+        ),
+    );
+    dictionary.set("C", color_array(stroke.color));
+    dictionary.set("BS", border_width(stroke.width));
+    // `/Border` es lo que leen los visores que no entienden `/BS`.
+    dictionary.set(
+        "Border",
+        Object::Array(vec![
+            Object::Integer(0),
+            Object::Integer(0),
+            real(stroke.width),
+        ]),
+    );
+    dictionary.set("F", Object::Integer(4));
+    Object::Dictionary(dictionary)
+}
+
+/// Diccionario de una forma: `/Square`, `/Circle` o `/Line` según su tipo, con su
+/// caja, su color y su grosor. La flecha es una `/Line` con la punta en `/LE`.
+fn shape_dictionary(shape: &Shape, page: PageBox, id: &str) -> Object {
+    let from = user_point(shape.from, page);
+    let to = user_point(shape.to, page);
+    let rect = user_bounds([from, to].into_iter()).expect("la forma tiene dos extremos");
+
+    let mut dictionary = Dictionary::new();
+    dictionary.set("Type", Object::Name(b"Annot".to_vec()));
+    dictionary.set(
+        "Subtype",
+        Object::Name(shape.kind.subtype().as_bytes().to_vec()),
+    );
+    set_identifier(&mut dictionary, id);
+    dictionary.set(
+        "Rect",
+        Object::Array(vec![real(rect.0), real(rect.1), real(rect.2), real(rect.3)]),
+    );
+    dictionary.set("C", color_array(shape.color));
+    dictionary.set("BS", border_width(shape.width));
+    match shape.kind {
+        // El rectángulo y la elipse se pintan solos: la caja dice dónde.
+        ShapeKind::Rectangle | ShapeKind::Ellipse => {
+            dictionary.set("F", Object::Integer(4));
+        }
+        // La línea y la flecha necesitan sus dos extremos, en espacio de usuario.
+        ShapeKind::Line | ShapeKind::Arrow => {
+            dictionary.set(
+                "L",
+                Object::Array(vec![
+                    real(from.0),
+                    real(from.1),
+                    real(to.0),
+                    real(to.1),
+                ]),
+            );
+            dictionary.set(
+                "LE",
+                Object::Array(vec![
+                    Object::Name(b"None".to_vec()),
+                    Object::Name(shape.kind.line_end().as_bytes().to_vec()),
+                ]),
+            );
+        }
+    }
+    Object::Dictionary(dictionary)
 }
 
 /// Número para el contenido de un stream: cuatro decimales bastan para la matriz
@@ -754,8 +886,140 @@ fn read_annotation(
         b"StrikeOut" => read_mark(document, dictionary, page, page_box, MarkKind::StrikeOut),
         b"FreeText" => read_note(document, dictionary, page, page_box),
         b"Stamp" => read_image(document, dictionary, page, page_box),
+        b"Ink" => read_ink(document, dictionary, page, page_box),
+        b"Square" => read_shape(document, dictionary, page, page_box, ShapeKind::Rectangle),
+        b"Circle" => read_shape(document, dictionary, page, page_box, ShapeKind::Ellipse),
+        b"Line" => read_shape(document, dictionary, page, page_box, line_kind(document, dictionary)),
         _ => None,
     }
+}
+
+/// Trazo leído de su `/InkList`: cada camino vuelve al espacio de la página con
+/// el eje vertical desandado, punto por punto.
+fn read_ink(
+    document: &Document,
+    dictionary: &Dictionary,
+    page: usize,
+    page_box: PageBox,
+) -> Option<Annotation> {
+    let list = resolve(document, dictionary.get(b"InkList").ok()?)?
+        .as_array()
+        .ok()?;
+
+    let mut paths = Vec::new();
+    for entry in list {
+        // Un camino que no se puede leer se saltea sin perder los demás.
+        let Some(values) = resolve(document, entry).and_then(|value| value.as_array().ok()) else {
+            continue;
+        };
+        let mut path = Vec::new();
+        let mut valid = true;
+        for pair in values.chunks_exact(2) {
+            let (Ok(x), Ok(y)) = (pair[0].as_float(), pair[1].as_float()) else {
+                valid = false;
+                break;
+            };
+            let (x, y) = (f64::from(x), f64::from(y));
+            if !x.is_finite() || !y.is_finite() {
+                valid = false;
+                break;
+            }
+            path.push(user_to_display((x, y), page_box));
+        }
+        if valid && !path.is_empty() {
+            paths.push(path);
+        }
+    }
+    if paths.is_empty() {
+        return None;
+    }
+
+    let [red, green, blue] = color_of(document, dictionary);
+    Some(Annotation::Ink(InkStroke::new(
+        page,
+        paths,
+        [red, green, blue],
+        stroke_width(document, dictionary),
+    )))
+}
+
+/// Forma leída de su `/Rect` (rectángulo y elipse) o de sus dos extremos `/L`
+/// (línea y flecha), con el grosor de `/BS` y el color de `/C`.
+fn read_shape(
+    document: &Document,
+    dictionary: &Dictionary,
+    page: usize,
+    page_box: PageBox,
+    kind: ShapeKind,
+) -> Option<Annotation> {
+    let (from, to) = match kind {
+        ShapeKind::Line | ShapeKind::Arrow => {
+            let endpoints = numbers_of(document, dictionary, b"L")?;
+            if endpoints.len() != 4 {
+                return None;
+            }
+            (
+                user_to_display((endpoints[0], endpoints[1]), page_box),
+                user_to_display((endpoints[2], endpoints[3]), page_box),
+            )
+        }
+        ShapeKind::Rectangle | ShapeKind::Ellipse => {
+            let rect = user_rect_to_display(rect_of(document, dictionary, b"Rect")?, page_box);
+            ((rect.0, rect.1), (rect.2, rect.3))
+        }
+    };
+
+    let [red, green, blue] = color_of(document, dictionary);
+    Some(Annotation::Shape(Shape::new(
+        page,
+        kind,
+        from,
+        to,
+        [red, green, blue],
+        stroke_width(document, dictionary),
+    )))
+}
+
+/// Tipo de una `/Line` según su `/LE`: si alguno de sus finales es una flecha
+/// (`OpenArrow`, `ClosedArrow`, ...) vuelve como flecha; si no, como línea.
+fn line_kind(document: &Document, dictionary: &Dictionary) -> ShapeKind {
+    let ends = dictionary
+        .get(b"LE")
+        .ok()
+        .and_then(|value| resolve(document, value))
+        .and_then(|value| value.as_array().ok());
+    let Some(ends) = ends else {
+        return ShapeKind::Line;
+    };
+    let arrow = ends.iter().any(|end| {
+        resolve(document, end)
+            .and_then(|value| value.as_name().ok())
+            .is_some_and(|name| name.ends_with(b"Arrow"))
+    });
+    if arrow {
+        ShapeKind::Arrow
+    } else {
+        ShapeKind::Line
+    }
+}
+
+/// Grosor de un trazo o de una forma: `/BS /W` y, si falta, el tercer valor de
+/// `/Border`, que es donde lo escriben los visores antiguos. Recortado al rango
+/// del lápiz; sin ninguno de los dos, un punto.
+fn stroke_width(document: &Document, dictionary: &Dictionary) -> f64 {
+    let bordered = numbers_of(document, dictionary, b"Border")
+        .filter(|values| values.len() == 3)
+        .map(|values| values[2]);
+    let from_bs = dictionary
+        .get(b"BS")
+        .ok()
+        .and_then(|value| resolve(document, value))
+        .and_then(|value| value.as_dict().ok())
+        .and_then(|bs| bs.get(b"W").ok())
+        .and_then(|value| resolve(document, value))
+        .and_then(|value| value.as_float().ok())
+        .map(f64::from);
+    clamp_stroke_width(from_bs.or(bordered).unwrap_or(1.0))
 }
 
 /// Marcado leído de `/QuadPoints` y `/C`: cada línea vuelve a su rectángulo en el
@@ -2744,5 +3008,375 @@ mod tests {
             3,
             "el archivo no gana anotaciones"
         );
+    }
+
+    /// Grosor que declara `/BS` de una anotación, leído del archivo.
+    fn border_of(annotation: &Dictionary) -> f64 {
+        annotation
+            .get(b"BS")
+            .expect("la anotación lleva su borde")
+            .as_dict()
+            .expect("BS es un diccionario")
+            .get(b"W")
+            .expect("BS lleva el grosor")
+            .as_float()
+            .expect("el grosor es un número")
+            .into()
+    }
+
+    /// Nombres de una lista de nombres del diccionario, como `/LE`.
+    fn names(dictionary: &Dictionary, key: &[u8]) -> Vec<String> {
+        dictionary
+            .get(key)
+            .expect("la clave tiene que existir")
+            .as_array()
+            .expect("tiene que ser una lista")
+            .iter()
+            .map(|entry| {
+                String::from_utf8_lossy(entry.as_name().expect("un nombre del PDF")).into_owned()
+            })
+            .collect()
+    }
+
+    /// Trazo de lápiz de la prueba: un solo camino en zigzag.
+    fn ink_stroke() -> InkStroke {
+        InkStroke::new(
+            0,
+            vec![vec![(20.0, 30.0), (60.0, 40.0), (100.0, 25.0)]],
+            [1.0, 0.0, 0.0],
+            3.0,
+        )
+    }
+
+    #[test]
+    fn an_ink_stroke_is_written_with_its_list_rect_colour_and_width() {
+        let source = scratch("ink.pdf");
+        let target = scratch("ink-out.pdf");
+        std::fs::write(&source, fixture([0.0, 0.0, 200.0, 200.0], 0)).expect("escribir el PDF");
+
+        let written = write_fresh(&source, &target, &[Annotation::Ink(ink_stroke())])
+            .expect("el trazo tiene que escribirse");
+        assert_eq!(written, 1);
+
+        let document = Document::load(&target).expect("el archivo escrito tiene que cargarse");
+        let page_id = *document.get_pages().get(&1).expect("página 1");
+        let annotations = document.get_page_annotations(page_id).expect("anotaciones");
+        assert_eq!(annotations.len(), 1, "una anotación por trazo");
+        let annotation = annotations[0];
+
+        assert_eq!(
+            annotation
+                .get(b"Subtype")
+                .and_then(Object::as_name)
+                .expect("Subtype"),
+            b"Ink",
+            "el lector de PDF tiene que reconocer el dibujo a mano alzada"
+        );
+
+        let list = annotation
+            .get(b"InkList")
+            .expect("el trazo lleva su InkList")
+            .as_array()
+            .expect("InkList es una lista de caminos");
+        assert_eq!(list.len(), 1, "un camino");
+        let path: Vec<f64> = list[0]
+            .as_array()
+            .expect("cada camino es una lista de números")
+            .iter()
+            .map(|value| f64::from(value.as_float().expect("número")))
+            .collect();
+        assert_eq!(
+            path,
+            vec![20.0, 170.0, 60.0, 160.0, 100.0, 175.0],
+            "los puntos van en espacio de usuario: el eje vertical se invierte"
+        );
+        assert_eq!(
+            numbers(annotation, b"Rect"),
+            vec![20.0, 160.0, 100.0, 175.0],
+            "la caja encierra todos los puntos"
+        );
+        assert_eq!(numbers(annotation, b"C"), vec![1.0, 0.0, 0.0], "color en 0..=1");
+        assert_eq!(border_of(annotation), 3.0, "/BS lleva el grosor en puntos");
+        assert_eq!(
+            numbers(annotation, b"Border"),
+            vec![0.0, 0.0, 3.0],
+            "/Border repite el grosor para los lectores que no leen /BS"
+        );
+        assert_eq!(
+            annotation.get(b"F").and_then(Object::as_i64).expect("F"),
+            4,
+            "la anotación se imprime"
+        );
+    }
+
+    #[test]
+    fn every_shape_is_written_with_its_subtype_and_its_own_data() {
+        let source = scratch("shapes.pdf");
+        let target = scratch("shapes-out.pdf");
+        std::fs::write(&source, fixture([0.0, 0.0, 200.0, 200.0], 0)).expect("escribir el PDF");
+
+        let shapes = [
+            Shape::new(
+                0,
+                ShapeKind::Rectangle,
+                (20.0, 20.0),
+                (80.0, 60.0),
+                [0.0, 0.0, 1.0],
+                2.0,
+            ),
+            Shape::new(
+                0,
+                ShapeKind::Ellipse,
+                (100.0, 20.0),
+                (160.0, 60.0),
+                [0.0, 1.0, 0.0],
+                4.0,
+            ),
+            Shape::new(
+                0,
+                ShapeKind::Line,
+                (20.0, 100.0),
+                (80.0, 140.0),
+                [0.0, 0.0, 0.0],
+                1.5,
+            ),
+            Shape::new(
+                0,
+                ShapeKind::Arrow,
+                (100.0, 100.0),
+                (160.0, 140.0),
+                [1.0, 0.5, 0.0],
+                5.0,
+            ),
+        ];
+        let written = write_fresh(
+            &source,
+            &target,
+            &shapes.iter().cloned().map(Annotation::Shape).collect::<Vec<_>>(),
+        )
+        .expect("las cuatro formas tienen que escribirse");
+        assert_eq!(written, 4, "una anotación por forma");
+
+        let document = Document::load(&target).expect("el archivo escrito tiene que cargarse");
+        let page_id = *document.get_pages().get(&1).expect("página 1");
+        let annotations = document.get_page_annotations(page_id).expect("anotaciones");
+        assert_eq!(annotations.len(), 4);
+        let subtypes: Vec<String> = annotations
+            .iter()
+            .map(|annotation| {
+                String::from_utf8_lossy(
+                    annotation
+                        .get(b"Subtype")
+                        .and_then(Object::as_name)
+                        .expect("Subtype"),
+                )
+                .into_owned()
+            })
+            .collect();
+        assert_eq!(
+            subtypes,
+            vec!["Square", "Circle", "Line", "Line"],
+            "cada forma usa el subtipo que el lector reconoce"
+        );
+
+        // Rectángulo: su caja va de esquina a esquina, en espacio de usuario.
+        assert_eq!(
+            numbers(annotations[0], b"Rect"),
+            vec![20.0, 140.0, 80.0, 180.0],
+            "el /Rect del rectángulo es su caja"
+        );
+        assert_eq!(numbers(annotations[0], b"C"), vec![0.0, 0.0, 1.0]);
+        assert_eq!(border_of(annotations[0]), 2.0);
+        assert_eq!(
+            annotations[0].get(b"F").and_then(Object::as_i64).expect("F"),
+            4,
+            "la forma se imprime"
+        );
+
+        // Elipse: mismo esquema, con su propio color y grosor.
+        assert_eq!(numbers(annotations[1], b"Rect"), vec![100.0, 140.0, 160.0, 180.0]);
+        assert_eq!(numbers(annotations[1], b"C"), vec![0.0, 1.0, 0.0]);
+        assert_eq!(border_of(annotations[1]), 4.0);
+
+        // Línea: sus dos extremos en /L y sin punta.
+        assert_eq!(
+            numbers(annotations[2], b"L"),
+            vec![20.0, 100.0, 80.0, 60.0],
+            "/L lleva los dos extremos en espacio de usuario"
+        );
+        assert_eq!(
+            names(annotations[2], b"LE"),
+            vec!["None", "None"],
+            "una línea no lleva punta"
+        );
+        assert_eq!(numbers(annotations[2], b"C"), vec![0.0, 0.0, 0.0]);
+        assert_eq!(border_of(annotations[2]), 1.5);
+
+        // Flecha: la misma /Line con la punta abierta en el segundo extremo.
+        assert_eq!(numbers(annotations[3], b"L"), vec![100.0, 100.0, 160.0, 60.0]);
+        assert_eq!(
+            names(annotations[3], b"LE"),
+            vec!["None", "OpenArrow"],
+            "la flecha se distingue por su /LE"
+        );
+        assert_eq!(numbers(annotations[3], b"C"), vec![1.0, 0.5, 0.0]);
+        assert_eq!(border_of(annotations[3]), 5.0);
+    }
+
+    #[test]
+    fn poppler_paints_the_written_stroke_and_shape() {
+        // La prueba de que otro lector los ve: el trazo es una /Ink y la forma un
+        // /Square con su borde, así que poppler tiene que dibujarlos sin que el
+        // visor ponga nada encima.
+        let source = scratch("stroke-painted.pdf");
+        let target = scratch("stroke-painted-out.pdf");
+        std::fs::write(&source, fixture([0.0, 0.0, 300.0, 200.0], 0)).expect("escribir el PDF");
+
+        let ink = InkStroke::new(
+            0,
+            vec![vec![(40.0, 40.0), (120.0, 40.0)]],
+            [1.0, 0.0, 0.0],
+            4.0,
+        );
+        let rectangle = Shape::new(
+            0,
+            ShapeKind::Rectangle,
+            (40.0, 120.0),
+            (120.0, 160.0),
+            [0.0, 0.0, 0.0],
+            3.0,
+        );
+        write_fresh(
+            &source,
+            &target,
+            &[Annotation::Ink(ink), Annotation::Shape(rectangle)],
+        )
+        .expect("el trazo y la forma tienen que escribirse");
+
+        let size = (300.0, 200.0);
+        assert_eq!(
+            reddish_bbox(&std::fs::read(&source).expect("original"), size),
+            None,
+            "la página vacía no tiene nada rojo"
+        );
+        let painted = reddish_bbox(&std::fs::read(&target).expect("resultado"), size)
+            .expect("poppler dibuja el trazo del lápiz");
+        assert!(
+            (painted.0 - 40.0).abs() <= 4.0 && (painted.1 - 40.0).abs() <= 4.0,
+            "el trazo empieza donde se guardó: {painted:?}"
+        );
+        assert!(
+            painted.2 - painted.0 >= 70.0,
+            "el trazo tiene el largo que se guardó: {painted:?}"
+        );
+        assert!(
+            dark_pixels(&std::fs::read(&target).expect("resultado"), size) > 0,
+            "poppler dibuja el borde del rectángulo"
+        );
+    }
+
+    #[test]
+    fn the_stroke_and_the_four_shapes_come_back_with_their_geometry() {
+        let ink = InkStroke::new(
+            0,
+            vec![
+                vec![(20.0, 30.0), (60.0, 40.0)],
+                vec![(80.0, 20.0), (100.0, 50.0), (120.0, 30.0)],
+            ],
+            [1.0, 0.25, 0.0],
+            3.5,
+        );
+        let shapes = [
+            Shape::new(
+                0,
+                ShapeKind::Rectangle,
+                (20.0, 80.0),
+                (80.0, 120.0),
+                [0.0, 0.0, 1.0],
+                2.0,
+            ),
+            Shape::new(
+                0,
+                ShapeKind::Ellipse,
+                (100.0, 80.0),
+                (160.0, 120.0),
+                [0.0, 1.0, 0.0],
+                4.5,
+            ),
+            Shape::new(
+                0,
+                ShapeKind::Line,
+                (20.0, 150.0),
+                (80.0, 180.0),
+                [0.0, 0.0, 0.0],
+                1.5,
+            ),
+            Shape::new(
+                0,
+                ShapeKind::Arrow,
+                (100.0, 150.0),
+                (160.0, 180.0),
+                [1.0, 0.5, 0.0],
+                5.0,
+            ),
+        ];
+
+        let mut current = vec![owned("mlnpdf-ida-trazo", Annotation::Ink(ink.clone()))];
+        for (index, shape) in shapes.iter().enumerate() {
+            current.push(owned(
+                &format!("mlnpdf-ida-forma-{index}"),
+                Annotation::Shape(shape.clone()),
+            ));
+        }
+
+        let (_, read) = round_trip(
+            "rt-strokes",
+            fixture([0.0, 0.0, 200.0, 200.0], 0),
+            &current,
+        );
+        assert_eq!(read.len(), 5, "vuelven el trazo y las cuatro formas: {read:?}");
+
+        let Annotation::Ink(back) = &read[0].1 else {
+            panic!("se esperaba un trazo y se leyó {:?}", read[0].1);
+        };
+        assert_eq!(back.page, 0, "misma página");
+        assert_eq!(back.paths.len(), ink.paths.len(), "mismos caminos");
+        for (got, want) in back.paths.iter().zip(&ink.paths) {
+            assert_eq!(got.len(), want.len(), "mismos puntos por camino");
+            for (got, want) in got.iter().zip(want) {
+                assert!(
+                    (got.0 - want.0).abs() <= 0.01 && (got.1 - want.1).abs() <= 0.01,
+                    "el punto {got:?} no es el guardado {want:?}"
+                );
+            }
+        }
+        assert_eq!(back.color, ink.color, "mismo color");
+        assert!(
+            (back.width - ink.width).abs() <= 0.01,
+            "mismo grosor: {} != {}",
+            back.width,
+            ink.width
+        );
+
+        for (index, want) in shapes.iter().enumerate() {
+            let Annotation::Shape(back) = &read[index + 1].1 else {
+                panic!("se esperaba una forma y se leyó {:?}", read[index + 1].1);
+            };
+            assert_eq!(back.page, 0);
+            assert_eq!(back.kind, want.kind, "mismo tipo de forma");
+            for (got, want) in [(back.from, want.from), (back.to, want.to)] {
+                assert!(
+                    (got.0 - want.0).abs() <= 0.01 && (got.1 - want.1).abs() <= 0.01,
+                    "{got:?} no es el extremo guardado {want:?}"
+                );
+            }
+            assert!(
+                (back.width - want.width).abs() <= 0.01,
+                "mismo grosor: {} != {}",
+                back.width,
+                want.width
+            );
+            assert_eq!(back.color, want.color, "mismo color");
+        }
     }
 }

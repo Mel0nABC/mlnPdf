@@ -7,7 +7,7 @@ use gtk::gio;
 
 /// Keyboard shortcuts bound to the window actions. Declared as data so the
 /// display test can prove every trigger string actually parses.
-pub const SHORTCUTS: [(&str, &str); 42] = [
+pub const SHORTCUTS: [(&str, &str); 47] = [
     ("<Control>plus", "win.zoom-in"),
     ("<Control>equal", "win.zoom-in"),
     ("<Control>minus", "win.zoom-out"),
@@ -49,6 +49,14 @@ pub const SHORTCUTS: [(&str, &str); 42] = [
     ("<Control><Alt>u", "win.strikeout"),
     ("<Control>t", "win.insert-text"),
     ("<Control><Shift>i", "win.insert-image"),
+    // Dibujo: el lápiz y las cuatro formas. Ninguna de estas combinaciones
+    // repite un atajo sin `Alt`, así que la herramienta se arma sin pisar a las
+    // demás.
+    ("<Control><Alt>p", "win.draw-ink"),
+    ("<Control><Alt>r", "win.draw-rectangle"),
+    ("<Control><Alt>e", "win.draw-ellipse"),
+    ("<Control><Alt>l", "win.draw-line"),
+    ("<Control><Alt>f", "win.draw-arrow"),
     ("<Control>s", "win.save-annotations"),
     ("<Control><Shift>s", "win.save-annotations-as"),
     // Sin `<Control>`: es la tecla de borrar la nota elegida. El visor la maneja
@@ -57,7 +65,7 @@ pub const SHORTCUTS: [(&str, &str); 42] = [
 ];
 
 /// Human-readable shortcut list shown by Help > Atajos de teclado.
-pub const SHORTCUT_HELP: [(&str, &str); 29] = [
+pub const SHORTCUT_HELP: [(&str, &str); 34] = [
     ("Ctrl+O", "Abrir un PDF"),
     ("Ctrl+P", "Imprimir"),
     ("Ctrl+F", "Buscar en el documento"),
@@ -78,6 +86,11 @@ pub const SHORTCUT_HELP: [(&str, &str); 29] = [
     ("Ctrl+Alt+U", "Tachar el texto seleccionado"),
     ("Ctrl+T", "Insertar una nota de texto en la página"),
     ("Ctrl+Shift+I", "Insertar una imagen en la página"),
+    ("Ctrl+Alt+P", "Dibujar a mano alzada (lápiz)"),
+    ("Ctrl+Alt+R", "Dibujar un rectángulo"),
+    ("Ctrl+Alt+E", "Dibujar una elipse"),
+    ("Ctrl+Alt+L", "Dibujar una línea"),
+    ("Ctrl+Alt+F", "Dibujar una flecha"),
     ("Ctrl+S / Ctrl+Shift+S", "Guardar los marcados / guardar como"),
     ("Ctrl+Shift+C", "Copiar el texto de la página actual"),
     ("Ctrl+G / Ctrl+Shift+G", "Siguiente / anterior coincidencia"),
@@ -117,6 +130,11 @@ pub fn build_menu_bar() -> gtk::PopoverMenuBar {
     edit_menu.append(Some("Tachar"), Some("win.strikeout"));
     edit_menu.append(Some("Insertar texto…"), Some("win.insert-text"));
     edit_menu.append(Some("Insertar imagen…"), Some("win.insert-image"));
+    edit_menu.append(Some("Lápiz"), Some("win.draw-ink"));
+    edit_menu.append(Some("Rectángulo"), Some("win.draw-rectangle"));
+    edit_menu.append(Some("Elipse"), Some("win.draw-ellipse"));
+    edit_menu.append(Some("Línea"), Some("win.draw-line"));
+    edit_menu.append(Some("Flecha"), Some("win.draw-arrow"));
     edit_menu.append(Some("Copiar texto de la página"), Some("win.copy-page-text"));
     model.append_submenu(Some("Edit"), &edit_menu);
 

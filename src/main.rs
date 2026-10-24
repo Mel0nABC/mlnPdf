@@ -32,9 +32,9 @@ mod tests {
     use crate::engine::render::render_page_surface;
     use crate::engine::annotation::{
         Annotation, Corner, FontChoice, IMAGE_BOX_FRACTION, ImageNote, ImagePixels, MarkKind,
-        NOTE_COLOR, TextMark, TextNote, TextRun,
+        NOTE_COLOR, STROKE_MAX_WIDTH, STROKE_MIN_WIDTH, ShapeKind, TextMark, TextNote, TextRun,
     };
-    use crate::services::annotations::{read_annotations, write_annotations};
+    use crate::services::annotations::{open_for_editing, read_annotations, write_annotations};
     use crate::ui::shell::*;
 
     /// One page, 200x100 pt, fully filled with pure red, no xref table
@@ -227,8 +227,9 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         };
         assert_eq!(
             children.len(),
-            10,
-            "búsqueda, hueco, páginas, hueco, zoom, subrayar, resaltar, tachar, insertar texto e insertar imagen"
+            11,
+            "búsqueda, hueco, páginas, hueco, zoom, subrayar, resaltar, tachar, insertar texto, \
+             insertar imagen y dibujar"
         );
         for gap in [&children[1], &children[3]] {
             assert_eq!(
@@ -273,6 +274,44 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             children[9].tooltip_text().as_deref(),
             Some("Insertar imagen (Ctrl+Shift+I)"),
             "el botón de imagen se anuncia con su atajo"
+        );
+
+        // S3 y S4: el botón de dibujar abre un popover con las cinco herramientas,
+        // el grosor libre en puntos y el color. Elegir una herramienta la arma y
+        // el popover se cierra; el grosor y el color se recuerdan.
+        let stroke_menu = children[10]
+            .clone()
+            .downcast::<gtk::MenuButton>()
+            .expect("el botón de dibujar es un MenuButton con su popover");
+        assert_eq!(
+            stroke_menu.tooltip_text().as_deref(),
+            Some("Dibujar y formas"),
+            "el botón de dibujar se anuncia como «Dibujar y formas»"
+        );
+        let stroke_popover = stroke_menu
+            .popover()
+            .expect("el botón de dibujar tiene que abrir su popover");
+        for label in ["Lápiz", "Rectángulo", "Elipse", "Línea", "Flecha"] {
+            assert!(
+                labeled_button(stroke_popover.upcast_ref::<gtk::Widget>(), label).is_some(),
+                "el popover de dibujo ofrece {label}"
+            );
+        }
+        let width_spin =
+            spin_button(stroke_popover.upcast_ref::<gtk::Widget>()).expect("el popover ofrece el grosor");
+        assert_eq!(
+            (width_spin.value(), width_spin.digits()),
+            (STROKE_WIDTH, 1),
+            "el grosor arranca en {STROKE_WIDTH} pt y se muestra con una décima"
+        );
+        assert_eq!(
+            (
+                width_spin.adjustment().lower(),
+                width_spin.adjustment().upper(),
+                width_spin.adjustment().step_increment(),
+            ),
+            (STROKE_MIN_WIDTH, STROKE_MAX_WIDTH, 0.5),
+            "el grosor va de 0,5 a 20 puntos en pasos de medio punto"
         );
 
         // El menú File: guardar con nombres cortos. "Guardar" escribe en el
@@ -2119,6 +2158,288 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         std::fs::remove_file(&reopen_source).ok();
         std::fs::remove_file(&reopen_path).ok();
 
+        // S3 y S4: dibujar con el lápiz y con una forma. Un arrastre real necesita
+        // un dispositivo que la prueba no tiene, así que se arma la herramienta con
+        // el mismo botón del popover que el lector pulsa y después se llaman los
+        // métodos que el gesto de arrastre llama.
+        let zoom = viewer.view.zoom.get();
+        assert!(zoom > 0.0, "hay un zoom con el que pasar a puntos");
+        width_spin.set_value(3.5);
+        let pencil = labeled_button(stroke_popover.upcast_ref::<gtk::Widget>(), "Lápiz")
+            .expect("el popover de dibujo ofrece el lápiz");
+        pencil.emit_by_name::<()>("clicked", &[]);
+        let armed = viewer
+            .stroke_tool_active()
+            .expect("elegir el lápiz arma la herramienta");
+        assert_eq!(armed.kind, StrokeKind::Ink, "la herramienta armada es el lápiz");
+        assert!(
+            (armed.width - 3.5).abs() < 1e-9,
+            "el grosor elegido en el popover viaja con la herramienta: {}",
+            armed.width
+        );
+        assert_eq!(
+            viewer
+                .ui
+                .scroller
+                .cursor()
+                .and_then(|cursor| cursor.name())
+                .as_deref(),
+            Some("crosshair"),
+            "con un trazo armado el cursor de la página es la cruz"
+        );
+        // Las herramientas siguen siendo excluyentes: armar un marcado desarma el
+        // trazo, y armarlo de nuevo apaga el marcado.
+        viewer.set_mark_mode(MarkKind::Underline, true);
+        assert!(
+            viewer.stroke_tool_active().is_none(),
+            "armar un marcado desarma el lápiz"
+        );
+        viewer.set_mark_mode(MarkKind::Underline, false);
+        viewer.start_stroke_tool(StrokeKind::Shape(ShapeKind::Rectangle));
+        assert!(
+            viewer.stroke_tool_active().is_some(),
+            "armar una forma vuelve a dejar el dibujo listo"
+        );
+        viewer.set_hand_mode(true);
+        assert!(
+            viewer.stroke_tool_active().is_none(),
+            "el modo mano también desarma el dibujo"
+        );
+        viewer.set_hand_mode(false);
+
+        // El lápiz acumula los puntos del arrastre y los guarda como /Ink.
+        viewer.start_stroke_tool(StrokeKind::Ink);
+        let ink_points = [(40.0, 40.0), (70.0, 60.0), (100.0, 45.0)];
+        assert!(
+            viewer.stroke_drag_begin(0, ink_points[0].0 * zoom, ink_points[0].1 * zoom),
+            "con el lápiz armado el arrastre empieza un trazo"
+        );
+        for point in &ink_points[1..] {
+            assert!(
+                viewer.stroke_drag_update(
+                    0,
+                    (point.0 - ink_points[0].0) * zoom,
+                    (point.1 - ink_points[0].1) * zoom,
+                ),
+                "el arrastre suma el punto {point:?}"
+            );
+        }
+        assert!(viewer.stroke_drag_end(), "soltar cierra el trazo");
+        assert!(
+            viewer.stroke_tool_active().is_none(),
+            "soltar el trazo desarma el lápiz para no encadenar trazos"
+        );
+        let ink = match &viewer.annot.edits.borrow()[0].value {
+            Annotation::Ink(stroke) => stroke.clone(),
+            other => panic!("el trazo se guarda como lápiz: {other:?}"),
+        };
+        assert_eq!(ink.page, 0);
+        assert_eq!(ink.paths.len(), 1, "un arrastre, un camino");
+        assert_eq!(
+            ink.paths[0].len(),
+            ink_points.len(),
+            "el trazo acumula todos los puntos del arrastre"
+        );
+        for (got, want) in ink.paths[0].iter().zip(&ink_points) {
+            assert!(
+                (got.0 - want.0).abs() < 1e-6 && (got.1 - want.1).abs() < 1e-6,
+                "el punto {got:?} no es el del arrastre {want:?}"
+            );
+        }
+        // El color viaja como `f32` por el selector de GTK, así que se compara
+        // con la precisión del canal.
+        for (got, want) in ink.color.iter().zip([STROKE_COLOR.0, STROKE_COLOR.1, STROKE_COLOR.2]) {
+            assert!(
+                (got - want).abs() < 1e-6,
+                "el trazo arranca con el color del popover: {:?}",
+                ink.color
+            );
+        }
+        assert!(
+            (ink.width - 3.5).abs() < 1e-9,
+            "el trazo guarda el grosor elegido: {}",
+            ink.width
+        );
+        // Y se pinta en la capa de anotaciones, no solo se guarda.
+        let ink_side = 200usize;
+        let ink_pixels = annotation_pixels(&viewer, 0, ink_side, ink_side);
+        assert!(
+            pixel_box(ink_side, &ink_pixels, |[red, green, blue]| {
+                red > 120 && green < 80 && blue < 80
+            })
+            .is_some(),
+            "el trazo se pinta en la capa de anotaciones"
+        );
+
+        // Un clic sin arrastre no deja un trazo, y una forma de menos de un punto
+        // de lado tampoco: no se podría ni ver ni volver a agarrar.
+        viewer.start_stroke_tool(StrokeKind::Ink);
+        assert!(viewer.stroke_drag_begin(0, 10.0 * zoom, 10.0 * zoom));
+        assert!(viewer.stroke_drag_end(), "el clic cierra el gesto");
+        assert_eq!(
+            viewer.annot.edits.borrow().len(),
+            1,
+            "un trazo de un solo punto no se agrega"
+        );
+        assert!(
+            viewer.stroke_tool_active().is_none(),
+            "aun sin agregar nada, soltar desarma la herramienta"
+        );
+        viewer.start_stroke_tool(StrokeKind::Shape(ShapeKind::Rectangle));
+        assert!(viewer.stroke_drag_begin(0, 10.0 * zoom, 10.0 * zoom));
+        assert!(viewer.stroke_drag_update(0, 0.4 * zoom, 0.4 * zoom));
+        assert!(viewer.stroke_drag_end(), "la forma diminuta se descarta");
+        assert_eq!(
+            viewer.annot.edits.borrow().len(),
+            1,
+            "una forma de menos de un punto de lado no se agrega"
+        );
+
+        // La flecha: dos esquinas y una punta en el segundo extremo.
+        viewer.start_stroke_tool(StrokeKind::Shape(ShapeKind::Arrow));
+        assert!(
+            viewer.stroke_drag_begin(0, 40.0 * zoom, 100.0 * zoom),
+            "la forma también empieza con el arrastre"
+        );
+        assert!(
+            viewer.stroke_drag_update(0, 60.0 * zoom, 30.0 * zoom),
+            "el arrastre mueve la esquina final"
+        );
+        assert!(viewer.stroke_drag_end(), "soltar cierra la forma");
+        let arrow = match &viewer.annot.edits.borrow()[1].value {
+            Annotation::Shape(shape) => shape.clone(),
+            other => panic!("la flecha se guarda como forma: {other:?}"),
+        };
+        assert_eq!(arrow.kind, ShapeKind::Arrow, "la forma es una flecha");
+        assert_eq!(arrow.from, (40.0, 100.0), "guarda la esquina inicial");
+        assert_eq!(arrow.to, (100.0, 130.0), "y la final");
+        assert_eq!(
+            viewer.annot.edits.borrow().len(),
+            2,
+            "el lápiz y la flecha son dos anotaciones"
+        );
+        let arrow_pixels = annotation_pixels(&viewer, 0, 400, 400);
+        assert!(
+            pixel_box(400, &arrow_pixels, |[red, green, blue]| {
+                red > 120 && green < 80 && blue < 80
+            })
+            .is_some(),
+            "la flecha también se pinta en la capa"
+        );
+
+        // El trazo elegido se borra con Supr y deshacer lo repone, como cualquier
+        // otra anotación: un clic sobre él lo encuentra.
+        let ink_id = edit_id(&viewer, 0);
+        assert_eq!(
+            viewer
+                .stroke_at(0, 70.0 * zoom, 60.0 * zoom)
+                .as_deref(),
+            Some(ink_id.as_str()),
+            "un clic sobre el trazo lo elige"
+        );
+        viewer.select_annotation(Some(ink_id.clone()));
+        assert!(
+            viewer.delete_selected_annotation(),
+            "Supr borra el trazo elegido"
+        );
+        assert_eq!(viewer.annot.edits.borrow().len(), 1);
+        assert!(viewer.undo(), "deshacer repone el trazo borrado");
+        assert_eq!(viewer.annot.edits.borrow().len(), 2);
+        assert!(
+            matches!(&viewer.annot.edits.borrow()[0].value, Annotation::Ink(_)),
+            "deshacer repone el trazo, no otra anotación"
+        );
+
+        // El menú contextual de un trazo ofrece Eliminar y no editar texto.
+        let stroke_anchor = viewer.doc.slots.borrow()[0].canvas.clone();
+        viewer.select_annotation(Some(ink_id.clone()));
+        let popover = viewer.open_annotation_menu(ink_id.clone(), &stroke_anchor, 20.0, 20.0);
+        assert!(
+            labeled_button(popover.upcast_ref::<gtk::Widget>(), "Editar texto").is_none(),
+            "un trazo no se edita como texto"
+        );
+        let delete_button = labeled_button(popover.upcast_ref::<gtk::Widget>(), "Eliminar")
+            .expect("el menú del trazo ofrece Eliminar");
+        delete_button.emit_by_name::<()>("clicked", &[]);
+        assert!(
+            !viewer
+                .annot
+                .edits
+                .borrow()
+                .iter()
+                .any(|edit| edit.id == ink_id),
+            "Eliminar quita el trazo"
+        );
+        assert!(viewer.undo(), "el borrado del trazo se deshace");
+
+        // Guardar y reabrir: el trazo y la flecha vuelven a la lista editable con
+        // su /NM, que es lo que los deja editar después de guardar.
+        let stroke_source = dir.join("stroke-source-ui.pdf");
+        let stroke_path = dir.join("stroke-ui.pdf");
+        std::fs::copy(&two_path, &stroke_source).expect("copiar el PDF de la prueba");
+        std::fs::remove_file(&stroke_path).ok();
+        let stroke_written = vec![
+            (
+                "mlnpdf-reabrir-trazo".to_string(),
+                Annotation::Ink(ink.clone()),
+            ),
+            (
+                "mlnpdf-reabrir-flecha".to_string(),
+                Annotation::Shape(arrow.clone()),
+            ),
+        ];
+        assert_eq!(
+            write_annotations(&stroke_source, &stroke_path, &stroke_written, &[])
+                .expect("el trazo y la flecha se escriben"),
+            2,
+            "el archivo de la prueba queda con un /Ink y una /Line con flecha"
+        );
+        let (loaded, _) = open_for_editing(&stroke_path).expect("reabrir el archivo guardado");
+        assert_eq!(loaded.len(), 2, "vuelven las dos: {loaded:?}");
+        assert!(
+            matches!(loaded[0].1, Annotation::Ink(_)),
+            "la primera es el trazo"
+        );
+        assert!(
+            matches!(&loaded[1].1, Annotation::Shape(shape) if shape.kind == ShapeKind::Arrow),
+            "la segunda es la flecha"
+        );
+        viewer
+            .open(&stroke_path)
+            .expect("abrir el archivo con el trazo y la flecha");
+        assert_eq!(
+            viewer.annot.edits.borrow().len(),
+            2,
+            "al reabrir, el trazo y la flecha vuelven a la lista editable"
+        );
+        assert!(
+            matches!(&viewer.annot.edits.borrow()[0].value, Annotation::Ink(stroke) if stroke.paths.len() == 1),
+            "el trazo vuelve con su camino"
+        );
+        assert!(
+            matches!(&viewer.annot.edits.borrow()[1].value, Annotation::Shape(shape) if shape.kind == ShapeKind::Arrow),
+            "la flecha vuelve como flecha, no como línea"
+        );
+        assert!(
+            !viewer.has_pending_marks(),
+            "lo reabierto coincide con el archivo"
+        );
+        std::fs::remove_file(&stroke_source).ok();
+        std::fs::remove_file(&stroke_path).ok();
+
+        // Y el estado queda como estaba: el documento de la prueba, sin
+        // anotaciones ni herramienta armada.
+        viewer.open(&two_path).expect("volver al documento de la prueba");
+        assert!(
+            viewer.annot.edits.borrow().is_empty(),
+            "el documento de la prueba sigue sin anotaciones"
+        );
+        assert!(!viewer.has_pending_marks());
+        assert!(
+            viewer.stroke_tool_active().is_none(),
+            "no queda ninguna herramienta de dibujo armada"
+        );
+
         // Pulsar la herramienta abre el selector de color del sistema. Es la
         // única parte del flujo que no se puede probar sin un clic real, así que
         // se comprueba que la ventana del selector aparezca.
@@ -2176,6 +2497,21 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         let mut child = widget.first_child();
         while let Some(current) = child {
             if let Some(found) = labeled_button(&current, label) {
+                return Some(found);
+            }
+            child = current.next_sibling();
+        }
+        None
+    }
+
+    /// Busca el primer `GtkSpinButton` dentro del árbol del diálogo o popover.
+    fn spin_button(widget: &gtk::Widget) -> Option<gtk::SpinButton> {
+        if let Some(spin) = widget.downcast_ref::<gtk::SpinButton>() {
+            return Some(spin.clone());
+        }
+        let mut child = widget.first_child();
+        while let Some(current) = child {
+            if let Some(found) = spin_button(&current) {
                 return Some(found);
             }
             child = current.next_sibling();
