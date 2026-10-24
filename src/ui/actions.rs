@@ -67,7 +67,7 @@ pub const SHORTCUT_HELP: [(&str, &str); 27] = [
     ("Ctrl+C", "Copiar el texto seleccionado"),
     ("Ctrl+Z", "Deshacer el último marcado sin guardar"),
     ("Ctrl+Shift+Z / Ctrl+Y", "Rehacer el marcado deshecho"),
-    ("Supr", "Borrar la nota seleccionada"),
+    ("Supr", "Borrar la anotación seleccionada"),
     ("Ctrl+U", "Subrayar el texto seleccionado"),
     ("Ctrl+Shift+U", "Resaltar el texto seleccionado"),
     ("Ctrl+T", "Insertar una nota de texto en la página"),
@@ -103,7 +103,7 @@ pub fn build_menu_bar() -> gtk::PopoverMenuBar {
     edit_menu.append(Some("Deshacer"), Some("win.undo"));
     edit_menu.append(Some("Rehacer"), Some("win.redo"));
     edit_menu.append(Some("Editar texto de la nota"), Some("win.note-edit"));
-    edit_menu.append(Some("Borrar la nota"), Some("win.note-delete"));
+    edit_menu.append(Some("Borrar la anotación"), Some("win.note-delete"));
     edit_menu.append(Some("Buscar…"), Some("win.search"));
     edit_menu.append(Some("Subrayar"), Some("win.underline"));
     edit_menu.append(Some("Resaltar"), Some("win.highlight"));

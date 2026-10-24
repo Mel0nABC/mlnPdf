@@ -66,6 +66,10 @@ const NOTE_CURSOR_REACH: f64 = 2.0;
 /// "move" selects and drags the note.
 const NOTE_HIT_TOLERANCE: f64 = 2.0;
 
+/// Tolerance around an underline line or a highlight rectangle, in logical
+/// pixels, so the mark can be clicked to select it.
+const MARK_HIT_TOLERANCE: f64 = 4.0;
+
 /// Width of the thumbnails in the side panel, in logical pixels.
 const THUMB_WIDTH: i32 = 120;
 
@@ -783,7 +787,7 @@ impl Viewer {
         }
 
         Self::install_shortcuts(&viewer);
-        Self::install_note_keys(&viewer);
+        Self::install_annotation_keys(&viewer);
         Self::install_ctrl_scroll(&viewer);
         Self::install_page_sync(&viewer);
         Self::install_pointer_tracking(&viewer);
@@ -935,7 +939,7 @@ impl Viewer {
         });
         Self::install_action(viewer, "note-edit", |viewer| viewer.prompt_note_edit());
         Self::install_action(viewer, "note-delete", |viewer| {
-            viewer.delete_selected_note();
+            viewer.delete_selected_annotation();
         });
         Self::install_action(viewer, "save-annotations", |viewer| viewer.save_annotations());
         Self::install_action(viewer, "save-annotations-as", |viewer| {
@@ -956,7 +960,7 @@ impl Viewer {
             controller.add_shortcut(shortcut);
         }
         viewer.ui.window.add_controller(controller);
-        viewer.refresh_note_actions();
+        viewer.refresh_edit_actions();
     }
 
     pub(crate) fn install_action<F>(viewer: &Rc<Self>, name: &str, action: F)
@@ -2534,7 +2538,7 @@ impl Viewer {
         self.annot.undo_stack.borrow_mut().clear();
         self.annot.redo_stack.borrow_mut().clear();
         *self.annot.selected.borrow_mut() = None;
-        self.refresh_note_actions();
+        self.refresh_edit_actions();
         for page in pages {
             self.queue_page_draw(page);
         }
@@ -2606,7 +2610,7 @@ impl Viewer {
             return;
         }
         *self.annot.selected.borrow_mut() = None;
-        self.refresh_note_actions();
+        self.refresh_edit_actions();
     }
 
     /// Anuncia un cambio de deshacer o rehacer por el canal accesible.
@@ -2629,7 +2633,7 @@ impl Viewer {
         self.set_text_tool(false);
         self.set_mark_mode(MarkKind::Underline, false);
         self.set_mark_mode(MarkKind::Highlight, false);
-        self.refresh_note_actions();
+        self.refresh_edit_actions();
     }
 
     /// Identificador de una anotación nueva: único en esta sesión y estable
@@ -2662,6 +2666,26 @@ impl Viewer {
         })
     }
 
+    /// Marcado bajo el punto `(x, y)` de la vista, si hay alguno. El subrayado se
+    /// agarra por su línea y el resaltado por dentro del rectángulo; la última
+    /// anotación dibujada gana.
+    pub(crate) fn mark_at(&self, page: usize, x: f64, y: f64) -> Option<String> {
+        let point = self.view_to_pdf(page, x, y)?;
+        let zoom = self.view.zoom.get();
+        let tolerance = if zoom > 0.0 {
+            MARK_HIT_TOLERANCE / zoom
+        } else {
+            0.0
+        };
+        let edits = self.annot.edits.borrow();
+        edits.iter().rev().find_map(|edit| match &edit.value {
+            Annotation::Mark(mark) if mark.page == page && mark.contains(point, tolerance) => {
+                Some(edit.id.clone())
+            }
+            _ => None,
+        })
+    }
+
     /// Copia de la nota `id`, si esa anotación existe y es una nota de texto.
     pub(crate) fn note(&self, id: &str) -> Option<TextNote> {
         self.annot
@@ -2677,7 +2701,7 @@ impl Viewer {
 
     /// Elige una anotación (o ninguna) y redibuja las páginas que cambian. Sólo
     /// una puede estar elegida: es la que responde a `Supr` y al menú.
-    pub(crate) fn select_note(&self, id: Option<String>) {
+    pub(crate) fn select_annotation(&self, id: Option<String>) {
         let previous = self.annot.selected.borrow().clone();
         if previous == id {
             return;
@@ -2687,7 +2711,7 @@ impl Viewer {
             self.edit_page(id.as_deref()),
         ];
         *self.annot.selected.borrow_mut() = id;
-        self.refresh_note_actions();
+        self.refresh_edit_actions();
         for page in pages.into_iter().flatten() {
             self.queue_page_draw(page);
         }
@@ -2704,40 +2728,47 @@ impl Viewer {
             .map(|edit| edit.value.page())
     }
 
-    /// Habilita las acciones de la nota sólo mientras hay una elegida: sin
-    /// selección no hay nada que editar ni borrar.
-    fn refresh_note_actions(&self) {
-        let selected = self.annot.selected.borrow().is_some();
-        for name in ["note-edit", "note-delete"] {
+    /// Habilita las acciones de la anotación elegida: editar solo si es una nota
+    /// de texto, borrar siempre que haya algo elegido.
+    fn refresh_edit_actions(&self) {
+        let selected = self.annot.selected.borrow().clone();
+        let is_note = selected.as_ref().is_some_and(|id| {
+            self.annot
+                .edits
+                .borrow()
+                .iter()
+                .any(|edit| edit.id == *id && matches!(edit.value, Annotation::Note(_)))
+        });
+        for (name, enabled) in [("note-edit", is_note), ("note-delete", selected.is_some())] {
             let action = self
                 .ui
                 .window
                 .lookup_action(name)
                 .and_then(|action| action.downcast::<gio::SimpleAction>().ok());
             if let Some(action) = action {
-                action.set_enabled(selected);
+                action.set_enabled(enabled);
             }
         }
     }
 
-    /// Borra la nota elegida. La instantánea va antes de tocar la lista: el
-    /// borrado se deshace como cualquier otro cambio.
-    pub(crate) fn delete_selected_note(&self) -> bool {
+    /// Borra la anotación elegida, sea una nota o un marcado. La instantánea va
+    /// antes de tocar la lista: el borrado se deshace como cualquier otro cambio.
+    pub(crate) fn delete_selected_annotation(&self) -> bool {
         let Some(id) = self.annot.selected.borrow().clone() else {
             return false;
         };
         let Some(page) = self.edit_page(Some(&id)) else {
-            self.select_note(None);
+            self.select_annotation(None);
             return false;
         };
         self.begin_edit();
         self.annot.edits.borrow_mut().retain(|edit| edit.id != id);
         *self.annot.selected.borrow_mut() = None;
-        self.refresh_note_actions();
+        self.refresh_edit_actions();
         self.queue_page_draw(page);
         self.ui
             .window
-            .announce("Nota borrada", gtk::AccessibleAnnouncementPriority::Medium);
+            .announce("Anotación borrada", gtk::AccessibleAnnouncementPriority::Medium);
         true
     }
 
@@ -2765,7 +2796,7 @@ impl Viewer {
         if self.sel.selection.borrow_mut().take().is_some() {
             self.sel.selection_rects.borrow_mut().clear();
         }
-        self.select_note(Some(id.clone()));
+        self.select_annotation(Some(id.clone()));
         *self.annot.note_drag.borrow_mut() = Some(NoteDrag {
             id,
             page,
@@ -2982,13 +3013,14 @@ impl Viewer {
         self.ui.window.set_cursor(cursor.as_ref());
     }
 
-    /// Menú contextual de la nota: editar el texto, borrarla o armar el movimiento
-    /// con el cursor de cuatro flechas. Los botones llaman directamente a la
+    /// Menú contextual de una anotación: una nota ofrece editar el texto y
+    /// borrarla; un marcado, solo eliminarlo. Los botones llaman directamente a la
     /// acción: un menú de modelo resuelve nombres de acción y puede quedar
     /// insensible cuando cuelga de una página, y el diálogo tiene que abrirse
     /// después de que el menú se cierre.
-    pub(crate) fn open_note_menu(
+    pub(crate) fn open_annotation_menu(
         self: &Rc<Self>,
+        id: String,
         anchor: &gtk::DrawingArea,
         x: f64,
         y: f64,
@@ -3003,27 +3035,31 @@ impl Viewer {
         content.set_margin_end(6);
         content.set_width_request(190);
 
-        let edit = note_menu_button("Editar texto");
-        {
-            let weak = Rc::downgrade(self);
-            let popover_ref = popover.downgrade();
-            edit.connect_clicked(move |_| {
-                if let Some(popover) = popover_ref.upgrade() {
-                    popover.popdown();
-                }
-                // Presentar el modal mientras el popover todavía tiene el grab
-                // deja la ventana detrás del menú; se abre cuando ya se cerró.
-                let weak = weak.clone();
-                glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
-                    if let Some(viewer) = weak.upgrade() {
-                        viewer.prompt_note_edit();
+        // Sólo una nota tiene texto que editar; un marcado solo se borra.
+        let is_note = self.note(&id).is_some();
+        if is_note {
+            let edit = context_menu_button("Editar texto");
+            {
+                let weak = Rc::downgrade(self);
+                let popover_ref = popover.downgrade();
+                edit.connect_clicked(move |_| {
+                    if let Some(popover) = popover_ref.upgrade() {
+                        popover.popdown();
                     }
+                    // Presentar el modal mientras el popover todavía tiene el grab
+                    // deja la ventana detrás del menú; se abre cuando ya se cerró.
+                    let weak = weak.clone();
+                    glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
+                        if let Some(viewer) = weak.upgrade() {
+                            viewer.prompt_note_edit();
+                        }
+                    });
                 });
-            });
+            }
+            content.append(&edit);
         }
-        content.append(&edit);
 
-        let delete = note_menu_button("Borrar");
+        let delete = context_menu_button(if is_note { "Borrar" } else { "Eliminar" });
         {
             let weak = Rc::downgrade(self);
             let popover_ref = popover.downgrade();
@@ -3032,7 +3068,7 @@ impl Viewer {
                     popover.popdown();
                 }
                 if let Some(viewer) = weak.upgrade() {
-                    viewer.delete_selected_note();
+                    viewer.delete_selected_annotation();
                 }
             });
         }
@@ -3059,7 +3095,7 @@ impl Viewer {
     /// `Supr` y `Retroceso` borran la nota elegida. El controlador va en fase de
     /// burbuja y no hace nada cuando el foco está en un campo de texto: ahí esas
     /// teclas borran caracteres.
-    pub(crate) fn install_note_keys(viewer: &Rc<Self>) {
+    pub(crate) fn install_annotation_keys(viewer: &Rc<Self>) {
         let keys = gtk::EventControllerKey::new();
         keys.set_propagation_phase(gtk::PropagationPhase::Bubble);
         let weak = Rc::downgrade(viewer);
@@ -3070,7 +3106,7 @@ impl Viewer {
             let Some(viewer) = weak.upgrade() else {
                 return glib::Propagation::Proceed;
             };
-            if viewer.text_input_focused() || !viewer.delete_selected_note() {
+            if viewer.text_input_focused() || !viewer.delete_selected_annotation() {
                 return glib::Propagation::Proceed;
             }
             glib::Propagation::Stop
@@ -3162,6 +3198,15 @@ impl Viewer {
                 }
             }
         }
+
+        // El contorno de la anotación elegida va al final, sobre todo lo demás.
+        if let Some(id) = selected.as_deref()
+            && let Some(edit) = edits.iter().find(|edit| edit.id == id)
+            && let Annotation::Mark(mark) = &edit.value
+            && mark.page == page
+        {
+            draw_mark_selection(context, mark, size, rotation, zoom);
+        }
     }
 
     /// Closes one of our modal dialogs in the order that leaves the parent
@@ -3230,7 +3275,7 @@ impl Viewer {
             return glib::Propagation::Stop;
         }
         if self.annot.selected.borrow().is_some() {
-            self.select_note(None);
+            self.select_annotation(None);
             return glib::Propagation::Stop;
         }
         glib::Propagation::Proceed
@@ -3952,29 +3997,34 @@ impl Viewer {
             let Some(viewer) = weak.upgrade() else {
                 return;
             };
-            if viewer.input.hand_mode.get()
-                || viewer.text_tool_active()
-                || viewer.active_mark_tool().is_some()
-            {
+            if viewer.input.hand_mode.get() || viewer.text_tool_active() {
                 return;
             }
-            match (gesture.current_button(), viewer.note_at(page, x, y)) {
-                (gdk::BUTTON_SECONDARY, Some(id)) => {
+            // La nota gana sobre un marcado que la cubra; si no hay nota, se
+            // prueba el subrayado o el resaltado.
+            let hit = viewer
+                .note_at(page, x, y)
+                .map(|id| (id, true))
+                .or_else(|| viewer.mark_at(page, x, y).map(|id| (id, false)));
+            match (gesture.current_button(), hit) {
+                (gdk::BUTTON_SECONDARY, Some((id, _))) => {
                     viewer.release_text_focus();
-                    viewer.select_note(Some(id.clone()));
-                    viewer.open_note_menu(&canvas_for_menu, x, y);
+                    viewer.select_annotation(Some(id.clone()));
+                    viewer.open_annotation_menu(id, &canvas_for_menu, x, y);
                     gesture.set_state(gtk::EventSequenceState::Claimed);
                 }
-                (gdk::BUTTON_PRIMARY, Some(id)) => {
+                (gdk::BUTTON_PRIMARY, Some((id, is_note))) => {
                     viewer.release_text_focus();
-                    viewer.select_note(Some(id));
-                    if presses >= 2 {
+                    viewer.select_annotation(Some(id));
+                    // El doble clic abre el editor solo para una nota y fuera de
+                    // las herramientas de marcado, donde el clic arma un marcado.
+                    if is_note && presses >= 2 && viewer.active_mark_tool().is_none() {
                         viewer.prompt_note_edit();
                     }
                 }
                 (gdk::BUTTON_PRIMARY, None) => {
                     viewer.release_text_focus();
-                    viewer.select_note(None);
+                    viewer.select_annotation(None);
                 }
                 _ => {}
             }
@@ -4023,6 +4073,11 @@ impl Viewer {
     pub(crate) fn update_selection(&self, page: usize, offset_x: f64, offset_y: f64) {
         if self.input.hand_mode.get() {
             return;
+        }
+        // Arrastrar para seleccionar texto (o para crear un marcado) suelta la
+        // anotación elegida: el clic simple la elige, el arrastre ya es otra cosa.
+        if self.annot.selected.borrow().is_some() {
+            self.select_annotation(None);
         }
         let Some((start_x, start_y)) = self.sel.selection_start.get() else {
             return;
@@ -6095,6 +6150,35 @@ fn measure_text(runs: &[TextRun]) -> (f64, f64) {
     )
 }
 
+/// Contorno punteado del marcado elegido, alrededor de todas sus líneas. Es la
+/// señal de que responde a `Supr` y al menú contextual.
+fn draw_mark_selection(
+    context: &cairo::Context,
+    mark: &TextMark,
+    page: (f64, f64),
+    rotation: i32,
+    zoom: f64,
+) {
+    let Some((x1, y1, x2, y2)) = mark.bounds() else {
+        return;
+    };
+    let (px1, py1) = forward_rotation((x1, y1), page, rotation);
+    let (px2, py2) = forward_rotation((x2, y2), page, rotation);
+    let left = px1.min(px2) * zoom;
+    let top = py1.min(py2) * zoom;
+    let width = ((px1 - px2).abs() * zoom).max(1.0);
+    let height = ((py1 - py2).abs() * zoom).max(1.0);
+    let dash = (4.0 * zoom).max(2.0);
+
+    let _ = context.save();
+    context.set_dash(&[dash, dash * 0.75], 0.0);
+    context.set_line_width((1.0 * zoom).max(1.0));
+    context.set_source_rgba(0.20, 0.45, 0.95, 0.9);
+    context.rectangle(left, top, width, height);
+    let _ = context.stroke();
+    let _ = context.restore();
+}
+
 /// Pinta una nota con pangocairo: cada tramo con su fuente y su color, escalado
 /// por el zoom y girado con la vista como el resto de la capa. La nota elegida
 /// lleva además un contorno punteado, que es lo que dice cuál responde a `Supr`
@@ -6241,7 +6325,7 @@ fn cursor_in_note_band(
 
 /// Botón de una entrada del menú contextual de la nota: aspecto de ítem de menú
 /// y texto alineado a la izquierda.
-fn note_menu_button(label: &str) -> gtk::Button {
+fn context_menu_button(label: &str) -> gtk::Button {
     let button = gtk::Button::with_label(label);
     button.add_css_class("flat");
     button.set_halign(gtk::Align::Fill);

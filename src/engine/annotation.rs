@@ -92,6 +92,44 @@ impl TextMark {
     pub fn is_empty(&self) -> bool {
         self.rects.is_empty()
     }
+
+    /// Caja que encierra todas las líneas, en el mismo espacio que `rects`.
+    pub fn bounds(&self) -> Option<Rect> {
+        let first = self.rects.first()?;
+        let mut bounds = (
+            first.0.min(first.2),
+            first.1.min(first.3),
+            first.0.max(first.2),
+            first.1.max(first.3),
+        );
+        for (x1, y1, x2, y2) in &self.rects {
+            bounds.0 = bounds.0.min(x1.min(*x2));
+            bounds.1 = bounds.1.min(y1.min(*y2));
+            bounds.2 = bounds.2.max(x1.max(*x2));
+            bounds.3 = bounds.3.max(y1.max(*y2));
+        }
+        Some(bounds)
+    }
+
+    /// True cuando `point` cae sobre el marcado. El subrayado se agarra por su
+    /// línea, en el borde inferior de cada rectángulo; el resaltado, por dentro
+    /// de cualquiera de sus rectángulos. La tolerancia llega en puntos del PDF.
+    pub fn contains(&self, point: (f64, f64), tolerance: f64) -> bool {
+        let (x, y) = point;
+        match self.kind {
+            MarkKind::Underline => self.rects.iter().any(|&(x1, _, x2, y2)| {
+                let left = x1.min(x2) - tolerance;
+                let right = x1.max(x2) + tolerance;
+                x >= left && x <= right && (y - y2).abs() <= tolerance
+            }),
+            MarkKind::Highlight => self.rects.iter().any(|&(x1, y1, x2, y2)| {
+                x >= x1.min(x2) - tolerance
+                    && x <= x1.max(x2) + tolerance
+                    && y >= y1.min(y2) - tolerance
+                    && y <= y1.max(y2) + tolerance
+            }),
+        }
+    }
 }
 
 /// Fuente base del PDF para una nota de texto. Las familias arbitrarias del
@@ -657,6 +695,39 @@ mod tests {
         assert_eq!(mark.page(), 4, "la página la decide el marcado");
         assert!(!mark.is_empty());
         assert!(Annotation::Mark(TextMark::underline(4, Vec::new(), (0.0, 0.0, 0.0))).is_empty());
+    }
+
+    #[test]
+    fn an_underline_is_hit_on_its_line_not_on_the_whole_text_box() {
+        let mark = TextMark::underline(0, vec![(10.0, 20.0, 60.0, 30.0)], (0.0, 0.0, 0.0));
+
+        assert!(mark.contains((35.0, 30.0), 2.0), "justo sobre la línea");
+        assert!(mark.contains((35.0, 32.0), 2.0), "dos puntos debajo");
+        assert!(!mark.contains((35.0, 25.0), 2.0), "en medio del texto, no");
+        assert!(!mark.contains((5.0, 30.0), 2.0), "fuera del ancho de la línea");
+    }
+
+    #[test]
+    fn a_highlight_is_hit_inside_its_rectangle() {
+        let mark = TextMark::highlight(0, vec![(10.0, 20.0, 60.0, 30.0)], (1.0, 1.0, 0.0));
+
+        assert!(mark.contains((35.0, 25.0), 2.0));
+        assert!(mark.contains((8.0, 25.0), 2.0), "la tolerancia llega afuera");
+        assert!(!mark.contains((5.0, 25.0), 2.0));
+        assert!(!mark.contains((35.0, 35.0), 2.0));
+    }
+
+    #[test]
+    fn the_mark_bounds_cover_every_line() {
+        let mark = TextMark::underline(
+            0,
+            vec![(10.0, 20.0, 60.0, 30.0), (10.0, 50.0, 40.0, 60.0)],
+            (0.0, 0.0, 0.0),
+        );
+        assert_eq!(mark.bounds(), Some((10.0, 20.0, 60.0, 60.0)));
+
+        let empty = TextMark::underline(0, Vec::new(), (0.0, 0.0, 0.0));
+        assert_eq!(empty.bounds(), None);
     }
 
     #[test]

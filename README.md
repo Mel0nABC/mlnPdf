@@ -65,8 +65,8 @@ ventana.
 | Salto entre coincidencias con contador `n/m` | `Ctrl+G` / `Ctrl+Shift+G` |
 | Copiar el texto de la página actual | `Ctrl+Shift+C` |
 | Selección con el ratón y copiar solo lo seleccionado | Arrastrar y `Ctrl+C` |
-| Subrayar el texto como anotación real del PDF, en el color elegido (el botón muestra ese color) | Botón al lado del zoom, `Ctrl+U`: abre el selector de color y aplica a la selección o al siguiente arrastre |
-| Resaltar el texto como rotulador, en su propio color (el botón lo muestra de fondo) | Botón al lado del zoom, `Ctrl+Shift+U`: abre el selector de color y aplica a la selección o al siguiente arrastre |
+| Subrayar el texto como anotación real del PDF, en el color elegido (el botón muestra ese color) | Botón al lado del zoom, `Ctrl+U`: abre el selector de color y aplica a la selección o al siguiente arrastre; un clic en el subrayado lo selecciona y `Supr` o `Eliminar` del menú contextual lo borra |
+| Resaltar el texto como rotulador, en su propio color (el botón lo muestra de fondo) | Botón al lado del zoom, `Ctrl+Shift+U`: abre el selector de color y aplica a la selección o al siguiente arrastre; un clic dentro del resaltado lo selecciona y `Supr` o `Eliminar` del menú contextual lo borra |
 | Insertar texto libre sobre la página, con la fuente y el color elegidos en los selectores de GTK (familia aproximada a una de las 14 estándar del PDF) | Botón `T` al lado de las otras herramientas, `Ctrl+T` o `Edit > Insertar texto…`: el diálogo pide texto (multilínea), fuente y color, y el siguiente clic fija la esquina de la nota |
 | Mover, borrar o cambiar el texto de una nota ya creada, también después de guardarla | Arrastrar la nota para moverla (en el borde el cursor es el de cuatro flechas; sobre el texto, el de edición), `Supr` (o `Retroceso`) para borrarla, doble clic o `Edit > Editar texto de la nota` para reescribirla, y clic derecho para el menú con `Editar texto` y `Borrar` |
 | Cambiar la fuente o el color de solo una parte de la nota | En el diálogo de edición, seleccionar el texto y elegir la fuente o el color; sin selección, se aplica a toda la nota |
@@ -114,7 +114,7 @@ ventana.
 | `Ctrl+C` / `Ctrl+Shift+C` | Copiar la selección / la página | `Esc` | Sale de presentación, del modo mano o de una herramienta de anotación; limpia la búsqueda |
 | `Ctrl+U` / `Ctrl+Shift+U` | Subrayar / resaltar | `Ctrl+T` | Insertar una nota de texto en la página |
 | `Ctrl+Z` | Deshacer el último cambio | `Ctrl+Shift+Z` / `Ctrl+Y` | Rehacer el cambio deshecho |
-| `Supr` | Borrar la nota seleccionada | `Ctrl+S` / `Ctrl+Shift+S` | Guardar / guardar como |
+| `Supr` | Borrar la anotación seleccionada | `Ctrl+S` / `Ctrl+Shift+S` | Guardar / guardar como |
 
 La lista completa está en `Help > Atajos de teclado…` dentro de la aplicación.
 
@@ -168,7 +168,7 @@ Probado con GTK 4.24 y poppler-glib 26.10.
 
 ```bash
 cargo build --release
-cargo test                 # 99 pruebas: motor, render, selección, búsqueda, páginas, sesión, anotaciones
+cargo test                 # 102 pruebas: motor, render, selección, búsqueda, páginas, sesión, anotaciones
 cargo test -- --ignored    # prueba de display: atajos, zoom y propiedad del viewer
 ```
 

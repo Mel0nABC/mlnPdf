@@ -312,8 +312,8 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         );
         assert_eq!(
             edit_labels.get(rehacer + 2).map(String::as_str),
-            Some("Borrar la nota"),
-            "el menú Edit borra la nota justo después de editar: {edit_labels:?}"
+            Some("Borrar la anotación"),
+            "el menú Edit borra la anotación justo después de editar: {edit_labels:?}"
         );
 
         // Help reúne los atajos y el «Acerca de»; el icono de la aplicación se
@@ -594,6 +594,73 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         assert_eq!(mark_at(&viewer, 3).color, [1.0, 0.5, 0.0]);
         viewer.set_mark_mode(MarkKind::Highlight, false);
 
+        // Un clic sobre un marcado lo elige; Supr o el menú lo borran.
+        let underline = mark_at(&viewer, 0);
+        let underline_line = underline.rects[0];
+        let page_size = viewer.doc.page_sizes.borrow()[0];
+        let line_center = forward_rotation(
+            ((underline_line.0 + underline_line.2) / 2.0, underline_line.3),
+            page_size,
+            viewer.view.rotation.get(),
+        );
+        let zoom = viewer.view.zoom.get();
+        let found_id = viewer
+            .mark_at(0, line_center.0 * zoom, line_center.1 * zoom)
+            .expect("el clic sobre la línea de un marcado lo encuentra");
+        viewer.select_annotation(Some(found_id.clone()));
+        let edit_action = viewer
+            .ui
+            .window
+            .lookup_action("note-edit")
+            .and_then(|action| action.downcast::<gio::SimpleAction>().ok())
+            .expect("la acción de editar existe");
+        let delete_action = viewer
+            .ui
+            .window
+            .lookup_action("note-delete")
+            .and_then(|action| action.downcast::<gio::SimpleAction>().ok())
+            .expect("la acción de borrar existe");
+        assert!(
+            !edit_action.is_enabled(),
+            "un marcado no se edita como texto"
+        );
+        assert!(
+            delete_action.is_enabled(),
+            "un marcado se puede borrar"
+        );
+        assert!(
+            viewer.delete_selected_annotation(),
+            "Supr borra el marcado elegido"
+        );
+        assert_eq!(viewer.annot.edits.borrow().len(), 3);
+        assert!(viewer.undo(), "el borrado del marcado se deshace");
+        assert_eq!(viewer.annot.edits.borrow().len(), 4);
+
+        // Menú contextual del resaltado: solo Eliminar, sin editar texto.
+        let highlight_id = edit_id(&viewer, 2);
+        viewer.select_annotation(Some(highlight_id.clone()));
+        let mark_anchor = viewer.doc.slots.borrow()[0].canvas.clone();
+        let popover =
+            viewer.open_annotation_menu(highlight_id.clone(), &mark_anchor, 20.0, 20.0);
+        assert!(
+            labeled_button(popover.upcast_ref::<gtk::Widget>(), "Editar texto").is_none(),
+            "un marcado no ofrece editar texto"
+        );
+        let delete_button = labeled_button(popover.upcast_ref::<gtk::Widget>(), "Eliminar")
+            .expect("el menú del marcado ofrece Eliminar");
+        delete_button.emit_by_name::<()>("clicked", &[]);
+        assert!(
+            !viewer
+                .annot
+                .edits
+                .borrow()
+                .iter()
+                .any(|edit| edit.id == highlight_id),
+            "Eliminar quita el resaltado"
+        );
+        assert!(viewer.undo(), "el borrado del resaltado se deshace");
+        assert_eq!(viewer.annot.edits.borrow().len(), 4);
+
         // Insertar texto: el borrador que deja el diálogo (acá se carga directo,
         // porque una prueba no puede manejar la ventana modal) se coloca con un
         // clic sobre la página y queda pendiente como cualquier otra anotación.
@@ -662,7 +729,7 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         // S1: el recuadro punteado de la nota elegida rodea el texto en vez de
         // quedar justo por encima. Se rasteriza la capa de anotaciones y se
         // comparan la caja del contorno azul y la de la tinta negra.
-        viewer.select_note(Some(edit_id(&viewer, 4)));
+        viewer.select_annotation(Some(edit_id(&viewer, 4)));
         let side = 200;
         let pixels = annotation_pixels(&viewer, 0, side, side);
         let dashed = pixel_box(side, &pixels, |[red, green, blue]| {
@@ -681,7 +748,7 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             ink.1 > dashed.1,
             "el texto no puede quedar por encima del recuadro: tinta {ink:?}, caja {dashed:?}"
         );
-        viewer.select_note(None);
+        viewer.select_annotation(None);
 
         // Deshacer y rehacer también alcanzan a la nota.
         assert!(viewer.undo(), "deshacer alcanza a la nota");
@@ -953,7 +1020,7 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         assert_eq!(before.text(), "Nota (insertada) ñandú");
 
         // Un clic sobre la nota la elige y habilita sus acciones.
-        viewer.select_note(Some(note_id.clone()));
+        viewer.select_annotation(Some(note_id.clone()));
         assert_eq!(
             viewer.annot.selected.borrow().clone(),
             Some(note_id.clone()),
@@ -995,7 +1062,7 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
 
         // Borrar: `Supr` y el menú llaman a esto mismo. Deshacer la recupera y
         // rehacer la vuelve a borrar.
-        assert!(viewer.delete_selected_note(), "se borra la nota elegida");
+        assert!(viewer.delete_selected_annotation(), "se borra la nota elegida");
         assert_eq!(viewer.annot.edits.borrow().len(), 6);
         assert!(
             viewer.annot.selected.borrow().is_none(),
@@ -1171,7 +1238,7 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         );
 
         // Esc deselecciona cuando no hay ninguna herramienta armada.
-        viewer.select_note(Some(note_id.clone()));
+        viewer.select_annotation(Some(note_id.clone()));
         assert_eq!(
             viewer.escape_pressed(),
             gtk::glib::Propagation::Stop,
@@ -1192,8 +1259,8 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         // (después de cerrarse el menú), borrar quita la nota y mover arma el
         // cursor de cuatro flechas.
         let menu_anchor = viewer.doc.slots.borrow()[0].canvas.clone();
-        viewer.select_note(Some(note_id.clone()));
-        let popover = viewer.open_note_menu(&menu_anchor, 20.0, 20.0);
+        viewer.select_annotation(Some(note_id.clone()));
+        let popover = viewer.open_annotation_menu(note_id.clone(), &menu_anchor, 20.0, 20.0);
         let edit_button = labeled_button(popover.upcast_ref::<gtk::Widget>(), "Editar texto")
             .expect("el menú de la nota ofrece Editar texto");
         edit_button.emit_by_name::<()>("clicked", &[]);
@@ -1216,8 +1283,8 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             "el diálogo de edición se cierra con Cancelar"
         );
 
-        viewer.select_note(Some(note_id.clone()));
-        let popover = viewer.open_note_menu(&menu_anchor, 20.0, 20.0);
+        viewer.select_annotation(Some(note_id.clone()));
+        let popover = viewer.open_annotation_menu(note_id.clone(), &menu_anchor, 20.0, 20.0);
         let delete_button = labeled_button(popover.upcast_ref::<gtk::Widget>(), "Borrar")
             .expect("el menú de la nota ofrece Borrar");
         delete_button.emit_by_name::<()>("clicked", &[]);
