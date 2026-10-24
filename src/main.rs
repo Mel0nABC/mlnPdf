@@ -260,6 +260,18 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             Some("Tachar (Ctrl+Alt+U)"),
             "la herramienta de tachar se anuncia con su atajo"
         );
+        // El tachado ya no es una etiqueta con markup de Pango: a tamaño de botón
+        // Pango dibuja la línea con el grosor de la fuente y apenas se ve, así que
+        // el icono se pinta a mano en un área de dibujo del tamaño del botón.
+        assert!(
+            children[7]
+                .clone()
+                .downcast::<gtk::ToggleButton>()
+                .expect("el tachado es un ToggleButton")
+                .child()
+                .is_some_and(|child| child.is::<gtk::DrawingArea>()),
+            "el icono de tachar es un área de dibujo, no una etiqueta con markup"
+        );
         assert_eq!(
             children[8].tooltip_text().as_deref(),
             Some("Insertar texto (Ctrl+T)"),
@@ -651,6 +663,14 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             "hay texto seleccionado antes de pulsar la herramienta"
         );
         viewer.accept_mark_color(MarkKind::Underline, (0.15, 0.45, 0.85));
+        assert!(
+            viewer.ui.tools[MarkKind::Underline.index()]
+                .button
+                .child()
+                .and_then(|child| child.downcast::<gtk::Label>().ok())
+                .is_some_and(|glyph| glyph.label().contains("#2673d9")),
+            "el botón de subrayar sigue mostrando el color elegido con markup"
+        );
         assert_eq!(
             viewer.annot.edits.borrow().len(),
             1,
@@ -798,8 +818,11 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             "armar el tachado apaga las otras dos herramientas"
         );
         assert!(
-            mark_glyph_markup(MarkKind::StrikeOut, STRIKEOUT_COLOR).contains("strikethrough"),
-            "el botón de tachar lleva la línea en su glifo"
+            viewer.ui.tools[MarkKind::StrikeOut.index()]
+                .button
+                .child()
+                .is_some_and(|child| child.is::<gtk::DrawingArea>()),
+            "el botón de tachar lleva su línea en un área de dibujo que sigue el color"
         );
         // La capa de anotaciones dibuja una línea por el medio de cada línea de
         // texto, no sobre el borde inferior como el subrayado.

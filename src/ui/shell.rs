@@ -874,6 +874,35 @@ impl Viewer {
         Self::connect_click(&viewer, &zoom_in_button, |viewer| viewer.zoom_in());
         Self::connect_click(&viewer, &zoom_out_button, |viewer| viewer.zoom_out());
 
+        // El icono del tachado se pinta a mano: Pango toma el grosor de su línea
+        // de la métrica de la fuente y a tamaño de botón queda de un píxel, casi
+        // invisible con colores claros. El área de dibujo lee el color de la
+        // herramienta al pintar, así que sigue el que elige el lector sin
+        // reescribir markup.
+        {
+            let weak = Rc::downgrade(&viewer);
+            if let Some(area) = viewer.ui.tools[MarkKind::StrikeOut.index()]
+                .button
+                .child()
+                .and_then(|child| child.downcast::<gtk::DrawingArea>().ok())
+            {
+                area.set_draw_func(move |area, context, width, height| {
+                    let Some(viewer) = weak.upgrade() else {
+                        return;
+                    };
+                    // La letra usa el color de texto del tema, que sigue el modo
+                    // claro u oscuro; la línea, el color de la herramienta.
+                    let ink = area.color();
+                    draw_strikeout_glyph(
+                        context,
+                        f64::from(width.min(height)),
+                        viewer.mark_tool(MarkKind::StrikeOut).color,
+                        (ink.red().into(), ink.green().into(), ink.blue().into()),
+                    );
+                });
+            }
+        }
+
         for kind in [MarkKind::Underline, MarkKind::Highlight, MarkKind::StrikeOut] {
             let ui = &viewer.ui.tools[kind.index()];
 
@@ -2250,11 +2279,18 @@ impl Viewer {
     }
 
     /// Pinta el color elegido en el botón de la herramienta, para no tener que
-    /// abrir el selector solo para recordarlo.
+    /// abrir el selector solo para recordarlo. El subrayado y el resaltado lo
+    /// muestran en el markup de su etiqueta; el tachado se pinta a mano y lee el
+    /// color al dibujar, así que basta repintarlo.
     fn refresh_mark_button(&self, kind: MarkKind) {
         let ui = &self.ui.tools[kind.index()];
-        if let Some(glyph) = ui.button.child().and_then(|child| child.downcast::<gtk::Label>().ok()) {
+        let Some(child) = ui.button.child() else {
+            return;
+        };
+        if let Ok(glyph) = child.clone().downcast::<gtk::Label>() {
             glyph.set_markup(&mark_glyph_markup(kind, self.mark_tool(kind).color));
+        } else if let Ok(area) = child.downcast::<gtk::DrawingArea>() {
+            area.queue_draw();
         }
     }
 
@@ -8563,7 +8599,9 @@ fn mark_spec(kind: MarkKind) -> MarkToolSpec {
 
 /// Glifo del botón con el color de la herramienta: la "U" lleva la línea en ese
 /// color, la "A" lo lleva de fondo, con letra clara si el fondo es oscuro, y la
-/// "S" lleva el tachado en ese color.
+/// "S" lleva el tachado en ese color. El botón del tachado no usa este marcado:
+/// pinta su icono a mano con `draw_strikeout_glyph`, porque a tamaño de botón la
+/// línea de Pango queda de un píxel y apenas se ve.
 pub(crate) fn mark_glyph_markup(kind: MarkKind, color: (f64, f64, f64)) -> String {
     let hex = hex_color(color);
     match kind {
@@ -8592,15 +8630,91 @@ fn hex_color(color: (f64, f64, f64)) -> String {
     )
 }
 
+/// Lado lógico del área que dibuja el icono del botón de tachado.
+const STRIKEOUT_GLYPH_SIZE: i32 = 18;
+
+/// Grosor de la línea del icono de tachado, en píxeles lógicos: Pango la dibuja
+/// con el grosor de la métrica de la fuente y a este tamaño deja un solo píxel.
+const STRIKEOUT_GLYPH_WIDTH: f64 = 2.5;
+
+/// Dibuja el icono del botón de tachado: una «S» en negrita con una línea del
+/// color de la herramienta cruzada de lado a lado. `ink` es el color de texto del
+/// tema, para que la letra se lea tanto en modo claro como en modo oscuro.
+fn draw_strikeout_glyph(
+    context: &cairo::Context,
+    size: f64,
+    color: (f64, f64, f64),
+    ink: (f64, f64, f64),
+) {
+    let size = if size.is_finite() && size > 0.0 {
+        size
+    } else {
+        f64::from(STRIKEOUT_GLYPH_SIZE)
+    };
+    let layout = pangocairo::functions::create_layout(context);
+    let mut description = pango::FontDescription::new();
+    description.set_family("Sans");
+    description.set_weight(pango::Weight::Bold);
+    // Tamaño absoluto: el icono es fijo en pantalla y no depende de los puntos
+    // por pulgada del contexto, como el texto de un sello.
+    let points = (size * 0.95).max(1.0);
+    description.set_absolute_size((points * f64::from(pango::SCALE)).round());
+    layout.set_font_description(Some(&description));
+    layout.set_text("S");
+
+    // La tinta de la letra centra el glifo y mide la línea. La caja lógica
+    // incluye ascendente y descendente, que dejarían la «S» descentrada.
+    let Some(line) = layout.line(0) else {
+        return;
+    };
+    let (ink_rect, logical_rect) = line.pixel_extents();
+    let (ink_width, ink_height) = (f64::from(ink_rect.width()), f64::from(ink_rect.height()));
+    let ink_left = (size - ink_width) / 2.0;
+    let ink_top = (size - ink_height) / 2.0;
+    // `show_layout` deja la esquina superior izquierda de la caja lógica en el
+    // punto actual, mientras que las cajas de tinta se miden desde la línea de
+    // base: la resta lleva la tinta justo al centro del área.
+    let (origin_x, origin_y) = (
+        ink_left - f64::from(ink_rect.x() - logical_rect.x()),
+        ink_top - f64::from(ink_rect.y() - logical_rect.y()),
+    );
+
+    context.move_to(origin_x, origin_y);
+    context.set_source_rgb(ink.0, ink.1, ink.2);
+    pangocairo::functions::show_layout(context, &layout);
+
+    // La línea cruza la letra de lado a lado, un píxel más allá de su tinta: así
+    // se lee como un tachado y no como un rasgo más de la «S».
+    let middle = ink_top + ink_height / 2.0;
+    let line_left = (ink_left - 1.0).max(0.0);
+    let line_right = (ink_left + ink_width + 1.0).min(size);
+    context.set_line_cap(cairo::LineCap::Butt);
+    context.set_line_width(STRIKEOUT_GLYPH_WIDTH.max(2.0));
+    context.set_source_rgb(color.0, color.1, color.2);
+    context.move_to(line_left, middle);
+    context.line_to(line_right, middle);
+    let _ = context.stroke();
+}
+
 /// Botón y selector de color de una herramienta de marcado.
 fn build_mark_tool(spec: &MarkToolSpec) -> MarkToolUi {
-    let glyph = gtk::Label::new(None);
-    glyph.set_markup(&mark_glyph_markup(spec.kind, spec.default_color));
     let button = gtk::ToggleButton::builder()
-        .child(&glyph)
         .tooltip_text(spec.tooltip)
         .margin_start(6)
         .build();
+    if spec.kind == MarkKind::StrikeOut {
+        // El tachado dibuja su icono en un área propia; el visor le instala la
+        // función de dibujo cuando ya puede leer el color de la herramienta.
+        let area = gtk::DrawingArea::builder()
+            .width_request(STRIKEOUT_GLYPH_SIZE)
+            .height_request(STRIKEOUT_GLYPH_SIZE)
+            .build();
+        button.set_child(Some(&area));
+    } else {
+        let glyph = gtk::Label::new(None);
+        glyph.set_markup(&mark_glyph_markup(spec.kind, spec.default_color));
+        button.set_child(Some(&glyph));
+    }
     accessible_label(&button, spec.accessible);
 
     // El selector de color de GTK, el mismo que ofrece el sistema.
@@ -9385,6 +9499,109 @@ mod tests {
         assert!(
             (8..=10).contains(&widest),
             "la punta tiene la base que pide la regla del motor: {widest} px"
+        );
+    }
+
+    /// Rasteriza el icono del botón de tachado sobre papel blanco y devuelve su
+    /// lado y sus píxeles como `[r, g, b]`.
+    fn strikeout_glyph_pixels(color: (f64, f64, f64)) -> (usize, Vec<[u8; 3]>) {
+        let side = usize::try_from(STRIKEOUT_GLYPH_SIZE).expect("lado del icono");
+        let mut surface =
+            cairo::ImageSurface::create(cairo::Format::ARgb32, side as i32, side as i32)
+                .expect("crear la superficie");
+        {
+            let context = cairo::Context::new(&surface).expect("contexto");
+            context.set_source_rgb(1.0, 1.0, 1.0);
+            context.paint().expect("fondo blanco");
+            // La tinta de la letra es el color de texto del tema y el color
+            // pedido es el de la herramienta, como en el botón real.
+            draw_strikeout_glyph(&context, side as f64, color, (0.1, 0.1, 0.1));
+        }
+        surface.flush();
+
+        let stride = usize::try_from(surface.stride()).expect("stride");
+        let data = surface.data().expect("píxeles");
+        let mut pixels = Vec::with_capacity(side * side);
+        for row in 0..side {
+            for column in 0..side {
+                let offset = row * stride + column * 4;
+                pixels.push([data[offset + 2], data[offset + 1], data[offset]]);
+            }
+        }
+        (side, pixels)
+    }
+
+    #[test]
+    fn strikeout_glyph_draws_the_letter_under_a_visible_line() {
+        let (side, pixels) = strikeout_glyph_pixels((0.85, 0.10, 0.10));
+        let red: Vec<(usize, usize)> = pixels
+            .iter()
+            .enumerate()
+            .filter(|(_, pixel)| is_red(**pixel))
+            .map(|(index, _)| (index % side, index / side))
+            .collect();
+        assert!(!red.is_empty(), "la línea del tachado se pinta con su color");
+
+        // El grosor que Pango deja en un píxel no alcanza: la línea tiene que
+        // ocupar al menos dos filas de píxeles.
+        let rows: std::collections::BTreeSet<usize> = red.iter().map(|(_, row)| *row).collect();
+        assert!(
+            rows.len() >= 2,
+            "la línea mide al menos dos píxeles de alto: {rows:?}"
+        );
+
+        // Cruza la letra de lado a lado, no un tramo corto en el medio.
+        let min_column = red.iter().map(|(column, _)| *column).min().unwrap_or(side);
+        let max_column = red.iter().map(|(column, _)| *column).max().unwrap_or(0);
+        assert!(
+            min_column <= side / 4,
+            "la línea llega al lado izquierdo de la «S»: empieza en {min_column}"
+        );
+        assert!(
+            max_column >= side * 3 / 4,
+            "la línea llega al lado derecho de la «S»: termina en {max_column}"
+        );
+        let center = side / 2;
+        assert!(
+            red.iter().any(|(column, _)| *column == center),
+            "la línea pasa por el centro del icono"
+        );
+
+        // La letra asoma por encima y por debajo de la línea: se lee como una
+        // «S» tachada y no como una raya suelta.
+        let band = (
+            *rows.iter().next().expect("fila de la línea"),
+            *rows.iter().next_back().expect("fila de la línea"),
+        );
+        let dark_between = |from: usize, to: usize| {
+            (from..to).any(|row| (0..side).any(|column| is_black(pixels[row * side + column])))
+        };
+        assert!(dark_between(0, band.0), "la «S» se ve encima de la línea");
+        assert!(
+            dark_between(band.1 + 1, side),
+            "la «S» se ve debajo de la línea"
+        );
+    }
+
+    #[test]
+    fn strikeout_glyph_follows_the_chosen_color() {
+        let (_, red_pixels) = strikeout_glyph_pixels((0.85, 0.10, 0.10));
+        let (_, blue_pixels) = strikeout_glyph_pixels((0.10, 0.20, 0.90));
+        assert!(
+            red_pixels.iter().any(|pixel| is_red(*pixel)),
+            "con rojo elegido la línea es roja"
+        );
+        assert!(
+            blue_pixels.iter().any(|pixel| is_blue(*pixel)),
+            "con azul elegido la línea es azul"
+        );
+        assert!(
+            !blue_pixels.iter().any(|pixel| is_red(*pixel)),
+            "el color anterior no queda en el icono"
+        );
+        assert!(
+            !red_pixels.iter().any(|pixel| is_blue(*pixel)),
+            "cada color pinta solo el suyo"
         );
     }
 
