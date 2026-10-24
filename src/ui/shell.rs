@@ -131,10 +131,6 @@ const IMAGE_HANDLE_SIZE: f64 = 7.0;
 /// Width of the thumbnails in the side panel, in logical pixels.
 const THUMB_WIDTH: i32 = 120;
 
-/// Distancia en píxeles lógicos entre la gestión de páginas y el grupo de zoom y
-/// herramientas de la barra superior.
-pub(crate) const TOOLBAR_GAP: i32 = 100;
-
 /// Time between two fling frames: a 60 Hz redraw, the same cadence as the
 /// smooth zoom.
 const PAN_FRAME_MS: u64 = 16;
@@ -770,32 +766,36 @@ impl Viewer {
         search_box.append(&search_status);
         accessible_label(&search_entry, "Buscar en el documento");
 
-        // El zoom y las herramientas abren la barra; un hueco fijo los separa de
-        // la gestión de páginas y la búsqueda queda pegada a su derecha, así que
-        // los dos grupos se leen como un bloque y no se reparten hasta los bordes.
-        let controls = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        controls.set_halign(gtk::Align::Center);
-        controls.set_hexpand(true);
-        controls.append(&zoom_box);
-        controls.append(&tools[0].button);
-        controls.append(&tools[1].button);
-        controls.append(&tools[2].button);
-        controls.append(&text_button);
-        controls.append(&image_button);
-        controls.append(&stroke_button);
-        controls.append(&toolbar_gap(TOOLBAR_GAP));
-        controls.append(&toolbar_nav.root);
-        controls.append(&search_box);
+        // La barra reparte tres zonas: el zoom y las herramientas la abren, la
+        // gestión de páginas ocupa el centro de la barra y la búsqueda la cierra a
+        // la derecha. Un CenterBox centra cada zona contra el ancho de la barra: si
+        // los tres grupos van en una sola caja centrada, el bloque de páginas queda
+        // corrido hacia el lado que tiene menos contenido.
+        let start_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        start_box.append(&zoom_box);
+        start_box.append(&tools[0].button);
+        start_box.append(&tools[1].button);
+        start_box.append(&tools[2].button);
+        start_box.append(&text_button);
+        start_box.append(&image_button);
+        start_box.append(&stroke_button);
 
-        // Secondary toolbar: the group stays centred, whatever the window width.
-        let toolbar = gtk::Box::builder()
+        // La barra ocupa todo el ancho de la ventana, con su margen interior, para
+        // que el centro de la caja sea el centro real de la barra.
+        let toolbar = gtk::CenterBox::builder()
             .orientation(gtk::Orientation::Horizontal)
+            .hexpand(true)
             .margin_top(6)
             .margin_bottom(6)
             .margin_start(6)
             .margin_end(6)
             .build();
-        toolbar.append(&controls);
+        toolbar.set_start_widget(Some(&start_box));
+        // El centro es la gestión de páginas y nada más: comparte barra con las
+        // herramientas y la búsqueda, pero no contenedor, así que su lugar lo fija
+        // el ancho de la barra y no el contenido de sus vecinas.
+        toolbar.set_center_widget(Some(&toolbar_nav.root));
+        toolbar.set_end_widget(Some(&search_box));
 
         let menu_bar = build_menu_bar();
         // Thumbnail side panel: a virtualised list, so a 666-page document only
@@ -9827,9 +9827,6 @@ fn thumbnail_row_page(row: &gtk::Widget) -> Option<usize> {
     number.parse::<usize>().ok()?.checked_sub(1)
 }
 
-/// Fixed-width spacer for the toolbar: the gap that separates the zoom and the
-/// tools from the page controls, so the distance between them is a number of
-/// the layout and not of the leftover space.
 /// Lo que distingue a una herramienta de marcado de la otra al construirla.
 struct MarkToolSpec {
     kind: MarkKind,
@@ -10384,12 +10381,6 @@ fn paint_color_sample(
         context.line_to(width - 1.0, 1.0);
         let _ = context.stroke();
     }
-}
-
-fn toolbar_gap(width: i32) -> gtk::Box {
-    let gap = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    gap.set_size_request(width, -1);
-    gap
 }
 
 /// Widens GTK's print dialog and puts the preview on its right.

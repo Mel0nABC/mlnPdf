@@ -213,29 +213,40 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         );
         assert_eq!(viewer.ui.title.label(), WINDOW_TITLE, "no document, no title");
 
-        // La barra deja el zoom y las herramientas a la izquierda, un hueco fijo
-        // aparte de la gestión de páginas, y la búsqueda pegada a su derecha, en
-        // vez de repartirlo todo hasta los bordes.
-        let controls = viewer.ui.chrome[1]
-            .first_child()
-            .expect("the toolbar holds the control group");
-        let children: Vec<gtk::Widget> = {
-            let mut children = Vec::new();
-            let mut child = controls.first_child();
-            while let Some(widget) = child {
-                child = widget.next_sibling();
-                children.push(widget);
-            }
-            children
-        };
+        // La barra superior reparte tres zonas: el zoom y las herramientas la
+        // abren, la gestión de páginas ocupa el CENTRO de la barra y la búsqueda
+        // la cierra. Centrar cada zona contra el ancho de la barra —y no contra
+        // sus vecinas— es lo que deja la gestión de páginas en el centro de la
+        // ventana aunque a su izquierda haya más contenido que a su derecha.
+        let toolbar = viewer.ui.chrome[1]
+            .clone()
+            .downcast::<gtk::CenterBox>()
+            .expect("la barra superior es un CenterBox de tres zonas");
+        assert!(
+            toolbar.hexpands(),
+            "la barra ocupa el ancho de la ventana para que su centro sea el centro"
+        );
         assert_eq!(
-            children.len(),
-            10,
-            "zoom, subrayar, resaltar, tachar, insertar texto, insertar imagen, dibujar, hueco, \
-             páginas y búsqueda"
+            (toolbar.margin_top(), toolbar.margin_bottom()),
+            (6, 6),
+            "la barra conserva el margen superior e inferior"
+        );
+        assert_eq!(
+            (toolbar.margin_start(), toolbar.margin_end()),
+            (6, 6),
+            "nada toca los bordes de la barra"
+        );
+        let start = toolbar
+            .start_widget()
+            .expect("la barra arranca con el zoom y las herramientas");
+        let tools_row = child_widgets(&start);
+        assert_eq!(
+            tools_row.len(),
+            7,
+            "zoom, subrayar, resaltar, tachar, insertar texto, insertar imagen y dibujar"
         );
         assert!(
-            !children[0].is::<gtk::ToggleButton>(),
+            !tools_row[0].is::<gtk::ToggleButton>(),
             "el bloque de zoom abre la barra y no es una herramienta"
         );
         for (index, name) in [
@@ -245,12 +256,22 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             (4, "insertar texto"),
         ] {
             assert!(
-                children[index].is::<gtk::ToggleButton>(),
+                tools_row[index].is::<gtk::ToggleButton>(),
                 "{name} va justo al lado del zoom"
             );
         }
         assert_eq!(
-            children[3].tooltip_text().as_deref(),
+            tools_row[1].tooltip_text().as_deref(),
+            Some("Subrayar (Ctrl+U)"),
+            "la herramienta de subrayar se anuncia con su atajo"
+        );
+        assert_eq!(
+            tools_row[2].tooltip_text().as_deref(),
+            Some("Resaltar (Ctrl+Shift+U)"),
+            "la herramienta de resaltar se anuncia con su atajo"
+        );
+        assert_eq!(
+            tools_row[3].tooltip_text().as_deref(),
             Some("Tachar (Ctrl+Alt+U)"),
             "la herramienta de tachar se anuncia con su atajo"
         );
@@ -258,7 +279,7 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         // Pango dibuja la línea con el grosor de la fuente y apenas se ve, así que
         // el icono se pinta a mano en un área de dibujo del tamaño del botón.
         assert!(
-            children[3]
+            tools_row[3]
                 .clone()
                 .downcast::<gtk::ToggleButton>()
                 .expect("el tachado es un ToggleButton")
@@ -267,36 +288,64 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             "el icono de tachar es un área de dibujo, no una etiqueta con markup"
         );
         assert_eq!(
-            children[4].tooltip_text().as_deref(),
+            tools_row[4].tooltip_text().as_deref(),
             Some("Insertar texto (Ctrl+T)"),
             "la herramienta de texto se anuncia con su atajo"
         );
         // Insertar imagen no es un modo que quede armado: es un botón normal con
         // icono que abre el selector de archivos en el acto.
         assert!(
-            !children[5].is::<gtk::ToggleButton>() && children[5].is::<gtk::Button>(),
+            !tools_row[5].is::<gtk::ToggleButton>() && tools_row[5].is::<gtk::Button>(),
             "insertar imagen es un botón normal, no una herramienta armada"
         );
         assert_eq!(
-            children[5].tooltip_text().as_deref(),
+            tools_row[5].tooltip_text().as_deref(),
             Some("Insertar imagen (Ctrl+Shift+I)"),
             "el botón de imagen se anuncia con su atajo"
         );
-        // La separación es una sola, entre las herramientas y las páginas, y la
-        // pide el layout, no el espacio que sobra.
+
+        // El centro de la barra es el bloque de páginas, y cuelga directo de la
+        // barra: no comparte contenedor con las herramientas ni con la búsqueda,
+        // que son zonas hermanas. Por eso GTK lo centra contra el ancho de la
+        // barra y no contra el contenido que tiene a los costados.
+        let bar = toolbar.clone().upcast::<gtk::Widget>();
+        let center = toolbar
+            .center_widget()
+            .expect("el centro de la barra es la gestión de páginas");
         assert_eq!(
-            children[7].size_request().0,
-            TOOLBAR_GAP,
-            "la única separación pide los {TOOLBAR_GAP} px"
+            center,
+            viewer.ui.navs[0].root.clone().upcast::<gtk::Widget>(),
+            "el centro de la barra es la gestión de páginas de la barra superior"
+        );
+        assert_eq!(
+            center.parent().as_ref(),
+            Some(&bar),
+            "la gestión de páginas cuelga directo de la barra, no de otro grupo"
         );
         assert_ne!(
-            children[8].size_request().0,
-            TOOLBAR_GAP,
-            "el bloque de páginas no es una separación"
+            center, start,
+            "las páginas no van dentro del bloque de herramientas"
         );
-        // La búsqueda queda pegada al lado derecho de las páginas: su bloque
-        // arranca con el icono y sigue el campo, sin hueco entre medio.
-        let search_box = children[9]
+        assert!(
+            !tools_row.iter().any(|widget| widget == &center),
+            "ningún widget de las herramientas envuelve a la gestión de páginas"
+        );
+
+        // La búsqueda cierra la barra, alineada a la derecha: su bloque arranca
+        // con el icono, sigue el campo y termina en el contador de resultados.
+        let end = toolbar
+            .end_widget()
+            .expect("la búsqueda cierra la barra, alineada a la derecha");
+        assert_eq!(
+            end.parent().as_ref(),
+            Some(&bar),
+            "la búsqueda cuelga directo de la barra, aparte de las páginas"
+        );
+        assert_ne!(
+            end, center,
+            "la búsqueda no comparte bloque con la gestión de páginas"
+        );
+        let search_box = end
             .clone()
             .downcast::<gtk::Box>()
             .expect("la búsqueda es su propio bloque al final de la barra");
@@ -323,11 +372,48 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             24,
             "el campo de búsqueda es más largo que antes (18 caracteres)"
         );
+        assert_eq!(
+            viewer.ui.search_entry.next_sibling(),
+            Some(viewer.ui.search_status.clone().upcast::<gtk::Widget>()),
+            "el contador de resultados cierra el bloque de búsqueda"
+        );
+
+        // La barra inferior no cambia: sigue al pie de la ventana con su propia
+        // gestión de páginas, fuera del CenterBox de la barra superior.
+        let bottom = viewer.ui.chrome[2].clone();
+        assert_eq!(
+            bottom,
+            viewer.ui.navs[1].root.clone().upcast::<gtk::Widget>(),
+            "la barra inferior sigue siendo la segunda gestión de páginas"
+        );
+        assert!(
+            toolbar.start_widget().as_ref() != Some(&bottom)
+                && toolbar.center_widget().as_ref() != Some(&bottom)
+                && toolbar.end_widget().as_ref() != Some(&bottom),
+            "la barra inferior no se mete en las zonas de la barra superior"
+        );
+        assert_eq!(
+            (bottom.margin_top(), bottom.margin_bottom()),
+            (6, 6),
+            "la barra inferior conserva su margen"
+        );
+        let bottom_row = child_widgets(&bottom);
+        assert_eq!(
+            bottom_row.len(),
+            3,
+            "anterior, número de página y siguiente"
+        );
+        assert!(
+            bottom_row[0].is::<gtk::Button>()
+                && bottom_row[1].is::<gtk::Box>()
+                && bottom_row[2].is::<gtk::Button>(),
+            "la barra inferior mantiene sus flechas y su bloque de página"
+        );
 
         // S3 y S4: el botón de dibujar abre un popover con las cinco herramientas,
         // el grosor libre en puntos y el color. Elegir una herramienta la arma y
         // el popover se cierra; el grosor y el color se recuerdan.
-        let stroke_menu = children[6]
+        let stroke_menu = tools_row[6]
             .clone()
             .downcast::<gtk::MenuButton>()
             .expect("el botón de dibujar es un MenuButton con su popover");
@@ -4654,6 +4740,17 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         false
+    }
+
+    /// Hijos directos de un contenedor, en el orden en que se muestran.
+    fn child_widgets(container: &gtk::Widget) -> Vec<gtk::Widget> {
+        let mut children = Vec::new();
+        let mut child = container.first_child();
+        while let Some(widget) = child {
+            child = widget.next_sibling();
+            children.push(widget);
+        }
+        children
     }
 
     /// Busca un botón por su etiqueta dentro del árbol del diálogo.
