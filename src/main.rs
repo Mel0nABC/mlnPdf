@@ -3576,7 +3576,7 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             ),
             ("el subrayado", &double_mark, DoubleClickAction::ChooseColor),
             ("el lápiz", &double_ink, DoubleClickAction::ChooseColor),
-            ("la forma", &double_shape, DoubleClickAction::ChooseColor),
+            ("la forma", &double_shape, DoubleClickAction::ShapeColors),
             ("el sello", &double_stamp, DoubleClickAction::ChooseColor),
             ("la imagen", &double_image, DoubleClickAction::None),
         ] {
@@ -3653,9 +3653,9 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         );
         drop(double_menu);
 
-        // El doble clic sobre una forma abre el mismo cambio de color que
-        // `Ctrl+Alt+C`, así que no hace falta un diálogo propio: la decisión
-        // —`ChooseColor`— ya está comprobada arriba.
+        // El doble clic sobre un rectángulo o una elipse abre su propio diálogo
+        // de contorno y relleno (`ShapeColors`), así que la decisión no es la
+        // misma que la de `Ctrl+Alt+C`; se comprueba en el bloque de S8.
         viewer.discard_edits();
         assert!(viewer.annot.edits.borrow().is_empty());
         assert!(viewer.selected_ids().is_empty());
@@ -4206,6 +4206,354 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         fill_check.set_active(false);
         viewer.set_fill_color(FILL_COLOR);
         fill_opacity.set_value(FILL_OPACITY);
+        viewer.discard_edits();
+        assert!(viewer.annot.edits.borrow().is_empty());
+        assert!(viewer.selected_ids().is_empty());
+
+        // S8 (T15): el doble clic sobre una forma rellenable abre su diálogo de
+        // colores en lugar del selector de color directo. El mapeo y las
+        // operaciones del diálogo —contorno, relleno y opacidad— se prueban por
+        // sus funciones, sin abrir la ventana modal.
+        viewer.apply_zoom(1.0);
+        let colors_rect = "mlnpdf-color-forma-rect".to_string();
+        let colors_ellipse = "mlnpdf-color-forma-elipse".to_string();
+        let colors_line = "mlnpdf-color-forma-linea".to_string();
+        let colors_arrow = "mlnpdf-color-forma-flecha".to_string();
+        viewer.annot.edits.borrow_mut().extend([
+            Edit {
+                id: colors_rect.clone(),
+                value: Annotation::Shape(Shape::new(
+                    0,
+                    ShapeKind::Rectangle,
+                    (20.0, 20.0),
+                    (80.0, 60.0),
+                    [0.0, 0.0, 0.0],
+                    2.0,
+                )),
+            },
+            Edit {
+                id: colors_ellipse.clone(),
+                value: Annotation::Shape(Shape::new(
+                    0,
+                    ShapeKind::Ellipse,
+                    (100.0, 20.0),
+                    (160.0, 60.0),
+                    [0.0, 0.0, 0.0],
+                    2.0,
+                )),
+            },
+            Edit {
+                id: colors_line.clone(),
+                value: Annotation::Shape(Shape::new(
+                    0,
+                    ShapeKind::Line,
+                    (20.0, 80.0),
+                    (80.0, 100.0),
+                    [0.0, 0.0, 0.0],
+                    2.0,
+                )),
+            },
+            Edit {
+                id: colors_arrow.clone(),
+                value: Annotation::Shape(Shape::new(
+                    0,
+                    ShapeKind::Arrow,
+                    (100.0, 80.0),
+                    (160.0, 100.0),
+                    [0.0, 0.0, 0.0],
+                    2.0,
+                )),
+            },
+        ]);
+        for (name, id, expected) in [
+            ("el rectángulo", &colors_rect, DoubleClickAction::ShapeColors),
+            ("la elipse", &colors_ellipse, DoubleClickAction::ShapeColors),
+            ("la línea", &colors_line, DoubleClickAction::ChooseColor),
+            ("la flecha", &colors_arrow, DoubleClickAction::ChooseColor),
+        ] {
+            let annotation = viewer
+                .annotation(id)
+                .unwrap_or_else(|| panic!("{name} sigue en la lista"));
+            assert_eq!(
+                double_click_action(&annotation),
+                expected,
+                "doble clic sobre {name}"
+            );
+        }
+
+        // El diálogo se presenta como ventana modal propia —no como popover— y
+        // muestra el estado de la forma que manda: sin relleno, la opacidad y el
+        // botón de quitar el relleno quedan deshabilitados.
+        viewer.select_annotation(Some(colors_rect.clone()));
+        viewer.prompt_shape_colors();
+        let mut shape_dialog: Option<gtk::Window> = None;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while shape_dialog.is_none() && std::time::Instant::now() < deadline {
+            gtk::glib::MainContext::default().iteration(false);
+            shape_dialog = gtk::Window::list_toplevels()
+                .into_iter()
+                .filter(|widget| *widget != viewer.ui.window)
+                .find_map(|widget| widget.downcast::<gtk::Window>().ok());
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let shape_dialog = shape_dialog.expect("el doble clic en la forma abre su diálogo");
+        assert_eq!(
+            shape_dialog.title().as_deref(),
+            Some("Color de la forma"),
+            "el diálogo se anuncia como «Color de la forma»"
+        );
+        assert!(shape_dialog.is_modal(), "el diálogo de la forma es modal");
+        let dialog_labels = labels(shape_dialog.clone().upcast_ref::<gtk::Widget>());
+        for expected in [
+            "Contorno",
+            "Relleno",
+            "Opacidad del relleno",
+            "sin relleno",
+            "Quitar relleno",
+            "Cerrar",
+        ] {
+            assert!(
+                dialog_labels.iter().any(|label| label == expected),
+                "el diálogo muestra «{expected}»: {dialog_labels:?}"
+            );
+        }
+        let shape_dialog_widget = shape_dialog.clone().upcast::<gtk::Widget>();
+        assert!(
+            !labeled_button(&shape_dialog_widget, "Quitar relleno")
+                .expect("el diálogo ofrece quitar el relleno")
+                .is_sensitive(),
+            "sin relleno el botón de quitarlo queda deshabilitado"
+        );
+        assert!(
+            click_dialog_button(&viewer, "Cerrar"),
+            "el diálogo se cierra con Cerrar"
+        );
+        assert!(
+            !shape_dialog.is_visible(),
+            "«Cerrar» cierra el diálogo y no revierte nada"
+        );
+
+        // Una forma hueca: la opacidad del relleno está deshabilitada.
+        viewer.select_annotation(Some(colors_rect.clone()));
+        assert_eq!(
+            viewer.selection_fill(),
+            None,
+            "la forma arranca sin relleno"
+        );
+        assert!(
+            !viewer.selection_fill_opacity_enabled(),
+            "sin relleno la opacidad queda deshabilitada"
+        );
+
+        // El contorno cambia solo, con una sola instantánea, y no toca el relleno.
+        let undo_before = viewer.annot.undo_stack.borrow().len();
+        assert!(
+            viewer.set_selection_stroke_color((0.2, 0.8, 0.3)),
+            "el contorno toma el color elegido en el diálogo"
+        );
+        assert_eq!(
+            viewer.annot.undo_stack.borrow().len(),
+            undo_before + 1,
+            "el color del contorno deja una sola instantánea"
+        );
+        let stroke_only = shape_of(&viewer, &colors_rect);
+        assert_eq!(
+            stroke_only.color,
+            [0.2, 0.8, 0.3],
+            "el contorno toma el color elegido"
+        );
+        assert_eq!(
+            stroke_only.fill, None,
+            "elegir el color del contorno no crea relleno"
+        );
+        let undo_same = viewer.annot.undo_stack.borrow().len();
+        assert!(
+            !viewer.set_selection_stroke_color((0.2, 0.8, 0.3)),
+            "el mismo contorno no cambia nada"
+        );
+        assert_eq!(
+            viewer.annot.undo_stack.borrow().len(),
+            undo_same,
+            "un contorno sin efecto no deja instantánea"
+        );
+        assert!(viewer.undo(), "un solo deshacer devuelve el contorno");
+        assert_eq!(
+            shape_of(&viewer, &colors_rect).color,
+            [0.0, 0.0, 0.0],
+            "deshacer repone el contorno anterior"
+        );
+
+        // Elegir un color de relleno en una forma hueca crea el relleno con la
+        // opacidad configurada en el menú de dibujo, y después la opacidad queda
+        // habilitada.
+        viewer.set_fill_color((0.1, 0.6, 0.2));
+        viewer.ui.stroke_fill_opacity.set_value(40.0);
+        let created_fill = ShapeFill::new([0.9, 0.8, 0.1], 0.4);
+        let undo_before = viewer.annot.undo_stack.borrow().len();
+        assert!(
+            viewer.set_selection_fill_color((0.9, 0.8, 0.1)),
+            "el color del relleno crea el relleno que faltaba"
+        );
+        assert_eq!(
+            viewer.annot.undo_stack.borrow().len(),
+            undo_before + 1,
+            "el color del relleno deja una sola instantánea"
+        );
+        assert_eq!(
+            shape_of(&viewer, &colors_rect).fill,
+            Some(created_fill),
+            "el relleno nace con la opacidad configurada"
+        );
+        assert_eq!(
+            shape_of(&viewer, &colors_rect).color,
+            [0.0, 0.0, 0.0],
+            "crear el relleno no toca el contorno"
+        );
+        assert_eq!(
+            viewer.selection_fill(),
+            Some(created_fill),
+            "el diálogo muestra el relleno de la forma"
+        );
+        assert!(
+            viewer.selection_fill_opacity_enabled(),
+            "con relleno la opacidad queda habilitada"
+        );
+        assert!(viewer.undo(), "un solo deshacer quita el relleno que se creó");
+        assert_eq!(
+            shape_of(&viewer, &colors_rect).fill,
+            None,
+            "deshacer deja la forma hueca otra vez"
+        );
+        assert!(
+            !viewer.selection_fill_opacity_enabled(),
+            "sin relleno la opacidad vuelve a deshabilitarse"
+        );
+
+        // Con relleno, elegir un color cambia solo el color y conserva la
+        // opacidad; el contorno sigue como estaba.
+        assert!(
+            viewer.set_selection_fill(true),
+            "el relleno configurado entra en la forma"
+        );
+        let recolored_fill = ShapeFill::new([0.9, 0.8, 0.1], 0.4);
+        assert!(
+            viewer.set_selection_fill_color((0.9, 0.8, 0.1)),
+            "el color del relleno cambia en la forma rellena"
+        );
+        assert_eq!(
+            shape_of(&viewer, &colors_rect).fill,
+            Some(recolored_fill),
+            "el relleno conserva su opacidad al cambiar de color"
+        );
+        assert_eq!(
+            shape_of(&viewer, &colors_rect).color,
+            [0.0, 0.0, 0.0],
+            "cambiar el relleno no toca el contorno"
+        );
+
+        // La opacidad alcanza a todas las formas rellenables elegidas y no toca
+        // ningún contorno; un solo deshacer la revierte en todas.
+        viewer.select_annotation(Some(colors_ellipse.clone()));
+        assert!(
+            viewer.set_selection_fill(true),
+            "la elipse entra rellena con el relleno configurado"
+        );
+        viewer.select_annotation(Some(colors_rect.clone()));
+        viewer.toggle_annotation_selection(&colors_ellipse);
+        let undo_before = viewer.annot.undo_stack.borrow().len();
+        assert!(
+            viewer.set_selection_fill_opacity_step(0.25, true),
+            "la opacidad alcanza a las dos formas rellenables elegidas"
+        );
+        assert_eq!(
+            viewer.annot.undo_stack.borrow().len(),
+            undo_before + 1,
+            "la opacidad del conjunto deja una sola instantánea"
+        );
+        assert_eq!(
+            shape_of(&viewer, &colors_rect).fill,
+            Some(ShapeFill::new([0.9, 0.8, 0.1], 0.25)),
+            "el rectángulo toma la opacidad nueva y conserva su color de relleno"
+        );
+        // Un arrastre de la barra de opacidad emite un valor por cada 5 %: deja una
+        // sola instantánea, así que un cambio completo se deshace de una vez.
+        assert!(
+            viewer.set_selection_fill_opacity_step(0.6, true),
+            "el primer paso del arrastre aplica la opacidad"
+        );
+        assert!(viewer.set_selection_fill_opacity_step(0.7, false));
+        assert!(viewer.set_selection_fill_opacity_step(0.8, false));
+        assert_eq!(
+            shape_of(&viewer, &colors_rect).fill.map(|fill| fill.alpha),
+            Some(0.8),
+            "el último paso del arrastre es el valor vigente"
+        );
+        assert!(viewer.undo(), "un solo deshacer revierte todo el arrastre");
+        assert_eq!(
+            shape_of(&viewer, &colors_rect).fill.map(|fill| fill.alpha),
+            Some(0.25),
+            "vuelve a la opacidad que había antes del arrastre"
+        );
+        assert_eq!(
+            shape_of(&viewer, &colors_ellipse).fill,
+            Some(ShapeFill::new([0.1, 0.6, 0.2], 0.25)),
+            "la elipse toma la opacidad nueva y conserva su color de relleno"
+        );
+        assert_eq!(
+            shape_of(&viewer, &colors_rect).color,
+            [0.0, 0.0, 0.0],
+            "la opacidad no toca el contorno del rectángulo"
+        );
+        assert_eq!(
+            shape_of(&viewer, &colors_ellipse).color,
+            [0.0, 0.0, 0.0],
+            "la opacidad no toca el contorno de la elipse"
+        );
+        assert!(
+            viewer.undo(),
+            "un solo deshacer devuelve las dos opacidades"
+        );
+        assert_eq!(
+            shape_of(&viewer, &colors_rect).fill,
+            Some(recolored_fill),
+            "el rectángulo vuelve a su opacidad anterior"
+        );
+        assert_eq!(
+            shape_of(&viewer, &colors_ellipse).fill,
+            Some(ShapeFill::new([0.1, 0.6, 0.2], 0.4)),
+            "la elipse vuelve a su opacidad anterior"
+        );
+
+        // En una línea el diálogo no tiene nada que ajustar: no hay interior y
+        // ninguna de estas operaciones toca el historial.
+        viewer.select_annotation(Some(colors_line.clone()));
+        assert!(
+            !viewer.selection_fill_opacity_enabled(),
+            "una línea no tiene relleno que ajustar"
+        );
+        let undo_unchanged = viewer.annot.undo_stack.borrow().len();
+        assert!(
+            !viewer.set_selection_fill_opacity_step(0.5, true),
+            "la opacidad no cambia una línea"
+        );
+        assert!(
+            !viewer.set_selection_fill_color((0.5, 0.5, 0.5)),
+            "un color de relleno no cambia una línea"
+        );
+        assert!(
+            !viewer.set_selection_stroke_color((0.5, 0.5, 0.5)),
+            "el contorno del diálogo no cambia una línea"
+        );
+        assert_eq!(
+            viewer.annot.undo_stack.borrow().len(),
+            undo_unchanged,
+            "sin formas rellenables no se deja ninguna instantánea"
+        );
+
+        // El estado queda como estaba: relleno configurado de fábrica, sin
+        // formas y sin selección.
+        viewer.set_fill_color(FILL_COLOR);
+        viewer.ui.stroke_fill_opacity.set_value(FILL_OPACITY);
         viewer.discard_edits();
         assert!(viewer.annot.edits.borrow().is_empty());
         assert!(viewer.selected_ids().is_empty());

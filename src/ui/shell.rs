@@ -3181,6 +3181,7 @@ impl Viewer {
             DoubleClickAction::EditText => self.prompt_note_edit(),
             DoubleClickAction::EditComments => self.prompt_sticky_note_edit(),
             DoubleClickAction::ChooseColor => self.prompt_selection_color(),
+            DoubleClickAction::ShapeColors => self.prompt_shape_colors(),
             DoubleClickAction::None => {}
         }
     }
@@ -4327,13 +4328,33 @@ impl Viewer {
     /// una vez, como el borrado. Devuelve si cambió algo; una selección sin color
     /// propio, o que ya tiene ese color, no toca nada.
     pub(crate) fn recolor_selection(&self, color: (f64, f64, f64)) -> bool {
-        let color = [color.0, color.1, color.2].map(|component| component.clamp(0.0, 1.0));
-        let changing: Vec<String> = self
+        let ids: Vec<String> = self
             .selection_colors()
             .into_iter()
-            .filter(|(_, current)| *current != color)
             .map(|(id, _)| id)
             .collect();
+        self.recolor_annotations(&ids, color)
+    }
+
+    /// Cambia el color propio de las anotaciones `ids` que todavía tengan otro,
+    /// con una sola instantánea de deshacer. Es el paso compartido por el cambio
+    /// de color de la selección y por el del contorno en el diálogo de la forma
+    /// rellenable, así que los dos empujan la misma clase de paso de deshacer.
+    fn recolor_annotations(&self, ids: &[String], color: (f64, f64, f64)) -> bool {
+        let color = [color.0, color.1, color.2].map(|component| component.clamp(0.0, 1.0));
+        let changing: Vec<String> = {
+            let edits = self.annot.edits.borrow();
+            ids.iter()
+                .filter(|id| {
+                    edits
+                        .iter()
+                        .find(|edit| edit.id == **id)
+                        .and_then(|edit| edit.value.color())
+                        .is_some_and(|current| current != color)
+                })
+                .cloned()
+                .collect()
+        };
         if changing.is_empty() {
             return false;
         }
@@ -4356,10 +4377,29 @@ impl Viewer {
         true
     }
 
-    /// Estado de relleno que manda en la selección: el de la forma principal, que
-    /// es la última elegida. Si la principal no tiene interior, manda la última
-    /// elegida que sí, y `None` cuando ninguna de las elegidas admite relleno.
-    fn selection_filled(&self) -> Option<bool> {
+    /// Formas rellenables elegidas: las que tienen interior y admiten relleno. La
+    /// línea, la flecha y las demás anotaciones no cambian.
+    fn selection_fillable_ids(&self) -> Vec<String> {
+        let selected = self.selected_ids();
+        let edits = self.annot.edits.borrow();
+        selected
+            .iter()
+            .filter(|id| {
+                edits
+                    .iter()
+                    .find(|edit| edit.id == **id)
+                    .is_some_and(|edit| {
+                        matches!(&edit.value, Annotation::Shape(shape) if shape.can_be_filled())
+                    })
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// La forma rellenable que manda en la selección: la principal, que es la
+    /// última elegida, y si la principal no tiene interior, la última elegida que
+    /// sí. `None` cuando ninguna de las elegidas admite relleno.
+    fn selection_fillable(&self) -> Option<Shape> {
         let selected = self.selected_ids();
         let edits = self.annot.edits.borrow();
         selected
@@ -4369,13 +4409,146 @@ impl Viewer {
                     .iter()
                     .find(|edit| edit.id == *id)
                     .and_then(|edit| match &edit.value {
-                        Annotation::Shape(shape) if shape.can_be_filled() => {
-                            Some(shape.fill.is_some())
-                        }
+                        Annotation::Shape(shape) if shape.can_be_filled() => Some(shape.clone()),
                         _ => None,
                     })
             })
             .next_back()
+    }
+
+    /// Relleno de la forma que manda en la selección, con su color y su opacidad.
+    /// `None` cuando esa forma está hueca o cuando ninguna de las elegidas admite
+    /// relleno: es lo que habilita la opacidad y el botón de quitar el relleno.
+    pub(crate) fn selection_fill(&self) -> Option<ShapeFill> {
+        self.selection_fillable().and_then(|shape| shape.fill)
+    }
+
+    /// True cuando la forma que manda en la selección tiene relleno, que es
+    /// cuando se puede ajustar su opacidad.
+    pub(crate) fn selection_fill_opacity_enabled(&self) -> bool {
+        self.selection_fill().is_some()
+    }
+
+    /// Cambia el color del contorno de las formas rellenables elegidas, con una
+    /// sola instantánea de deshacer. Es el mismo cambio que `recolor_selection`
+    /// hace con el color de la anotación, acotado a las formas con interior; el
+    /// relleno de cada una conserva su color y su opacidad.
+    pub(crate) fn set_selection_stroke_color(&self, color: (f64, f64, f64)) -> bool {
+        let ids = self.selection_fillable_ids();
+        self.recolor_annotations(&ids, color)
+    }
+
+    /// Cambia el color del relleno de las formas rellenables elegidas, con una
+    /// sola instantánea de deshacer. Si una forma no tenía relleno, lo crea con
+    /// ese color y la opacidad configurada en el menú de dibujo; si ya lo tenía,
+    /// cambia solo el color y conserva su opacidad. El contorno no se toca.
+    /// Devuelve si cambió algo; un relleno que ya tiene ese color no toca nada.
+    pub(crate) fn set_selection_fill_color(&self, color: (f64, f64, f64)) -> bool {
+        let color = [color.0, color.1, color.2].map(|component| component.clamp(0.0, 1.0));
+        let default_alpha = self.configured_fill().alpha;
+        let targets = self.selection_fill_targets(|shape| {
+            let alpha = shape.fill.map_or(default_alpha, |fill| fill.alpha);
+            Some(ShapeFill::new(color, alpha))
+        });
+        if targets.is_empty() {
+            return false;
+        }
+        self.apply_selection_fills(
+            &targets,
+            if targets.len() == 1 {
+                "Color de relleno cambiado".to_string()
+            } else {
+                format!("Color de relleno cambiado en {} formas", targets.len())
+            },
+            true,
+        )
+    }
+
+    /// Cambia la opacidad del relleno de las formas rellenables elegidas que ya
+    /// tienen relleno. `snapshot` dice si la operación deja instantánea de
+    /// deshacer: el diálogo lo usa para que un arrastre de la barra —que emite un
+    /// valor por cada 5 %— se deshaga de una vez, con la instantánea en la primera
+    /// llamada y ninguna en las siguientes del mismo arrastre.
+    pub(crate) fn set_selection_fill_opacity_step(&self, alpha: f64, snapshot: bool) -> bool {
+        let targets = self.selection_fill_targets(|shape| {
+            let fill = shape.fill?;
+            Some(ShapeFill::new(fill.color, alpha))
+        });
+        if targets.is_empty() {
+            return false;
+        }
+        self.apply_selection_fills(
+            &targets,
+            if targets.len() == 1 {
+                "Opacidad del relleno cambiada".to_string()
+            } else {
+                format!("Opacidad del relleno cambiada en {} formas", targets.len())
+            },
+            snapshot,
+        )
+    }
+
+    /// Formas rellenables elegidas cuyo relleno cambia con `target`, junto con el
+    /// relleno nuevo de cada una. Una forma para la que `target` no da relleno —la
+    /// que está hueca cuando solo se cambia la opacidad— queda como está. Las que
+    /// ya están como se pide tampoco entran, así una operación sin efecto no deja
+    /// instantánea.
+    fn selection_fill_targets(
+        &self,
+        target: impl Fn(&Shape) -> Option<ShapeFill>,
+    ) -> Vec<(String, ShapeFill)> {
+        let ids = self.selection_fillable_ids();
+        let edits = self.annot.edits.borrow();
+        ids.iter()
+            .filter_map(|id| {
+                let edit = edits.iter().find(|edit| edit.id == *id)?;
+                let Annotation::Shape(shape) = &edit.value else {
+                    return None;
+                };
+                let fill = target(shape)?;
+                (shape.fill != Some(fill)).then(|| (id.clone(), fill))
+            })
+            .collect()
+    }
+
+    /// Aplica los rellenos de `targets` con una sola instantánea de deshacer y
+    /// redibuja las páginas de las formas tocadas. Devuelve `true`: el llamador ya
+    /// comprobó que hay algo que cambiar.
+    /// Aplica un relleno nuevo a `targets` y redibuja. `snapshot` dice si la
+    /// operación deja instantánea de deshacer: el diálogo de color la deja en la
+    /// primera llamada de un arrastre de la barra de opacidad y no en las
+    /// siguientes, para que un arrastre largo se deshaga con un solo `Ctrl+Z`.
+    fn apply_selection_fills(
+        &self,
+        targets: &[(String, ShapeFill)],
+        message: String,
+        snapshot: bool,
+    ) -> bool {
+        let ids: Vec<String> = targets.iter().map(|(id, _)| id.clone()).collect();
+        let pages = self.selection_pages(&ids);
+        if snapshot {
+            self.begin_edit();
+        }
+        for edit in self.annot.edits.borrow_mut().iter_mut() {
+            if let Some((_, fill)) = targets.iter().find(|(id, _)| *id == edit.id)
+                && let Annotation::Shape(shape) = &mut edit.value
+            {
+                *shape = shape.with_fill(Some(*fill));
+            }
+        }
+        for page in pages {
+            self.queue_page_draw(page);
+        }
+        self.announce_change(&message);
+        true
+    }
+
+    /// Estado de relleno que manda en la selección: el de la forma principal, que
+    /// es la última elegida. Si la principal no tiene interior, manda la última
+    /// elegida que sí, y `None` cuando ninguna de las elegidas admite relleno.
+    fn selection_filled(&self) -> Option<bool> {
+        self.selection_fillable()
+            .map(|shape| shape.fill.is_some())
     }
 
     /// Rellena o quita el relleno de todas las formas elegidas que lo admiten, con
@@ -4475,6 +4648,298 @@ impl Viewer {
                 }
             },
         );
+    }
+
+    /// Diálogo de la forma rellenable: el color del contorno, el del relleno y la
+    /// opacidad del relleno, cada uno con su propio selector de color. Los cambios
+    /// se aplican en el acto —cada uno con una sola instantánea de deshacer— y
+    /// «Cerrar» no revierte nada.
+    ///
+    /// Es una ventana modal propia, como la de la nota: un popover con grab deja
+    /// el diálogo sin eventos. Muestra el estado de la forma que manda en la
+    /// selección y lo vuelve a leer al volver de cada selector de color.
+    ///
+    /// Quien lo abra desde un menú contextual tiene que cerrarlo antes y esperar a
+    /// que suelte el grab, como hace `double_click_annotation`: presentar el modal
+    /// con el popover vivo deja la ventana detrás de él.
+    pub(crate) fn prompt_shape_colors(self: &Rc<Self>) {
+        if self.selection_fillable().is_none() {
+            self.announce_change(if self.selected_ids().is_empty() {
+                "No hay nada seleccionado"
+            } else {
+                "Lo seleccionado no tiene interior que pintar"
+            });
+            return;
+        }
+
+        let window = gtk::Window::builder()
+            .title("Color de la forma")
+            .modal(true)
+            .transient_for(&self.ui.window)
+            .default_width(400)
+            .build();
+
+        // Muestra del contorno y del relleno: se repintan con el estado actual
+        // cada vez que un selector devuelve un color o cambia una operación.
+        let stroke_sample = color_sample_area();
+        stroke_sample.set_tooltip_text(Some("Color del contorno actual"));
+        accessible_label(&stroke_sample, "Color del contorno actual");
+        let fill_sample = color_sample_area();
+        fill_sample.set_tooltip_text(Some("Color del relleno actual"));
+        accessible_label(&fill_sample, "Color del relleno actual");
+
+        let stroke_button = gtk::Button::with_label("Elegir…");
+        stroke_button.add_css_class("flat");
+        stroke_button.set_tooltip_text(Some("Elegir el color del contorno"));
+        accessible_label(&stroke_button, "Elegir el color del contorno");
+        let fill_button = gtk::Button::with_label("Elegir…");
+        fill_button.add_css_class("flat");
+        fill_button.set_tooltip_text(Some("Elegir el color del relleno"));
+        accessible_label(&fill_button, "Elegir el color del relleno");
+
+        let stroke_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let stroke_caption = gtk::Label::new(Some("Contorno"));
+        stroke_caption.set_xalign(0.0);
+        stroke_caption.set_hexpand(true);
+        stroke_row.append(&stroke_caption);
+        stroke_row.append(&stroke_sample);
+        stroke_row.append(&stroke_button);
+
+        let fill_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let fill_caption = gtk::Label::new(Some("Relleno"));
+        fill_caption.set_xalign(0.0);
+        fill_caption.set_hexpand(true);
+        fill_row.append(&fill_caption);
+        fill_row.append(&fill_sample);
+        fill_row.append(&fill_button);
+
+        // Barra de la opacidad del relleno, de 10 % a 100 % en pasos de 5, con su
+        // etiqueta de porcentaje. Se deshabilita cuando la forma que manda no
+        // tiene relleno, y la etiqueta lo dice.
+        let opacity = gtk::Scale::with_range(
+            gtk::Orientation::Horizontal,
+            FILL_OPACITY_MIN,
+            FILL_OPACITY,
+            FILL_OPACITY_STEP,
+        );
+        opacity.set_draw_value(false);
+        opacity.set_hexpand(true);
+        opacity.set_tooltip_text(Some("Opacidad del relleno"));
+        accessible_label(&opacity, "Opacidad del relleno");
+        let opacity_label = gtk::Label::new(Some(&fill_percent_label(FILL_OPACITY)));
+        opacity_label.set_xalign(1.0);
+        let opacity_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let opacity_caption = gtk::Label::new(Some("Opacidad del relleno"));
+        opacity_caption.set_xalign(0.0);
+        opacity_row.append(&opacity_caption);
+        opacity_row.append(&opacity);
+        opacity_row.append(&opacity_label);
+
+        let remove = gtk::Button::with_label("Quitar relleno");
+        accessible_label(&remove, "Quitar el relleno de la selección");
+        let close = gtk::Button::with_label("Cerrar");
+        close.add_css_class("suggested-action");
+        let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        buttons.append(&remove);
+        let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        spacer.set_hexpand(true);
+        buttons.append(&spacer);
+        buttons.append(&close);
+
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 10);
+        content.set_margin_top(14);
+        content.set_margin_bottom(14);
+        content.set_margin_start(14);
+        content.set_margin_end(14);
+        content.append(&stroke_row);
+        content.append(&fill_row);
+        content.append(&opacity_row);
+        content.append(&buttons);
+        window.set_child(Some(&content));
+        window.set_default_widget(Some(&close));
+
+        // Protege la barra mientras se pone al día con el estado de la forma:
+        // seguir a la selección no puede aplicar una opacidad por sí solo.
+        let syncing = Rc::new(Cell::new(false));
+
+        let refresh: Rc<dyn Fn()> = {
+            let weak = Rc::downgrade(self);
+            let stroke_sample = stroke_sample.clone();
+            let fill_sample = fill_sample.clone();
+            let opacity = opacity.clone();
+            let opacity_label = opacity_label.clone();
+            let remove = remove.clone();
+            let syncing = syncing.clone();
+            Rc::new(move || {
+                let Some(viewer) = weak.upgrade() else {
+                    return;
+                };
+                let shape = viewer.selection_fillable();
+                let stroke = shape.as_ref().map(|shape| shape.color);
+                let fill = shape.as_ref().and_then(|shape| shape.fill);
+                let opacity_enabled = viewer.selection_fill_opacity_enabled();
+                stroke_sample.set_draw_func(move |_, context, width, height| {
+                    paint_color_sample(context, stroke, width, height, 1.0);
+                });
+                fill_sample.set_draw_func(move |_, context, width, height| match fill {
+                    Some(fill) => {
+                        paint_color_sample(context, Some(fill.color), width, height, fill.alpha);
+                    }
+                    None => paint_color_sample(context, None, width, height, 1.0),
+                });
+                let percent = fill.map_or(FILL_OPACITY, |fill| {
+                    (fill.alpha * 100.0).clamp(FILL_OPACITY_MIN, FILL_OPACITY)
+                });
+                syncing.set(true);
+                opacity.set_sensitive(opacity_enabled);
+                opacity.set_value(percent);
+                syncing.set(false);
+                opacity_label.set_label(&if opacity_enabled {
+                    fill_percent_label(percent)
+                } else {
+                    "sin relleno".to_string()
+                });
+                remove.set_sensitive(opacity_enabled);
+            })
+        };
+
+        {
+            let weak = Rc::downgrade(self);
+            let window_ref = window.clone();
+            let refresh = refresh.clone();
+            stroke_button.connect_clicked(move |_| {
+                let Some(viewer) = weak.upgrade() else {
+                    return;
+                };
+                let Some(shape) = viewer.selection_fillable() else {
+                    return;
+                };
+                let initial = note_rgba(shape.color);
+                let dialog = gtk::ColorDialog::builder()
+                    .title("Color del contorno")
+                    .with_alpha(false)
+                    .modal(true)
+                    .build();
+                let weak = Rc::downgrade(&viewer);
+                let refresh = refresh.clone();
+                let window_ref = window_ref.clone();
+                dialog.choose_rgba(
+                    Some(&window_ref),
+                    Some(&initial),
+                    None::<&gio::Cancellable>,
+                    move |result| {
+                        let Ok(rgba) = result else {
+                            return;
+                        };
+                        let Some(viewer) = weak.upgrade() else {
+                            return;
+                        };
+                        viewer.set_selection_stroke_color((
+                            rgba.red().into(),
+                            rgba.green().into(),
+                            rgba.blue().into(),
+                        ));
+                        refresh();
+                    },
+                );
+            });
+        }
+        {
+            let weak = Rc::downgrade(self);
+            let window_ref = window.clone();
+            let refresh = refresh.clone();
+            fill_button.connect_clicked(move |_| {
+                let Some(viewer) = weak.upgrade() else {
+                    return;
+                };
+                if viewer.selection_fillable().is_none() {
+                    return;
+                }
+                let initial = note_rgba(
+                    viewer
+                        .selection_fill()
+                        .map_or_else(|| viewer.configured_fill().color, |fill| fill.color),
+                );
+                let dialog = gtk::ColorDialog::builder()
+                    .title("Color del relleno")
+                    .with_alpha(false)
+                    .modal(true)
+                    .build();
+                let weak = Rc::downgrade(&viewer);
+                let refresh = refresh.clone();
+                let window_ref = window_ref.clone();
+                dialog.choose_rgba(
+                    Some(&window_ref),
+                    Some(&initial),
+                    None::<&gio::Cancellable>,
+                    move |result| {
+                        let Ok(rgba) = result else {
+                            return;
+                        };
+                        let Some(viewer) = weak.upgrade() else {
+                            return;
+                        };
+                        viewer.set_selection_fill_color((
+                            rgba.red().into(),
+                            rgba.green().into(),
+                            rgba.blue().into(),
+                        ));
+                        refresh();
+                    },
+                );
+            });
+        }
+        {
+            let weak = Rc::downgrade(self);
+            let refresh = refresh.clone();
+            remove.connect_clicked(move |_| {
+                if let Some(viewer) = weak.upgrade() {
+                    viewer.set_selection_fill(false);
+                    refresh();
+                }
+            });
+        }
+        {
+            let weak = Rc::downgrade(self);
+            let syncing = syncing.clone();
+            let opacity_label = opacity_label.clone();
+            // La barra emite un valor por cada 5 %: la primera llamada de cada
+            // diálogo deja la instantánea de deshacer y las siguientes del mismo
+            // arrastre no, así el cambio completo se deshace con un solo `Ctrl+Z`.
+            let snapshot_pending = Rc::new(std::cell::Cell::new(true));
+            opacity.connect_value_changed(move |scale| {
+                if syncing.get() {
+                    return;
+                }
+                let percent = scale.value();
+                opacity_label.set_label(&fill_percent_label(percent));
+                if let Some(viewer) = weak.upgrade() {
+                    let snapshot = snapshot_pending.replace(false);
+                    viewer.set_selection_fill_opacity_step(percent / 100.0, snapshot);
+                }
+            });
+        }
+
+        {
+            let window_ref = window.clone();
+            close.connect_clicked(move |_| Viewer::close_modal(&window_ref));
+        }
+        {
+            let window_ref = window.clone();
+            let keys = gtk::EventControllerKey::new();
+            keys.connect_key_pressed(move |_, keyval, _, _| {
+                if keyval != gdk::Key::Escape {
+                    return glib::Propagation::Proceed;
+                }
+                Viewer::close_modal(&window_ref);
+                glib::Propagation::Stop
+            });
+            window.add_controller(keys);
+        }
+
+        // El diálogo arranca mostrando el estado de la forma que manda.
+        refresh();
+        window.present();
     }
 
     /// Empieza a arrastrar la nota que está bajo `(x, y)` y devuelve si el gesto
@@ -9879,6 +10344,45 @@ fn build_stroke_menu() -> StrokeMenuUi {
 /// Texto de la etiqueta de la opacidad del relleno, en porcentaje entero.
 fn fill_percent_label(percent: f64) -> String {
     format!("{} %", percent.round() as i64)
+}
+
+/// Muestra cuadrada de color del diálogo de la forma rellenable. Su dibujo se
+/// reemplaza con `set_draw_func` cada vez que cambia el estado que muestra.
+fn color_sample_area() -> gtk::DrawingArea {
+    let sample = gtk::DrawingArea::builder()
+        .width_request(24)
+        .height_request(24)
+        .build();
+    sample.set_valign(gtk::Align::Center);
+    sample
+}
+
+/// Pinta la muestra de color de una fila del diálogo de la forma: el color con su
+/// opacidad, o una muestra blanca con una diagonal cuando no hay relleno.
+fn paint_color_sample(
+    context: &cairo::Context,
+    color: Option<[f64; 3]>,
+    width: i32,
+    height: i32,
+    alpha: f64,
+) {
+    let (width, height) = (f64::from(width), f64::from(height));
+    match color {
+        Some([red, green, blue]) => context.set_source_rgba(red, green, blue, alpha),
+        None => context.set_source_rgb(1.0, 1.0, 1.0),
+    }
+    context.rectangle(1.0, 1.0, (width - 2.0).max(1.0), (height - 2.0).max(1.0));
+    let _ = context.fill_preserve();
+    // El contorno marca el borde de la muestra en los dos casos.
+    context.set_source_rgba(0.0, 0.0, 0.0, 0.6);
+    context.set_line_width(1.0);
+    let _ = context.stroke();
+    if color.is_none() {
+        // La diagonal dice que no hay relleno, como una muestra vacía.
+        context.move_to(1.0, height - 1.0);
+        context.line_to(width - 1.0, 1.0);
+        let _ = context.stroke();
+    }
 }
 
 fn toolbar_gap(width: i32) -> gtk::Box {

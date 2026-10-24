@@ -1376,6 +1376,9 @@ pub(crate) enum DoubleClickAction {
     EditComments,
     /// La anotación con un solo color abre el selector de color.
     ChooseColor,
+    /// La forma rellenable abre el diálogo que elige el color del contorno, el
+    /// del relleno y la opacidad de este.
+    ShapeColors,
     /// No hay nada que editar: el doble clic solo deja la anotación elegida.
     None,
 }
@@ -1384,6 +1387,10 @@ pub(crate) enum DoubleClickAction {
 /// contextual ofrece con sus botones: la nota de texto y la nota adhesiva editan
 /// lo suyo, las que tienen un color propio abren el cambio de color —el mismo de
 /// `Ctrl+Alt+C`— y la imagen, que no tiene ni texto ni color propio, no abre nada.
+///
+/// El rectángulo y la elipse tienen interior, así que su doble clic abre el
+/// diálogo de contorno y relleno; la línea y la flecha no lo tienen y siguen
+/// abriendo el selector de color del contorno.
 pub(crate) fn double_click_action(annotation: &Annotation) -> DoubleClickAction {
     match annotation {
         Annotation::Note(_) => DoubleClickAction::EditText,
@@ -1391,6 +1398,7 @@ pub(crate) fn double_click_action(annotation: &Annotation) -> DoubleClickAction 
         // conserva ese comportamiento.
         Annotation::Sticky(_) => DoubleClickAction::EditComments,
         Annotation::Image(_) => DoubleClickAction::None,
+        Annotation::Shape(shape) if shape.can_be_filled() => DoubleClickAction::ShapeColors,
         Annotation::Mark(_) | Annotation::Ink(_) | Annotation::Shape(_) | Annotation::Stamp(_) => {
             DoubleClickAction::ChooseColor
         }
@@ -3033,7 +3041,7 @@ mod tests {
             ),
             (
                 Annotation::Shape(colored_shape((0.3, 0.4, 0.5))),
-                DoubleClickAction::ChooseColor,
+                DoubleClickAction::ShapeColors,
             ),
             (
                 Annotation::Stamp(Stamp::new(0, (10.0, 10.0), StampKind::Approved)),
@@ -3050,6 +3058,43 @@ mod tests {
                 "doble clic sobre {annotation:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_shape_with_an_interior_opens_its_own_colour_dialog() {
+        // S8: el rectángulo y la elipse tienen interior, así que su doble clic
+        // abre el diálogo de contorno y relleno; la línea y la flecha no lo
+        // tienen y siguen abriendo el selector de color del contorno.
+        for (kind, expected) in [
+            (ShapeKind::Rectangle, DoubleClickAction::ShapeColors),
+            (ShapeKind::Ellipse, DoubleClickAction::ShapeColors),
+            (ShapeKind::Line, DoubleClickAction::ChooseColor),
+            (ShapeKind::Arrow, DoubleClickAction::ChooseColor),
+        ] {
+            let shape = Shape::new(
+                0,
+                kind,
+                (10.0, 20.0),
+                (110.0, 80.0),
+                [0.1, 0.2, 0.3],
+                2.0,
+            );
+            assert_eq!(
+                double_click_action(&Annotation::Shape(shape)),
+                expected,
+                "doble clic sobre {kind:?}"
+            );
+        }
+
+        // Un relleno no cambia la acción: la forma ya rellena abre el mismo
+        // diálogo, que es donde se ajusta la opacidad y se quita el relleno.
+        let filled = colored_shape((0.3, 0.4, 0.5))
+            .with_fill(Some(ShapeFill::new([0.9, 0.1, 0.2], 0.4)));
+        assert_eq!(
+            double_click_action(&Annotation::Shape(filled)),
+            DoubleClickAction::ShapeColors,
+            "una forma ya rellena abre el mismo diálogo"
+        );
     }
 
     #[test]
