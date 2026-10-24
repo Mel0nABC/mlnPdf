@@ -425,6 +425,33 @@ impl Shape {
     }
 }
 
+/// Punta de flecha rellena de una línea que va de `from` a `to`. Devuelve los
+/// tres vértices del triángulo: el vértice, que cae exactamente en `to` y es
+/// donde termina la flecha, y los dos puntos de la base, perpendicular a la
+/// línea y centrada en ella. El largo y el ancho crecen con el grosor `width`,
+/// con un mínimo para que una flecha fina conserve su punta.
+///
+/// `None` cuando los dos extremos coinciden: una flecha sin largo no tiene punta
+/// que dibujar.
+pub fn arrow_head(from: (f64, f64), to: (f64, f64), width: f64) -> Option<[(f64, f64); 3]> {
+    let (dx, dy) = (to.0 - from.0, to.1 - from.1);
+    let length = (dx * dx + dy * dy).sqrt();
+    if length <= f64::EPSILON {
+        return None;
+    }
+    let (ux, uy) = (dx / length, dy / length);
+    let size = (width * 3.0).max(8.0);
+    let half = (width * 2.0).max(5.0) / 2.0;
+    let base = (to.0 - ux * size, to.1 - uy * size);
+    // La perpendicular a la dirección es (-uy, ux): con ella los dos puntos de la
+    // base quedan a la misma distancia del eje de la línea.
+    Some([
+        to,
+        (base.0 - uy * half, base.1 + ux * half),
+        (base.0 + uy * half, base.1 - ux * half),
+    ])
+}
+
 /// Fuente base del PDF para una nota de texto. Las familias arbitrarias del
 /// sistema no se pueden usar sin incrustar el archivo de fuente, así que se
 /// aproximan a una de las 14 estándar.
@@ -573,6 +600,12 @@ impl TextNote {
         self.runs.first().map_or(NOTE_COLOR, |run| run.color)
     }
 }
+
+/// Color por omisión de una nota adhesiva: el amarillo cálido de una nota de
+/// papel, que se lee como nota sobre la página blanca y sobre la oscura. El
+/// color que trae una nota leída del archivo, o el que el lector elija, manda
+/// sobre este valor.
+pub const STICKY_COLOR: [f64; 3] = [1.0, 0.93, 0.55];
 
 /// Lado del icono de una nota adhesiva, en puntos: es lo que se ve sobre la
 /// página y lo que se agarra con el ratón.
@@ -1414,6 +1447,7 @@ pub fn parse_da(da: &str) -> Option<(FontChoice, [f64; 3])> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::geometry::forward_rotation;
 
     /// Página de 200x100 pt sin desplazamiento de CropBox.
     const PLAIN: PageBox = PageBox {
@@ -2267,6 +2301,100 @@ mod tests {
     }
 
     #[test]
+    fn an_arrow_head_ends_exactly_at_the_tip_with_a_perpendicular_base() {
+        // Horizontal, vertical y diagonal: el vértice cae siempre en `to`, la base
+        // queda perpendicular a la línea, centrada en ella y proporcional al
+        // grosor, con los mínimos para que una flecha fina conserve su punta.
+        let cases = [
+            ((10.0, 20.0), (110.0, 20.0)),
+            ((30.0, 10.0), (30.0, 90.0)),
+            ((10.0, 10.0), (70.0, 50.0)),
+        ];
+        for (from, to) in cases {
+            let head = arrow_head(from, to, 2.0).expect("una flecha con largo tiene punta");
+            assert!(
+                (head[0].0 - to.0).abs() < 1e-9 && (head[0].1 - to.1).abs() < 1e-9,
+                "{from:?}->{to:?}: el vértice tiene que caer en {to:?}, no en {:?}",
+                head[0]
+            );
+
+            let (dx, dy) = (to.0 - from.0, to.1 - from.1);
+            let across = (head[2].0 - head[1].0, head[2].1 - head[1].1);
+            assert!(
+                (across.0 * dx + across.1 * dy).abs() < 1e-9,
+                "{from:?}->{to:?}: la base es perpendicular a la línea"
+            );
+            // Con el punto medio de la base sobre la línea, la base está centrada:
+            // el producto cruz del vector hasta ese punto con la dirección es cero.
+            let middle = (
+                (head[1].0 + head[2].0) / 2.0,
+                (head[1].1 + head[2].1) / 2.0,
+            );
+            assert!(
+                ((middle.0 - from.0) * dy - (middle.1 - from.1) * dx).abs() < 1e-9,
+                "{from:?}->{to:?}: la base queda centrada en la línea"
+            );
+
+            let length = ((middle.0 - to.0).powi(2) + (middle.1 - to.1).powi(2)).sqrt();
+            assert!(
+                (length - 8.0).abs() < 1e-9,
+                "con grosor 2 la punta mide max(8, 3 * 2) = 8, no {length}"
+            );
+            let width = ((head[2].0 - head[1].0).powi(2) + (head[2].1 - head[1].1).powi(2)).sqrt();
+            assert!(
+                (width - 5.0).abs() < 1e-9,
+                "con grosor 2 la base mide max(5, 2 * 2) = 5, no {width}"
+            );
+        }
+
+        // Con un grosor grande la punta crece con él: 18 de largo y 12 de base.
+        let thick = arrow_head((0.0, 0.0), (100.0, 0.0), 6.0).expect("flecha gruesa");
+        let thick_middle = (
+            (thick[1].0 + thick[2].0) / 2.0,
+            (thick[1].1 + thick[2].1) / 2.0,
+        );
+        assert!(
+            (thick_middle.0 - 82.0).abs() < 1e-9,
+            "la base queda a 3 * grosor del vértice"
+        );
+        let thick_width =
+            ((thick[2].0 - thick[1].0).powi(2) + (thick[2].1 - thick[1].1).powi(2)).sqrt();
+        assert!(
+            (thick_width - 12.0).abs() < 1e-9,
+            "la base mide 2 * grosor, no {thick_width}"
+        );
+    }
+
+    #[test]
+    fn an_arrow_head_needs_two_different_points() {
+        assert!(
+            arrow_head((10.0, 10.0), (10.0, 10.0), 2.0).is_none(),
+            "sin largo no hay punta que dibujar"
+        );
+    }
+
+    #[test]
+    fn an_arrow_head_follows_the_page_rotation() {
+        // La punta se calcula con los extremos ya pasados por `forward_rotation`:
+        // con /Rotate 90 el vértice tiene que seguir cayendo en el `to` convertido.
+        let page = (200.0, 100.0);
+        let from = (10.0, 20.0);
+        let to = (90.0, 20.0);
+        let head = arrow_head(
+            forward_rotation(from, page, 90),
+            forward_rotation(to, page, 90),
+            2.0,
+        )
+        .expect("la flecha rotada conserva su punta");
+        let tip = forward_rotation(to, page, 90);
+        assert!(
+            (head[0].0 - tip.0).abs() < 1e-9 && (head[0].1 - tip.1).abs() < 1e-9,
+            "/Rotate 90: el vértice cae en el extremo convertido {tip:?}, no en {:?}",
+            head[0]
+        );
+    }
+
+    #[test]
     fn moving_a_stroke_only_moves_its_geometry() {
         let stroke = ink(&[(10.0, 10.0), (40.0, 30.0)]);
         let moved = stroke.moved((5.0, -3.0));
@@ -2397,7 +2525,7 @@ mod tests {
 
     #[test]
     fn a_sticky_note_starts_with_the_icon_side_and_no_comments() {
-        let fresh = StickyNote::new(3, (10.0, 20.0), NOTE_COLOR);
+        let fresh = StickyNote::new(3, (10.0, 20.0), STICKY_COLOR);
         assert_eq!(fresh.page, 3);
         assert_eq!(fresh.at, (10.0, 20.0), "la esquina es donde se hizo clic");
         assert_eq!(
@@ -2405,7 +2533,15 @@ mod tests {
             (STICKY_SIDE, STICKY_SIDE),
             "el icono mide STICKY_SIDE puntos de lado"
         );
-        assert_eq!(fresh.color, NOTE_COLOR, "nace con el color por omisión");
+        assert_eq!(
+            fresh.color, STICKY_COLOR,
+            "nace con el color por omisión, el amarillo de nota"
+        );
+        assert_eq!(
+            STICKY_COLOR,
+            [1.0, 0.93, 0.55],
+            "el amarillo por omisión es el de una nota de papel"
+        );
         assert!(fresh.comments.is_empty());
         assert_eq!(
             StickyNote::new(0, (0.0, 0.0), [-0.5, 0.5, 2.0]).color,

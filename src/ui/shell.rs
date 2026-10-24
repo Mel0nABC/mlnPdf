@@ -173,7 +173,7 @@ pub(crate) struct UiHandles {
     /// trazos.
     pub(crate)     stroke_width: gtk::SpinButton,
     /// Selector de color del trazo, también recordado entre trazos.
-    pub(crate)     stroke_color: gtk::ColorDialogButton,
+    pub(crate)     stroke_color: StrokeColorUi,
     /// Los tres botones de la sección «Sellos» del popover de dibujo, en el orden
     /// de `StampKind`.
     pub(crate)     stamp_buttons: [gtk::Button; 3],
@@ -184,6 +184,17 @@ pub(crate) struct UiHandles {
 pub(crate) struct MarkToolUi {
     pub(crate) button: gtk::ToggleButton,
     pub(crate) dialog: gtk::ColorDialog,
+}
+
+/// Selector de color del trazo: el botón que abre el diálogo, la muestra que
+/// enseña el color elegido y el color recordado entre trazos.
+#[derive(Clone)]
+pub(crate) struct StrokeColorUi {
+    pub(crate) button: gtk::Button,
+    /// Muestra del color elegido; se repinta al cambiarlo.
+    pub(crate) swatch: gtk::DrawingArea,
+    /// Color RGB en `0..=1`, el mismo que viaja en `/C`.
+    pub(crate) value: Rc<Cell<(f64, f64, f64)>>,
 }
 
 /// The open document and everything derived from it.
@@ -896,6 +907,16 @@ impl Viewer {
                     popover.popdown();
                 }
                 viewer.start_stroke_tool(kind);
+            });
+        }
+        {
+            // Elegir el color no puede cerrar el menú: si el popover desaparece
+            // al abrirse el diálogo, ya no se puede elegir la herramienta.
+            let weak = Rc::downgrade(&viewer);
+            viewer.ui.stroke_color.button.connect_clicked(move |_| {
+                if let Some(viewer) = weak.upgrade() {
+                    viewer.choose_stroke_color();
+                }
             });
         }
         {
@@ -2339,14 +2360,65 @@ impl Viewer {
 
         // El grosor y el color salen de los controles del popover, que conservan
         // lo último que se eligió para el trazo siguiente.
-        let rgba = self.ui.stroke_color.rgba();
+        let rgba = self.ui.stroke_color.value.get();
         let tool = StrokeTool {
             kind,
-            color: (rgba.red().into(), rgba.green().into(), rgba.blue().into()),
+            color: rgba,
             width: clamp_stroke_width(self.ui.stroke_width.value()),
         };
         *self.annot.stroke_tool.borrow_mut() = Some(tool);
         self.refresh_page_cursor();
+    }
+
+    /// Abre el selector de color del trazo con el que ya está elegido. Mientras el
+    /// diálogo está abierto el popover de dibujo se queda visible: si se cerrara,
+    /// el lector perdería la posibilidad de elegir la herramienta después de
+    /// cambiar el color. Al aceptar o cancelar, el popover vuelve a su
+    /// comportamiento normal.
+    pub(crate) fn choose_stroke_color(self: &Rc<Self>) {
+        let Some(popover) = self.ui.stroke_button.popover() else {
+            return;
+        };
+        let dialog = gtk::ColorDialog::builder()
+            .title("Color del trazo")
+            .with_alpha(false)
+            .modal(true)
+            .build();
+        let current = self.ui.stroke_color.value.get();
+        let initial = gdk::RGBA::new(
+            current.0 as f32,
+            current.1 as f32,
+            current.2 as f32,
+            1.0,
+        );
+        hold_color_popover(&popover);
+        let restore = popover.clone();
+        let weak = Rc::downgrade(self);
+        dialog.choose_rgba(
+            Some(&self.ui.window),
+            Some(&initial),
+            None::<&gio::Cancellable>,
+            move |result| {
+                release_color_popover(&restore);
+                let Ok(color) = result else {
+                    return;
+                };
+                if let Some(viewer) = weak.upgrade() {
+                    viewer.keep_stroke_color(color);
+                }
+            },
+        );
+    }
+
+    /// Guarda el color elegido y repinta la muestra del botón, que es lo que se
+    /// ve junto al grosor antes de elegir la herramienta.
+    pub(crate) fn keep_stroke_color(&self, color: gdk::RGBA) {
+        self.ui.stroke_color.value.set((
+            color.red().into(),
+            color.green().into(),
+            color.blue().into(),
+        ));
+        self.ui.stroke_color.swatch.queue_draw();
     }
 
     /// Recibe lo que dejó el diálogo: si hay texto, guarda el borrador y arma la
@@ -2421,7 +2493,7 @@ impl Viewer {
         let id = self.new_id();
         self.annot.edits.borrow_mut().push(Edit {
             id: id.clone(),
-            value: Annotation::Sticky(StickyNote::new(page, at, NOTE_COLOR)),
+            value: Annotation::Sticky(StickyNote::new(page, at, STICKY_COLOR)),
         });
         self.select_annotation(Some(id.clone()));
         self.set_sticky_tool(false);
@@ -4147,13 +4219,15 @@ impl Viewer {
     }
 
     /// Suelta el trazo en curso: si alcanza, se agrega como una anotación más y
-    /// queda pendiente de guardar. La herramienta se desarma siempre —también la
-    /// del lápiz—, para no encadenar trazos sin querer.
+    /// queda pendiente de guardar. El lápiz queda armado para encadenar trazos sin
+    /// volver al menú; las formas se desarman, porque un arrastre es una forma.
     pub(crate) fn stroke_drag_end(&self) -> bool {
         let Some(drag) = self.annot.stroke_drag.borrow_mut().take() else {
             return false;
         };
-        self.clear_stroke_tool();
+        if drag.tool.kind != StrokeKind::Ink {
+            self.clear_stroke_tool();
+        }
         self.queue_page_draw(drag.page);
         if !drag.is_worth_adding() {
             return true;
@@ -7802,26 +7876,31 @@ fn draw_shape(
             let _ = context.stroke();
         }
         ShapeKind::Line | ShapeKind::Arrow => {
+            // La punta se calcula con los extremos ya pasados por la rotación de la
+            // vista; en pantalla solo falta el zoom. La línea llega hasta la base
+            // del triángulo y no hasta el vértice: si llegara al vértice, el trazo
+            // asomaría por la punta.
+            let head = if shape.kind == ShapeKind::Arrow {
+                arrow_head(from, to, shape.width)
+            } else {
+                None
+            };
+            let (end_x, end_y) = head.map_or((x2, y2), |head| {
+                (
+                    (head[1].0 + head[2].0) / 2.0 * zoom,
+                    (head[1].1 + head[2].1) / 2.0 * zoom,
+                )
+            });
             context.move_to(x1, y1);
-            context.line_to(x2, y2);
+            context.line_to(end_x, end_y);
             let _ = context.stroke();
 
-            if shape.kind == ShapeKind::Arrow {
-                let (dx, dy) = (x2 - x1, y2 - y1);
-                let length = (dx * dx + dy * dy).sqrt();
-                if length > f64::EPSILON {
-                    // La punta crece con el grosor, así una flecha gruesa no queda
-                    // con una cabeza diminuta.
-                    let (ux, uy) = (dx / length, dy / length);
-                    let size = (shape.width * zoom * 4.0).max(6.0);
-                    let half = size * 0.4;
-                    let (bx, by) = (x2 - ux * size, y2 - uy * size);
-                    context.move_to(x2, y2);
-                    context.line_to(bx - uy * half, by + ux * half);
-                    context.line_to(bx + uy * half, by - ux * half);
-                    context.close_path();
-                    let _ = context.fill();
-                }
+            if let Some(head) = head {
+                context.move_to(head[0].0 * zoom, head[0].1 * zoom);
+                context.line_to(head[1].0 * zoom, head[1].1 * zoom);
+                context.line_to(head[2].0 * zoom, head[2].1 * zoom);
+                context.close_path();
+                let _ = context.fill();
             }
         }
     }
@@ -7965,9 +8044,10 @@ fn text_view_text(view: &gtk::TextView) -> String {
         .to_string()
 }
 
-/// Pinta el icono de una nota adhesiva: el cuadrado del color de la nota con la
-/// esquina superior derecha doblada y, si tiene respuestas, la cuenta en su
-/// esquinita. La nota elegida lleva el mismo contorno punteado que las demás.
+/// Pinta el icono de una nota adhesiva: la hoja del color de la nota con un
+/// borde fino más oscuro, la esquina inferior derecha doblada y, si tiene
+/// respuestas, la cuenta en un círculo sobre la esquina superior derecha. La
+/// nota elegida lleva el mismo contorno punteado que las demás.
 fn draw_sticky(
     context: &cairo::Context,
     sticky: &StickyNote,
@@ -7983,15 +8063,26 @@ fn draw_sticky(
         forward_rotation((rect.2, rect.3), page, rotation),
         forward_rotation((rect.0, rect.3), page, rotation),
     ];
-    let fold = (rect.2 - rect.0) * 0.35;
+    // El doblez de la esquina inferior derecha: la hoja se ve como una nota y no
+    // como un cuadrado de color.
+    let fold = (rect.2 - rect.0).min(rect.3 - rect.1) * 0.35;
     let folded = [
-        forward_rotation((rect.2, rect.1), page, rotation),
-        forward_rotation((rect.2 - fold, rect.1), page, rotation),
-        forward_rotation((rect.2, rect.1 + fold), page, rotation),
+        forward_rotation((rect.2, rect.3), page, rotation),
+        forward_rotation((rect.2 - fold, rect.3), page, rotation),
+        forward_rotation((rect.2, rect.3 - fold), page, rotation),
+    ];
+    // Borde y doblez más oscuros que la hoja: el mismo tono apagado, que se lee
+    // sobre papel blanco y sobre una página oscura.
+    let border_shade = 0.55;
+    let fold_shade = 0.72;
+    let border = [
+        sticky.color[0] * border_shade,
+        sticky.color[1] * border_shade,
+        sticky.color[2] * border_shade,
     ];
 
     let _ = context.save();
-    // La nota: un cuadrado del color elegido, acostado con la página.
+    // La hoja: el color de la nota, acostada con la página.
     context.move_to(corners[0].0 * zoom, corners[0].1 * zoom);
     for corner in &corners[1..] {
         context.line_to(corner.0 * zoom, corner.1 * zoom);
@@ -8000,25 +8091,24 @@ fn draw_sticky(
     context.set_source_rgba(sticky.color[0], sticky.color[1], sticky.color[2], 1.0);
     let _ = context.fill();
 
-    // La esquina doblada: un triángulo más oscuro sobre el vértice superior
-    // derecho, que es lo que hace que el cuadrado se lea como una nota.
-    let shade = 0.72;
+    // La esquina doblada: un triángulo más oscuro sobre el vértice inferior
+    // derecho, que es lo que hace que la hoja se lea como una nota.
     context.move_to(folded[0].0 * zoom, folded[0].1 * zoom);
     for corner in &folded[1..] {
         context.line_to(corner.0 * zoom, corner.1 * zoom);
     }
     context.close_path();
     context.set_source_rgba(
-        sticky.color[0] * shade,
-        sticky.color[1] * shade,
-        sticky.color[2] * shade,
+        sticky.color[0] * fold_shade,
+        sticky.color[1] * fold_shade,
+        sticky.color[2] * fold_shade,
         1.0,
     );
     let _ = context.fill();
 
-    // Contorno tenue: separa el icono del papel y de una página de color parecido.
+    // Contorno fino: separa la hoja del papel y de una página de color parecido.
     context.set_line_width((0.8 * zoom).max(1.0));
-    context.set_source_rgba(0.0, 0.0, 0.0, 0.45);
+    context.set_source_rgba(border[0], border[1], border[2], 0.9);
     context.move_to(corners[0].0 * zoom, corners[0].1 * zoom);
     for corner in &corners[1..] {
         context.line_to(corner.0 * zoom, corner.1 * zoom);
@@ -8026,28 +8116,64 @@ fn draw_sticky(
     context.close_path();
     let _ = context.stroke();
 
-    // La cuenta de respuestas, en la esquina inferior derecha y en el color que
-    // más contrasta con el de la nota.
+    // La cuenta de respuestas, en un círculo sobre la esquina superior derecha.
+    // El círculo y el número cambian juntos para que el número se lea sobre la
+    // nota: oscuro con número blanco sobre una nota clara, y al revés sobre una
+    // nota oscura. El radio y el alto de letra siguen al zoom, con un mínimo para
+    // que la cuenta no desaparezca al alejarse.
     let replies = sticky.replies();
     if replies > 0 {
+        let luminance =
+            0.299 * sticky.color[0] + 0.587 * sticky.color[1] + 0.114 * sticky.color[2];
+        let (badge, ink) = if luminance > 0.45 {
+            ([0.12, 0.12, 0.12], [1.0, 1.0, 1.0])
+        } else {
+            ([0.95, 0.95, 0.95], [0.10, 0.10, 0.10])
+        };
+        let radius = (STICKY_SIDE * 0.30 * zoom).max(3.0);
+        // El centro se corre desde la esquina hacia el centro de la hoja por la
+        // diagonal, que es lo que deja el círculo entero dentro del icono con
+        // cualquier rotación de la página.
+        let middle = (
+            corners.iter().map(|corner| corner.0).sum::<f64>() / 4.0,
+            corners.iter().map(|corner| corner.1).sum::<f64>() / 4.0,
+        );
+        let corner = corners[1];
+        let (dx, dy) = (middle.0 - corner.0, middle.1 - corner.1);
+        let diagonal = (dx * dx + dy * dy).sqrt();
+        let (ux, uy) = if diagonal > f64::EPSILON {
+            (dx / diagonal, dy / diagonal)
+        } else {
+            (1.0, 1.0)
+        };
+        let center = (
+            corner.0 * zoom + ux * radius * std::f64::consts::SQRT_2,
+            corner.1 * zoom + uy * radius * std::f64::consts::SQRT_2,
+        );
+        context.arc(
+            center.0,
+            center.1,
+            radius,
+            0.0,
+            std::f64::consts::TAU,
+        );
+        context.set_source_rgba(badge[0], badge[1], badge[2], 1.0);
+        let _ = context.fill();
+
         let layout = pangocairo::functions::create_layout(context);
         pangocairo::functions::context_set_resolution(&layout.context(), 72.0);
         let mut font = pango::FontDescription::new();
         font.set_family("Sans");
         font.set_weight(pango::Weight::Bold);
-        let size = (STICKY_SIDE * 0.38 * zoom).max(4.0);
+        let size = (radius * 1.1).max(4.0);
         font.set_absolute_size(size * f64::from(pango::SCALE));
         layout.set_font_description(Some(&font));
         layout.set_text(&replies.to_string());
         let (text_width, text_height) = layout.pixel_size();
-        let luminance =
-            0.299 * sticky.color[0] + 0.587 * sticky.color[1] + 0.114 * sticky.color[2];
-        let ink = if luminance > 0.55 { 0.0 } else { 1.0 };
-        context.set_source_rgba(ink, ink, ink, 0.9);
-        let corner = corners[2];
+        context.set_source_rgba(ink[0], ink[1], ink[2], 1.0);
         context.move_to(
-            corner.0 * zoom - f64::from(text_width) - 1.0 * zoom,
-            corner.1 * zoom - f64::from(text_height) - 0.5 * zoom,
+            center.0 - f64::from(text_width) / 2.0,
+            center.1 - f64::from(text_height) / 2.0,
         );
         pangocairo::functions::show_layout(context, &layout);
     }
@@ -8460,6 +8586,19 @@ fn stamp_shortcut(kind: StampKind) -> &'static str {
     }
 }
 
+/// Deja el popover de dibujo visible mientras el diálogo de color está abierto:
+/// el diálogo modal le quita el foco y, con `autohide`, el menú se cerraría antes
+/// de que el lector pueda elegir la herramienta.
+pub(crate) fn hold_color_popover(popover: &gtk::Popover) {
+    popover.set_autohide(false);
+}
+
+/// Devuelve el popover a su comportamiento normal cuando el diálogo se cierra,
+/// tanto al aceptar como al cancelar.
+pub(crate) fn release_color_popover(popover: &gtk::Popover) {
+    popover.set_autohide(true);
+}
+
 /// Botón de la barra y popover de dibujo: las cinco herramientas, el grosor
 /// libre en puntos, el selector de color, la nota adhesiva y los tres sellos.
 /// Devuelve las piezas que el visor tiene que conectar y recordar.
@@ -8467,7 +8606,7 @@ fn build_stroke_menu() -> (
     gtk::MenuButton,
     [gtk::Button; 5],
     gtk::SpinButton,
-    gtk::ColorDialogButton,
+    StrokeColorUi,
     gtk::Button,
     [gtk::Button; 3],
 ) {
@@ -8501,27 +8640,40 @@ fn build_stroke_menu() -> (
     width.set_tooltip_text(Some("Grosor en puntos"));
     accessible_label(&width, "Grosor del trazo en puntos");
 
-    let color_dialog = gtk::ColorDialog::builder()
-        .title("Color del trazo")
-        .with_alpha(false)
-        .modal(true)
+    let color_value: Rc<Cell<(f64, f64, f64)>> = Rc::new(Cell::new(STROKE_COLOR));
+    let color_swatch = gtk::DrawingArea::builder()
+        .width_request(18)
+        .height_request(18)
         .build();
-    let color = gtk::ColorDialogButton::builder()
-        .dialog(&color_dialog)
-        .rgba(&gdk::RGBA::new(
-            STROKE_COLOR.0 as f32,
-            STROKE_COLOR.1 as f32,
-            STROKE_COLOR.2 as f32,
-            1.0,
-        ))
+    {
+        let color_value = color_value.clone();
+        color_swatch.set_draw_func(move |_, context, width, height| {
+            let color = color_value.get();
+            let (width, height) = (f64::from(width), f64::from(height));
+            context.set_source_rgb(color.0, color.1, color.2);
+            context.rectangle(1.0, 1.0, (width - 2.0).max(1.0), (height - 2.0).max(1.0));
+            let _ = context.fill_preserve();
+            context.set_source_rgba(0.0, 0.0, 0.0, 0.6);
+            context.set_line_width(1.0);
+            let _ = context.stroke();
+        });
+    }
+    let color_button = gtk::Button::builder()
+        .child(&color_swatch)
+        .tooltip_text("Color del trazo")
         .build();
-    color.set_tooltip_text(Some("Color del trazo"));
-    accessible_label(&color, "Color del trazo");
+    color_button.add_css_class("flat");
+    accessible_label(&color_button, "Color del trazo");
+    let color = StrokeColorUi {
+        button: color_button,
+        swatch: color_swatch,
+        value: color_value,
+    };
 
     let settings = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     settings.append(&width_label);
     settings.append(&width);
-    settings.append(&color);
+    settings.append(&color.button);
 
     content.append(&tools);
     content.append(&settings);
@@ -8565,7 +8717,7 @@ fn build_stroke_menu() -> (
     popover.set_child(Some(&content));
 
     let button = gtk::MenuButton::builder()
-        .icon_name("applications-graphics-symbolic")
+        .icon_name("document-edit-symbolic")
         .tooltip_text("Dibujar y formas")
         .always_show_arrow(false)
         .popover(&popover)
@@ -9124,9 +9276,11 @@ mod tests {
             .map(|column| (0..side).filter(|row| is_red(pixels[row * side + column])).count())
             .max()
             .unwrap_or(0);
+        // La base de la punta mide max(5, 2 * grosor) puntos: con grosor 4 son
+        // 8 px y la punta queda más ancha que el trazo de 4 px.
         assert!(
-            widest > 8,
-            "la punta es más ancha que el trazo de la flecha: {widest} px"
+            (8..=10).contains(&widest),
+            "la punta tiene la base que pide la regla del motor: {widest} px"
         );
     }
 

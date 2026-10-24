@@ -32,8 +32,8 @@ mod tests {
     use crate::engine::render::render_page_surface;
     use crate::engine::annotation::{
         Annotation, Corner, FontChoice, IMAGE_BOX_FRACTION, ImageNote, ImagePixels, MarkKind,
-        NOTE_COLOR, STAMP_SIZE, STICKY_SIDE, STROKE_MAX_WIDTH, STROKE_MIN_WIDTH, ShapeKind,
-        StampKind, TextMark, TextNote, TextRun,
+        NOTE_COLOR, STAMP_SIZE, STICKY_COLOR, STICKY_SIDE, STROKE_MAX_WIDTH, STROKE_MIN_WIDTH,
+        ShapeKind, StampKind, TextMark, TextNote, TextRun,
     };
     use crate::services::annotations::{open_for_editing, read_annotations, write_annotations};
     use crate::ui::shell::*;
@@ -289,6 +289,11 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             Some("Dibujar y formas"),
             "el botón de dibujar se anuncia como «Dibujar y formas»"
         );
+        assert_eq!(
+            stroke_menu.icon_name().as_deref(),
+            Some("document-edit-symbolic"),
+            "el botón de dibujar lleva un lápiz, no el icono de gráficos"
+        );
         let stroke_popover = stroke_menu
             .popover()
             .expect("el botón de dibujar tiene que abrir su popover");
@@ -313,6 +318,36 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             ),
             (STROKE_MIN_WIDTH, STROKE_MAX_WIDTH, 0.5),
             "el grosor va de 0,5 a 20 puntos en pasos de medio punto"
+        );
+
+        // El color del trazo se elige sin perder el menú: mientras el diálogo de
+        // color está abierto el popover no se auto-oculta, y al cerrarse —aceptar
+        // o cancelar— vuelve a su comportamiento normal. El diálogo en sí es
+        // modal y no se puede simular: se prueba la preparación y la restauración.
+        assert!(
+            stroke_popover.is_autohide(),
+            "el popover se cierra al pulsar fuera, como cualquier menú"
+        );
+        let color_button = viewer.ui.stroke_color.button.clone();
+        assert_eq!(
+            color_button.tooltip_text().as_deref(),
+            Some("Color del trazo"),
+            "el popover de dibujo ofrece el color del trazo"
+        );
+        assert_eq!(
+            viewer.ui.stroke_color.value.get(),
+            STROKE_COLOR,
+            "el color del trazo arranca con el del lápiz"
+        );
+        hold_color_popover(&stroke_popover);
+        assert!(
+            !stroke_popover.is_autohide(),
+            "con el diálogo de color abierto el menú tiene que seguir visible"
+        );
+        release_color_popover(&stroke_popover);
+        assert!(
+            stroke_popover.is_autohide(),
+            "al cerrar el diálogo el popover vuelve a ocultarse solo"
         );
 
         // El menú File: guardar con nombres cortos. "Guardar" escribe en el
@@ -2234,9 +2269,10 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             );
         }
         assert!(viewer.stroke_drag_end(), "soltar cierra el trazo");
-        assert!(
-            viewer.stroke_tool_active().is_none(),
-            "soltar el trazo desarma el lápiz para no encadenar trazos"
+        assert_eq!(
+            viewer.stroke_tool_active().map(|tool| tool.kind),
+            Some(StrokeKind::Ink),
+            "soltar el trazo deja el lápiz armado para seguir dibujando"
         );
         let ink = match &viewer.annot.edits.borrow()[0].value {
             Annotation::Ink(stroke) => stroke.clone(),
@@ -2280,6 +2316,40 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             "el trazo se pinta en la capa de anotaciones"
         );
 
+        // El lápiz sigue armado: un segundo arrastre deja otro /Ink sin volver al
+        // menú, que es lo que el lector pidió al soltar el primer trazo.
+        assert!(
+            viewer.stroke_drag_begin(0, 20.0 * zoom, 90.0 * zoom),
+            "con el lápiz todavía armado el segundo arrastre empieza otro trazo"
+        );
+        assert!(
+            viewer.stroke_drag_update(0, 20.0 * zoom, 10.0 * zoom),
+            "y acumula su propio punto"
+        );
+        assert!(viewer.stroke_drag_end(), "el segundo trazo se cierra");
+        assert_eq!(
+            viewer.annot.edits.borrow().len(),
+            2,
+            "el segundo arrastre deja un segundo trazo"
+        );
+        assert!(
+            matches!(
+                &viewer.annot.edits.borrow()[1].value,
+                Annotation::Ink(stroke) if stroke.paths.len() == 1
+            ),
+            "la segunda anotación es un /Ink con su camino"
+        );
+        // Esc sigue desarmando el lápiz, aunque al soltar quede armado.
+        assert_eq!(
+            viewer.escape_pressed(),
+            gtk::glib::Propagation::Stop,
+            "Esc desarma el lápiz"
+        );
+        assert!(
+            viewer.stroke_tool_active().is_none(),
+            "después de Esc no queda herramienta armada"
+        );
+
         // Un clic sin arrastre no deja un trazo, y una forma de menos de un punto
         // de lado tampoco: no se podría ni ver ni volver a agarrar.
         viewer.start_stroke_tool(StrokeKind::Ink);
@@ -2287,12 +2357,13 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         assert!(viewer.stroke_drag_end(), "el clic cierra el gesto");
         assert_eq!(
             viewer.annot.edits.borrow().len(),
-            1,
+            2,
             "un trazo de un solo punto no se agrega"
         );
-        assert!(
-            viewer.stroke_tool_active().is_none(),
-            "aun sin agregar nada, soltar desarma la herramienta"
+        assert_eq!(
+            viewer.stroke_tool_active().map(|tool| tool.kind),
+            Some(StrokeKind::Ink),
+            "aun sin agregar nada, el lápiz sigue armado"
         );
         viewer.start_stroke_tool(StrokeKind::Shape(ShapeKind::Rectangle));
         assert!(viewer.stroke_drag_begin(0, 10.0 * zoom, 10.0 * zoom));
@@ -2300,8 +2371,12 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         assert!(viewer.stroke_drag_end(), "la forma diminuta se descarta");
         assert_eq!(
             viewer.annot.edits.borrow().len(),
-            1,
+            2,
             "una forma de menos de un punto de lado no se agrega"
+        );
+        assert!(
+            viewer.stroke_tool_active().is_none(),
+            "soltar una forma desarma la herramienta: un arrastre, una forma"
         );
 
         // La flecha: dos esquinas y una punta en el segundo extremo.
@@ -2315,7 +2390,7 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             "el arrastre mueve la esquina final"
         );
         assert!(viewer.stroke_drag_end(), "soltar cierra la forma");
-        let arrow = match &viewer.annot.edits.borrow()[1].value {
+        let arrow = match &viewer.annot.edits.borrow()[2].value {
             Annotation::Shape(shape) => shape.clone(),
             other => panic!("la flecha se guarda como forma: {other:?}"),
         };
@@ -2324,8 +2399,12 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         assert_eq!(arrow.to, (100.0, 130.0), "y la final");
         assert_eq!(
             viewer.annot.edits.borrow().len(),
-            2,
-            "el lápiz y la flecha son dos anotaciones"
+            3,
+            "los dos trazos del lápiz y la flecha son tres anotaciones"
+        );
+        assert!(
+            viewer.stroke_tool_active().is_none(),
+            "soltar la flecha desarma la forma: un arrastre, una forma"
         );
         let arrow_pixels = annotation_pixels(&viewer, 0, 400, 400);
         assert!(
@@ -2351,9 +2430,9 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             viewer.delete_selected_annotation(),
             "Supr borra el trazo elegido"
         );
-        assert_eq!(viewer.annot.edits.borrow().len(), 1);
-        assert!(viewer.undo(), "deshacer repone el trazo borrado");
         assert_eq!(viewer.annot.edits.borrow().len(), 2);
+        assert!(viewer.undo(), "deshacer repone el trazo borrado");
+        assert_eq!(viewer.annot.edits.borrow().len(), 3);
         assert!(
             matches!(&viewer.annot.edits.borrow()[0].value, Annotation::Ink(_)),
             "deshacer repone el trazo, no otra anotación"
@@ -2499,6 +2578,10 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             ((60.0, 120.0), STICKY_SIDE, STICKY_SIDE),
             "el icono queda donde se hizo clic, con su lado de {STICKY_SIDE} puntos"
         );
+        assert_eq!(
+            fresh.color, STICKY_COLOR,
+            "una nota nueva nace con el amarillo de nota, no con un cuadrado negro"
+        );
 
         // Aceptar el diálogo: el primer texto es la nota y el segundo, la
         // respuesta que agregó «Responder».
@@ -2524,11 +2607,12 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             "la nota queda pendiente de guardar"
         );
 
-        // El icono se pinta en la capa, dentro de su caja y no como un punto.
+        // El icono se pinta en la capa como una hoja de color cálido, dentro de su
+        // caja y no como un punto.
         let sticky_side = 400usize;
         let sticky_pixels = annotation_pixels(&viewer, 0, sticky_side, sticky_side);
         let painted = pixel_box(sticky_side, &sticky_pixels, |[red, green, blue]| {
-            red < 120 && green < 120 && blue < 120
+            red > 200 && green > 180 && blue < 200
         })
         .expect("el icono de la nota adhesiva se pinta en la capa");
         let expected = (
@@ -2545,6 +2629,20 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
                 && (painted.2 - painted.0) as f64 >= STICKY_SIDE * sticky_zoom - 2.0
                 && (painted.3 - painted.1) as f64 >= STICKY_SIDE * sticky_zoom - 2.0,
             "el icono {painted:?} tiene que llenar su caja {expected:?}"
+        );
+        // La cuenta de respuestas va en un círculo oscuro dentro de la hoja, con el
+        // número en blanco: sin el círculo la hoja amarilla quedaría sin cuenta.
+        let badge = pixel_box(sticky_side, &sticky_pixels, |[red, green, blue]| {
+            red < 90 && green < 90 && blue < 90
+        })
+        .expect("el círculo de la cuenta se pinta oscuro sobre la nota");
+        assert!(
+            badge.0 >= expected.0 && badge.1 >= expected.1 && badge.2 <= expected.2,
+            "el círculo {badge:?} queda dentro de la nota {expected:?}"
+        );
+        assert!(
+            badge.2 - badge.0 <= (STICKY_SIDE * sticky_zoom) as usize,
+            "el círculo no puede ser más ancho que la nota: {badge:?}"
         );
 
         // `Supr` (el mismo camino del controlador de teclas) borra la nota entera
@@ -2599,6 +2697,13 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             vec!["Texto de la nota", "Primera respuesta"],
             "los comentarios vuelven en orden"
         );
+        for (got, want) in back.color.iter().zip(STICKY_COLOR) {
+            assert!(
+                (got - want).abs() < 1e-6,
+                "el color del archivo, su /C, se respeta al reabrir: {:?}",
+                back.color
+            );
+        }
         assert!(
             back.contains(
                 (back.at.0 + STICKY_SIDE / 2.0, back.at.1 + STICKY_SIDE / 2.0),
