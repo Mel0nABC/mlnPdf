@@ -248,8 +248,10 @@ pub(crate) struct AnnotationState {
     pub(crate)     id_prefix: String,
     /// Arrastre de una nota en curso, si hay uno.
     pub(crate)     note_drag: RefCell<Option<NoteDrag>>,
-    /// Nota bajo el puntero y cursor que le corresponde, para no reescribirlo en
-    /// cada movimiento.
+    /// Arrastre de una imagen en curso, si hay uno.
+    pub(crate)     image_drag: RefCell<Option<ImageDrag>>,
+    /// Anotación bajo el puntero y cursor que le corresponde, para no
+    /// reescribirlo en cada movimiento.
     pub(crate)     hover: RefCell<Option<(String, &'static str)>>,
     pub(crate)     underline: Cell<MarkTool>,
     pub(crate)     highlight: Cell<MarkTool>,
@@ -282,6 +284,27 @@ pub(crate) struct NoteDrag {
     /// orientada (rotación aplicada, zoom 1): se conserva al cambiar de página.
     pub(crate) offset: (f64, f64),
     /// True una vez que se empujó la instantánea y la nota se movió.
+    pub(crate) moved: bool,
+}
+
+/// Arrastre de una imagen en curso: qué imagen, desde dónde se agarró y cómo era
+/// al empezar.
+///
+/// El gesto mueve la imagen dentro de su página: arrastrarla fuera de la página
+/// no la pasa a otra, porque su caja y su apariencia se escriben en la página a
+/// la que pertenece.
+#[derive(Clone, Debug)]
+pub(crate) struct ImageDrag {
+    pub(crate) id: String,
+    pub(crate) page: usize,
+    /// Punto de la vista donde empezó el arrastre, en píxeles lógicos.
+    pub(crate) grab: (f64, f64),
+    /// La imagen tal como estaba al empezar: cada movimiento se calcula desde
+    /// acá, así apretar o soltar `Shift` a mitad del arrastre no acumula formas.
+    pub(crate) start: ImageNote,
+    /// Esquina que se arrastra, o `None` cuando el gesto mueve la imagen entera.
+    pub(crate) corner: Option<Corner>,
+    /// True una vez que se empujó la instantánea y la imagen se movió.
     pub(crate) moved: bool,
 }
 
@@ -612,6 +635,7 @@ impl Viewer {
                 // el de la otra.
                 id_prefix: format!("mlnpdf-{}-{}", std::process::id(), session_nanos()),
                 note_drag: RefCell::new(None),
+                image_drag: RefCell::new(None),
                 hover: RefCell::new(None),
                 underline: Cell::new(MarkTool {
                     color: UNDERLINE_COLOR,
@@ -2886,6 +2910,19 @@ impl Viewer {
             })
     }
 
+    /// Copia de la imagen `id`, si esa anotación existe y es una imagen.
+    pub(crate) fn image(&self, id: &str) -> Option<ImageNote> {
+        self.annot
+            .edits
+            .borrow()
+            .iter()
+            .find(|edit| edit.id == id)
+            .and_then(|edit| match &edit.value {
+                Annotation::Image(image) => Some(image.clone()),
+                Annotation::Mark(_) | Annotation::Note(_) => None,
+            })
+    }
+
     /// Elige una anotación (o ninguna) y redibuja las páginas que cambian. Sólo
     /// una puede estar elegida: es la que responde a `Supr` y al menú.
     pub(crate) fn select_annotation(&self, id: Option<String>) {
@@ -3097,6 +3134,125 @@ impl Viewer {
         self.annot.note_drag.borrow_mut().take().is_some()
     }
 
+    /// Empieza a arrastrar la imagen que está bajo `(x, y)` y devuelve si el gesto
+    /// es un arrastre de imagen. Un asa de la imagen elegida redimensiona desde
+    /// esa esquina; el interior de una imagen la mueve, y de paso la elige.
+    pub(crate) fn image_drag_begin(&self, page: usize, x: f64, y: f64) -> bool {
+        let zoom = self.view.zoom.get();
+        if zoom <= 0.0 {
+            return false;
+        }
+        let Some(point) = self.view_to_pdf(page, x, y) else {
+            return false;
+        };
+        let tolerance = IMAGE_HANDLE_SIZE / zoom;
+        // Las asas de la imagen elegida van primero: son el tirador que se ve.
+        let handle = self.annot.selected.borrow().as_deref().and_then(|id| {
+            let image = self.image(id).filter(|image| image.page == page)?;
+            let corner = image.corner_at(point, tolerance)?;
+            Some((id.to_string(), corner))
+        });
+        let (id, corner) = match handle {
+            Some((id, corner)) => (id, Some(corner)),
+            None => match self.image_at(page, x, y) {
+                Some(id) => (id, None),
+                None => return false,
+            },
+        };
+        let Some(start) = self.image(&id) else {
+            return false;
+        };
+        // La selección de texto anterior se suelta: este gesto mueve la imagen.
+        if self.sel.selection.borrow_mut().take().is_some() {
+            self.sel.selection_rects.borrow_mut().clear();
+        }
+        self.select_annotation(Some(id.clone()));
+        *self.annot.image_drag.borrow_mut() = Some(ImageDrag {
+            id,
+            page,
+            grab: (x, y),
+            start,
+            corner,
+            moved: false,
+        });
+        self.queue_page_draw(page);
+        true
+    }
+
+    /// True mientras se está arrastrando una imagen.
+    pub(crate) fn image_drag_active(&self) -> bool {
+        self.annot.image_drag.borrow().is_some()
+    }
+
+    /// Mueve o redimensiona la imagen del arrastre con el desplazamiento del
+    /// puntero. El desplazamiento se mide en puntos de la página, así que ni el
+    /// zoom ni la rotación de la vista cambian el resultado; con `keep_aspect` se
+    /// conserva la proporción, como con `Shift`. La instantánea para deshacer se
+    /// empuja una sola vez por arrastre.
+    pub(crate) fn image_drag_update(
+        &self,
+        offset_x: f64,
+        offset_y: f64,
+        keep_aspect: bool,
+    ) -> bool {
+        if offset_x == 0.0 && offset_y == 0.0 {
+            return false;
+        }
+        let Some((page, id, next)) = self.image_drag_target(offset_x, offset_y, keep_aspect) else {
+            return false;
+        };
+        if !self
+            .annot
+            .image_drag
+            .borrow()
+            .as_ref()
+            .is_some_and(|drag| drag.moved)
+        {
+            self.begin_edit();
+            if let Some(drag) = self.annot.image_drag.borrow_mut().as_mut() {
+                drag.moved = true;
+            }
+        }
+        {
+            let mut edits = self.annot.edits.borrow_mut();
+            let Some(edit) = edits.iter_mut().find(|edit| edit.id == id) else {
+                return false;
+            };
+            let Annotation::Image(image) = &mut edit.value else {
+                return false;
+            };
+            *image = next;
+        }
+        self.queue_page_draw(page);
+        true
+    }
+
+    /// Página, identificador y caja nueva de la imagen que se está arrastrando.
+    /// La caja sale siempre del estado del principio del arrastre: mover usa
+    /// `moved` y redimensionar usa `resized` desde la esquina agarrada.
+    fn image_drag_target(
+        &self,
+        offset_x: f64,
+        offset_y: f64,
+        keep_aspect: bool,
+    ) -> Option<(usize, String, ImageNote)> {
+        let drag = self.annot.image_drag.borrow();
+        let drag = drag.as_ref()?;
+        let grab = self.view_to_pdf(drag.page, drag.grab.0, drag.grab.1)?;
+        let now = self.view_to_pdf(drag.page, drag.grab.0 + offset_x, drag.grab.1 + offset_y)?;
+        let delta = (now.0 - grab.0, now.1 - grab.1);
+        let next = match drag.corner {
+            Some(corner) => drag.start.resized(corner, delta, keep_aspect),
+            None => drag.start.moved(delta),
+        };
+        Some((drag.page, drag.id.clone(), next))
+    }
+
+    /// Suelta la imagen que se estaba arrastrando; devuelve si había una.
+    pub(crate) fn image_drag_end(&self) -> bool {
+        self.annot.image_drag.borrow_mut().take().is_some()
+    }
+
     /// Cambia el texto de la nota `id` con sus tramos, la vuelve a medir y la
     /// redibuja. Un texto en blanco no la borra: una nota sin texto no se puede
     /// leer ni volver a editar.
@@ -3126,18 +3282,31 @@ impl Viewer {
         true
     }
 
-    /// Cursor de la capa de la página: cuatro flechas en el borde de la nota
-    /// (ahí se agarra para moverla) y cursor de texto sobre el texto. El modo mano
-    /// y las herramientas armadas mandan: mientras alguno esté activo, el cursor
-    /// es el suyo.
-    pub(crate) fn update_note_cursor(&self, page: usize, x: f64, y: f64, overlay: &gtk::Overlay) {
+    /// Cursor de la capa de la página: cursor de redimensión en las asas de la
+    /// imagen elegida, cuatro flechas en el borde de la nota y cursor de texto
+    /// sobre su texto, y cursor de mover dentro de una imagen. El modo mano y las
+    /// herramientas armadas mandan: mientras alguno esté activo, el cursor es el
+    /// suyo.
+    pub(crate) fn update_annotation_cursor(
+        &self,
+        page: usize,
+        x: f64,
+        y: f64,
+        overlay: &gtk::Overlay,
+    ) {
         if self.input.hand_mode.get()
             || self.active_mark_tool().is_some()
             || self.text_tool_active()
         {
             return;
         }
-        let current = self.note_cursor_hit(page, x, y);
+        // Las asas de la imagen elegida ganan sobre lo demás: son el tirador que
+        // se ve. Después la nota, que se apila encima de la imagen, y al final el
+        // interior de la imagen.
+        let current = self
+            .image_handle_cursor_hit(page, x, y)
+            .or_else(|| self.note_cursor_hit(page, x, y))
+            .or_else(|| self.image_cursor_hit(page, x, y));
         let mut hover = self.annot.hover.borrow_mut();
         if *hover == current {
             return;
@@ -3145,13 +3314,46 @@ impl Viewer {
         let name = current.as_ref().map(|(_, name)| *name);
         *hover = current;
         drop(hover);
-        self.apply_note_cursor(page, overlay, name);
+        self.apply_annotation_cursor(page, overlay, name);
     }
 
-    /// El puntero salió de la página: ya no hay nota bajo el cursor.
-    pub(crate) fn clear_note_cursor(&self, page: usize, overlay: &gtk::Overlay) {
+    /// El puntero salió de la página: ya no hay anotación bajo el cursor.
+    pub(crate) fn clear_annotation_cursor(&self, page: usize, overlay: &gtk::Overlay) {
         self.annot.hover.borrow_mut().take();
-        self.apply_note_cursor(page, overlay, None);
+        self.apply_annotation_cursor(page, overlay, None);
+    }
+
+    /// Imagen bajo el puntero o asa de la imagen elegida, con el cursor que le
+    /// corresponde: las esquinas de la imagen elegida redimensionan y su interior
+    /// mueve. Un asa gana sobre el interior porque es lo que se ve como tirador.
+    pub(crate) fn image_cursor_hit(
+        &self,
+        page: usize,
+        x: f64,
+        y: f64,
+    ) -> Option<(String, &'static str)> {
+        self.image_handle_cursor_hit(page, x, y)
+            .or_else(|| self.image_at(page, x, y).map(|id| (id, "move")))
+    }
+
+    /// Asa de la imagen elegida bajo el puntero, con el cursor de su diagonal.
+    fn image_handle_cursor_hit(
+        &self,
+        page: usize,
+        x: f64,
+        y: f64,
+    ) -> Option<(String, &'static str)> {
+        let zoom = self.view.zoom.get();
+        if zoom <= 0.0 {
+            return None;
+        }
+        let point = self.view_to_pdf(page, x, y)?;
+        let tolerance = IMAGE_HANDLE_SIZE / zoom;
+        let selected = self.annot.selected.borrow().clone();
+        let id = selected?;
+        let image = self.image(&id).filter(|image| image.page == page)?;
+        let corner = image.corner_at(point, tolerance)?;
+        Some((id, resize_cursor(corner, self.view.rotation.get())))
     }
 
     /// Nota bajo el puntero o dentro de su banda de borde, con el cursor que le
@@ -3182,7 +3384,7 @@ impl Viewer {
     /// Pone el cursor en todas las capas de la página. El lienzo de la selección
     /// es el widget que recibe el puntero y heredar el cursor del `Overlay` no se
     /// refresca mientras el puntero sigue dentro: hay que fijarlo en el lienzo.
-    fn apply_note_cursor(&self, page: usize, overlay: &gtk::Overlay, name: Option<&str>) {
+    fn apply_annotation_cursor(&self, page: usize, overlay: &gtk::Overlay, name: Option<&str>) {
         let cursor = name.and_then(|name| {
             if name == "move" {
                 move_cursor()
@@ -4210,16 +4412,27 @@ impl Viewer {
             if viewer.active_mark_tool().is_none() && viewer.note_drag_begin(page, x, y) {
                 return;
             }
+            // Lo mismo con una imagen: el interior la mueve y sus asas la
+            // redimensionan.
+            if viewer.active_mark_tool().is_none() && viewer.image_drag_begin(page, x, y) {
+                return;
+            }
             viewer.begin_selection(page, x, y);
         });
 
         let weak = Rc::downgrade(viewer);
-        gesture.connect_drag_update(move |_, offset_x, offset_y| {
+        gesture.connect_drag_update(move |gesture, offset_x, offset_y| {
             let Some(viewer) = weak.upgrade() else {
                 return;
             };
             if viewer.note_drag_active() {
                 viewer.note_drag_update(offset_x, offset_y);
+            } else if viewer.image_drag_active() {
+                // `Shift` conserva la proporción mientras se redimensiona.
+                let keep_aspect = gesture
+                    .current_event_state()
+                    .contains(gdk::ModifierType::SHIFT_MASK);
+                viewer.image_drag_update(offset_x, offset_y, keep_aspect);
             } else {
                 viewer.update_selection(page, offset_x, offset_y);
             }
@@ -4230,8 +4443,8 @@ impl Viewer {
             let Some(viewer) = weak.upgrade() else {
                 return;
             };
-            // Un arrastre de nota no termina en una selección de texto.
-            if !viewer.note_drag_end() {
+            // Un arrastre de nota o de imagen no termina en una selección de texto.
+            if !viewer.note_drag_end() && !viewer.image_drag_end() {
                 viewer.finish_selection();
             }
         });
@@ -4292,14 +4505,14 @@ impl Viewer {
         let overlay_for_motion = overlay.clone();
         motion.connect_motion(move |_, x, y| {
             if let Some(viewer) = weak.upgrade() {
-                viewer.update_note_cursor(page, x, y, &overlay_for_motion);
+                viewer.update_annotation_cursor(page, x, y, &overlay_for_motion);
             }
         });
         let weak = Rc::downgrade(viewer);
         let overlay_for_leave = overlay.clone();
         motion.connect_leave(move |_| {
             if let Some(viewer) = weak.upgrade() {
-                viewer.clear_note_cursor(page, &overlay_for_leave);
+                viewer.clear_annotation_cursor(page, &overlay_for_leave);
             }
         });
         overlay.add_controller(motion);
@@ -6637,6 +6850,19 @@ fn note_view_rect(note: &TextNote, page: (f64, f64), rotation: i32) -> (f64, f64
         rotation,
     );
     (x1.min(x2), y1.min(y2), x1.max(x2), y1.max(y2))
+}
+
+/// Cursor de redimensión de una esquina: el de la diagonal que forma con la
+/// esquina opuesta. Con `/Rotate` 90 o 270 la vista gira un cuarto de vuelta y las
+/// dos diagonales se intercambian; con 180 la diagonal sigue siendo la misma.
+fn resize_cursor(corner: Corner, rotation: i32) -> &'static str {
+    let nwse = matches!(corner, Corner::TopLeft | Corner::BottomRight);
+    let quarter_turn = matches!(rotation.rem_euclid(360), 90 | 270);
+    if nwse != quarter_turn {
+        "nwse-resize"
+    } else {
+        "nesw-resize"
+    }
 }
 
 /// `Some("move")` on the border of `rect` (up to `inner` towards the inside and

@@ -27,7 +27,8 @@ mod tests {
     use std::rc::Rc;
     use crate::engine::geometry::*;
     use crate::engine::annotation::{
-        Annotation, FontChoice, IMAGE_BOX_FRACTION, MarkKind, NOTE_COLOR, TextMark, TextNote, TextRun,
+        Annotation, Corner, FontChoice, IMAGE_BOX_FRACTION, ImageNote, MarkKind, NOTE_COLOR,
+        TextMark, TextNote, TextRun,
     };
     use crate::ui::shell::*;
 
@@ -1168,7 +1169,7 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         );
         let current_note = note_value(&viewer, 4);
         let overlay = viewer.doc.slots.borrow()[0].overlay.clone();
-        viewer.update_note_cursor(
+        viewer.update_annotation_cursor(
             0,
             current_note.at.0 + 2.0,
             current_note.at.1 + current_note.height / 2.0,
@@ -1179,7 +1180,7 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             Some((note_id.clone(), "move")),
             "el borde de la nota muestra el cursor de mover"
         );
-        viewer.update_note_cursor(
+        viewer.update_annotation_cursor(
             0,
             current_note.at.0 - 2.0,
             current_note.at.1 + current_note.height / 2.0,
@@ -1212,7 +1213,7 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
                 .is_none(),
             "más allá de la tolerancia ya no es la nota"
         );
-        viewer.update_note_cursor(
+        viewer.update_annotation_cursor(
             0,
             current_note.at.0 + current_note.width / 2.0,
             current_note.at.1 + current_note.height / 2.0,
@@ -1223,7 +1224,7 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             Some((note_id.clone(), "text")),
             "el texto de la nota muestra el cursor de edición"
         );
-        viewer.clear_note_cursor(0, &overlay);
+        viewer.clear_annotation_cursor(0, &overlay);
         assert!(
             viewer.annot.hover.borrow().is_none(),
             "salir de la nota limpia el cursor"
@@ -1536,6 +1537,138 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             image.height
         );
 
+        // S5: arrastrar desde dentro de la imagen la mueve y no le cambia el
+        // tamaño. El arrastre se mide en puntos de la página, así que el
+        // desplazamiento del puntero se pasa a puntos con el zoom.
+        let zoom = viewer.view.zoom.get();
+        assert!(zoom > 0.0, "hay un zoom con el que pasar a puntos");
+        let image = image_value(&viewer, 0);
+        viewer.select_annotation(Some(image_id.clone()));
+        let center = |image: &ImageNote| {
+            (
+                (image.at.0 + image.width / 2.0) * zoom,
+                (image.at.1 + image.height / 2.0) * zoom,
+            )
+        };
+        let (grab_x, grab_y) = center(&image);
+        assert!(
+            viewer.image_drag_begin(image.page, grab_x, grab_y),
+            "el arrastre empieza dentro de la imagen"
+        );
+        assert!(viewer.image_drag_active(), "el arrastre de imagen queda vivo");
+        let (dx, dy) = (24.0, 16.0);
+        assert!(
+            viewer.image_drag_update(dx, dy, false),
+            "el arrastre mueve la imagen"
+        );
+        assert!(viewer.image_drag_end(), "el arrastre termina");
+        assert!(!viewer.image_drag_active(), "soltar cierra el arrastre");
+        let moved = image_value(&viewer, 0);
+        assert!(
+            (moved.at.0 - (image.at.0 + dx / zoom)).abs() < 1e-6
+                && (moved.at.1 - (image.at.1 + dy / zoom)).abs() < 1e-6,
+            "la imagen se mueve el desplazamiento del puntero en puntos: {:?} -> {:?}",
+            image.at,
+            moved.at
+        );
+        assert_eq!(
+            (moved.width, moved.height),
+            (image.width, image.height),
+            "mover no cambia el tamaño de la imagen"
+        );
+        assert!(
+            viewer.has_pending_marks(),
+            "mover la imagen deja el cambio pendiente de guardar"
+        );
+        assert!(viewer.undo(), "mover la imagen se deshace");
+        let restored = image_value(&viewer, 0);
+        assert_eq!(
+            (restored.at, restored.width, restored.height),
+            (image.at, image.width, image.height),
+            "deshacer devuelve la imagen a donde estaba"
+        );
+
+        // S4: arrastrar un asa redimensiona desde esa esquina; los dos lados van
+        // por su eje y la esquina opuesta se queda donde estaba.
+        let image = image_value(&viewer, 0);
+        viewer.select_annotation(Some(image_id.clone()));
+        let corner = Corner::BottomRight;
+        let (handle_x, handle_y) = corner.point(image.rect());
+        assert!(
+            viewer.image_drag_begin(image.page, handle_x * zoom, handle_y * zoom),
+            "el asa arranca la redimensión"
+        );
+        assert!(
+            viewer.image_drag_update(20.0, 10.0, false),
+            "el asa redimensiona la imagen"
+        );
+        assert!(viewer.image_drag_end(), "la redimensión termina");
+        let resized = image_value(&viewer, 0);
+        assert!(
+            (resized.width - (image.width + 20.0 / zoom)).abs() < 1e-6
+                && (resized.height - (image.height + 10.0 / zoom)).abs() < 1e-6,
+            "cada lado sigue al puntero por su eje: {}x{} -> {}x{}",
+            image.width,
+            image.height,
+            resized.width,
+            resized.height
+        );
+        assert_eq!(
+            resized.at, image.at,
+            "la esquina opuesta a la agarrada queda fija"
+        );
+
+        // Con `Shift` la proporción se conserva: el lado que no se arrastró
+        // acompaña al que sí.
+        let before = image_value(&viewer, 0);
+        let aspect = before.width / before.height;
+        viewer.select_annotation(Some(image_id.clone()));
+        let (handle_x, handle_y) = Corner::BottomRight.point(before.rect());
+        assert!(viewer.image_drag_begin(
+            before.page,
+            handle_x * zoom,
+            handle_y * zoom
+        ));
+        assert!(viewer.image_drag_update(30.0, 0.0, true));
+        assert!(viewer.image_drag_end());
+        let stretched = image_value(&viewer, 0);
+        assert!(
+            (stretched.width / stretched.height - aspect).abs() < 1e-9,
+            "con Shift la proporción se conserva: {}x{}",
+            stretched.width,
+            stretched.height
+        );
+        assert!(
+            stretched.height > before.height,
+            "el alto acompaña al ancho: {} > {}",
+            stretched.height,
+            before.height
+        );
+
+        // Cursor: dentro de la imagen elegida mueve y en sus asas redimensiona en
+        // la diagonal de esa esquina.
+        let image = image_value(&viewer, 0);
+        viewer.select_annotation(Some(image_id.clone()));
+        let (grab_x, grab_y) = center(&image);
+        assert_eq!(
+            viewer.image_cursor_hit(image.page, grab_x, grab_y),
+            Some((image_id.clone(), "move")),
+            "dentro de la imagen el cursor dice que se mueve"
+        );
+        for (corner, expected) in [
+            (Corner::TopLeft, "nwse-resize"),
+            (Corner::BottomRight, "nwse-resize"),
+            (Corner::TopRight, "nesw-resize"),
+            (Corner::BottomLeft, "nesw-resize"),
+        ] {
+            let (x, y) = corner.point(image.rect());
+            assert_eq!(
+                viewer.image_cursor_hit(image.page, x * zoom, y * zoom),
+                Some((image_id.clone(), expected)),
+                "el asa {corner:?} muestra el cursor de su diagonal"
+            );
+        }
+
         assert!(
             viewer.delete_selected_annotation(),
             "Supr borra la imagen elegida"
@@ -1638,6 +1771,14 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         match viewer.annot.edits.borrow()[index].value.clone() {
             Annotation::Note(note) => note,
             other => panic!("la anotación {index} tenía que ser una nota: {other:?}"),
+        }
+    }
+
+    /// Imagen de la posición `index`.
+    fn image_value(viewer: &Viewer, index: usize) -> ImageNote {
+        match viewer.annot.edits.borrow()[index].value.clone() {
+            Annotation::Image(image) => image,
+            other => panic!("la anotación {index} tenía que ser una imagen: {other:?}"),
         }
     }
 

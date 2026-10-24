@@ -472,11 +472,6 @@ impl ImageNote {
         (at, size)
     }
 
-    /// Tamaño que ocupa la imagen a 72 ppp: un píxel, un punto.
-    pub fn natural_size(&self) -> (f64, f64) {
-        (self.pixels.width as f64, self.pixels.height as f64)
-    }
-
     /// Caja de la imagen en el espacio de la selección: `(x1, y1, x2, y2)`.
     pub fn rect(&self) -> Rect {
         (
