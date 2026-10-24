@@ -27,9 +27,10 @@ mod tests {
     use std::rc::Rc;
     use crate::engine::geometry::*;
     use crate::engine::annotation::{
-        Annotation, Corner, FontChoice, IMAGE_BOX_FRACTION, ImageNote, MarkKind, NOTE_COLOR,
-        TextMark, TextNote, TextRun,
+        Annotation, Corner, FontChoice, IMAGE_BOX_FRACTION, ImageNote, ImagePixels, MarkKind,
+        NOTE_COLOR, TextMark, TextNote, TextRun,
     };
+    use crate::services::annotations::{read_annotations, write_annotations};
     use crate::ui::shell::*;
 
     /// One page, 200x100 pt, fully filled with pure red, no xref table
@@ -1763,6 +1764,239 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             "deshacer quita la imagen soltada"
         );
         std::fs::remove_file(&image_path).ok();
+
+        // S1 y S2: al volver a abrir el archivo, las anotaciones propias vuelven a
+        // la lista editable. Los diálogos modales no se pueden manejar desde una
+        // prueba, así que el archivo se arma con el mismo escritor que usa el
+        // visor y después se abre: es el mismo camino que sigue el lector.
+        let reopen_source = dir.join("reopen-source-ui.pdf");
+        let reopen_path = dir.join("reopen-ui.pdf");
+        std::fs::copy(&two_path, &reopen_source).expect("copiar el PDF de la prueba");
+        std::fs::remove_file(&reopen_path).ok();
+
+        let reopen_font = FontChoice {
+            family: "Liberation Serif".to_string(),
+            size: 14.0,
+            bold: true,
+            italic: false,
+        };
+        let reopen_text = "Nota que vuelve a la lista";
+        let reopen_note = TextNote::new(
+            0,
+            (20.0, 100.0),
+            90.0,
+            18.0,
+            vec![TextRun {
+                text: reopen_text.to_string(),
+                font: reopen_font.clone(),
+                color: NOTE_COLOR,
+            }],
+        );
+        // Verde puro opaco en BGRA premultiplicado: se distingue del papel rojo de
+        // la página y del recuadro azul de la selección.
+        let (green_width, green_height) = (20u32, 10u32);
+        let mut green_bytes = Vec::with_capacity((green_width * green_height * 4) as usize);
+        for _ in 0..green_width * green_height {
+            green_bytes.extend_from_slice(&[0, 255, 0, 255]);
+        }
+        let reopen_pixels = ImagePixels::new(green_width, green_height, green_bytes)
+            .expect("los píxeles de la imagen son válidos");
+        let reopen_image = ImageNote::new(0, (20.0, 130.0), 40.0, 20.0, reopen_pixels);
+
+        let reopen_written = vec![
+            (
+                "mlnpdf-reabrir-subrayado".to_string(),
+                Annotation::Mark(TextMark::underline(
+                    0,
+                    vec![(20.0, 20.0, 120.0, 40.0)],
+                    (1.0, 0.0, 0.0),
+                )),
+            ),
+            (
+                "mlnpdf-reabrir-resaltado".to_string(),
+                Annotation::Mark(TextMark::highlight(
+                    0,
+                    vec![(20.0, 60.0, 120.0, 80.0)],
+                    (1.0, 0.5, 0.0),
+                )),
+            ),
+            (
+                "mlnpdf-reabrir-nota".to_string(),
+                Annotation::Note(reopen_note),
+            ),
+            (
+                "mlnpdf-reabrir-imagen".to_string(),
+                Annotation::Image(reopen_image.clone()),
+            ),
+        ];
+        assert_eq!(
+            write_annotations(&reopen_source, &reopen_path, &reopen_written, &[])
+                .expect("las cuatro anotaciones se escriben"),
+            4,
+            "el archivo de la prueba queda con subrayado, resaltado, nota e imagen"
+        );
+
+        viewer.open(&reopen_path).expect("abrir el archivo guardado");
+        let reopen_ids: Vec<String> = viewer
+            .annot
+            .edits
+            .borrow()
+            .iter()
+            .map(|edit| edit.id.clone())
+            .collect();
+        assert_eq!(
+            reopen_ids,
+            vec![
+                "mlnpdf-reabrir-subrayado",
+                "mlnpdf-reabrir-resaltado",
+                "mlnpdf-reabrir-nota",
+                "mlnpdf-reabrir-imagen",
+            ],
+            "las cuatro vuelven con su /NM, en orden de página"
+        );
+        assert_eq!(
+            *viewer.annot.persisted.borrow(),
+            *viewer.annot.edits.borrow(),
+            "persisted es la copia exacta de lo que el archivo tiene"
+        );
+        assert!(
+            !viewer.has_pending_marks(),
+            "al abrir no queda nada pendiente"
+        );
+        assert_eq!(viewer.pending_count(), 0, "no hay cambios que anunciar");
+
+        // La imagen vuelve con sus píxeles y se pinta: se rasteriza la capa de
+        // anotaciones y se la encuentra dentro de su caja.
+        let reopened_image = image_value(&viewer, 3);
+        assert_eq!(
+            (reopened_image.pixels.width, reopened_image.pixels.height),
+            (green_width, green_height),
+            "la imagen vuelve con su tamaño en píxeles"
+        );
+        assert_eq!(
+            *reopened_image.pixels.data,
+            *reopen_image.pixels.data,
+            "los píxeles vuelven tal como se escribieron"
+        );
+        let reopen_side = 200usize;
+        let reopened_pixels = annotation_pixels(&viewer, 0, reopen_side, reopen_side);
+        let green_box = pixel_box(reopen_side, &reopened_pixels, |[red, green, blue]| {
+            green > 200 && red < 60 && blue < 60
+        })
+        .expect("la imagen vuelve y se pinta sobre la página");
+        assert!(
+            green_box.2 - green_box.0 > 10 && green_box.3 - green_box.1 > 5,
+            "la imagen se pinta entera y no un solo píxel: {green_box:?}"
+        );
+
+        // S2: lo que vuelve se puede volver a editar. La nota de texto recupera su
+        // acción de editar y el texto del archivo es el punto de partida de
+        // deshacer.
+        let reopen_note_id = "mlnpdf-reabrir-nota".to_string();
+        viewer.select_annotation(Some(reopen_note_id.clone()));
+        let note_edit_action = viewer
+            .ui
+            .window
+            .lookup_action("note-edit")
+            .and_then(|action| action.downcast::<gio::SimpleAction>().ok())
+            .expect("la acción de editar texto existe");
+        assert!(
+            note_edit_action.is_enabled(),
+            "una nota que volvió del archivo se puede editar"
+        );
+        assert!(
+            viewer.apply_note_text(
+                &reopen_note_id,
+                vec![TextRun {
+                    text: "Texto nuevo".to_string(),
+                    font: reopen_font.clone(),
+                    color: NOTE_COLOR,
+                }],
+            ),
+            "el texto de la nota se vuelve a editar"
+        );
+        assert!(
+            viewer.has_pending_marks(),
+            "el texto nuevo queda pendiente de guardar"
+        );
+        assert!(viewer.undo(), "deshacer alcanza al texto editado");
+        assert_eq!(
+            note_value(&viewer, 2).text(),
+            reopen_text,
+            "deshacer devuelve el texto que traía el archivo"
+        );
+        assert!(
+            !viewer.has_pending_marks(),
+            "y el estado vuelve a coincidir con el archivo"
+        );
+
+        // Y la imagen vuelve a moverse: el arrastre la deja pendiente y deshacer
+        // la devuelve a la caja con la que se abrió.
+        let reopen_image_id = "mlnpdf-reabrir-imagen".to_string();
+        let reopen_zoom = viewer.view.zoom.get();
+        assert!(reopen_zoom > 0.0, "hay un zoom con el que pasar a puntos");
+        let before = image_value(&viewer, 3);
+        viewer.select_annotation(Some(reopen_image_id));
+        let grab_x = (before.at.0 + before.width / 2.0) * reopen_zoom;
+        let grab_y = (before.at.1 + before.height / 2.0) * reopen_zoom;
+        assert!(
+            viewer.image_drag_begin(before.page, grab_x, grab_y),
+            "el arrastre empieza dentro de la imagen que volvió"
+        );
+        assert!(
+            viewer.image_drag_update(24.0, 16.0, false),
+            "el arrastre mueve la imagen que volvió"
+        );
+        assert!(viewer.image_drag_end(), "el arrastre termina");
+        assert_ne!(
+            image_value(&viewer, 3).at,
+            before.at,
+            "la imagen se movió"
+        );
+        assert!(
+            viewer.has_pending_marks(),
+            "moverla la deja pendiente de guardar"
+        );
+        assert!(viewer.undo(), "deshacer alcanza a la imagen");
+        let restored = image_value(&viewer, 3);
+        assert_eq!(
+            (restored.at, restored.width, restored.height),
+            (before.at, before.width, before.height),
+            "deshacer la devuelve a su caja original"
+        );
+        assert!(!viewer.has_pending_marks());
+
+        // Sin nada pendiente, guardar no escribe ninguna anotación: el archivo
+        // queda igual y sigue con cuatro, no ocho.
+        let before_save = std::fs::read(&reopen_path).expect("leer el archivo guardado");
+        assert!(
+            viewer.save_pending_edits(&reopen_path),
+            "guardar sin cambios pendientes no falla"
+        );
+        assert_eq!(
+            std::fs::read(&reopen_path).expect("releer el archivo guardado"),
+            before_save,
+            "sin cambios pendientes el archivo no se reescribe"
+        );
+        assert_eq!(
+            read_annotations(&reopen_path)
+                .expect("leer las anotaciones del archivo")
+                .len(),
+            4,
+            "el archivo sigue con sus cuatro anotaciones, no ocho"
+        );
+
+        // Abrir otro documento deja la lista en lo que ese archivo tiene: el
+        // documento original de la prueba no trae anotaciones propias.
+        viewer.open(&two_path).expect("volver al documento de la prueba");
+        assert!(
+            viewer.annot.edits.borrow().is_empty(),
+            "el documento original no tiene anotaciones propias"
+        );
+        assert!(!viewer.has_pending_marks());
+
+        std::fs::remove_file(&reopen_source).ok();
+        std::fs::remove_file(&reopen_path).ok();
 
         // Pulsar la herramienta abre el selector de color del sistema. Es la
         // única parte del flujo que no se puede probar sin un clic real, así que

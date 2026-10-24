@@ -1193,6 +1193,19 @@ impl Viewer {
         *self.doc.current_path.borrow_mut() = Some(path.to_path_buf());
         // Las anotaciones pertenecen al documento anterior.
         self.clear_edits();
+        // Lo que el archivo ya tiene vuelve como anotación editable: son las
+        // nuestras, las que llevan nuestro `/NM`. `persisted` guarda una copia
+        // idéntica, así al abrir no hay nada pendiente y el primer guardado
+        // reemplaza esas anotaciones en lugar de duplicarlas. Si el archivo no se
+        // puede leer se abre sin anotaciones y nada se pierde, porque tampoco hay
+        // nada pendiente que guardar.
+        let loaded: Vec<Edit> = read_annotations(path)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(id, value)| Edit { id, value })
+            .collect();
+        *self.annot.edits.borrow_mut() = loaded.clone();
+        *self.annot.persisted.borrow_mut() = loaded;
         *self.sel.selection.borrow_mut() = None;
         self.sel.selection_rects.borrow_mut().clear();
         self.view.zoom.set(ZOOM_DEFAULT);
@@ -2848,6 +2861,10 @@ impl Viewer {
         self.annot.persisted.borrow_mut().clear();
         self.annot.undo_stack.borrow_mut().clear();
         self.annot.redo_stack.borrow_mut().clear();
+        // Las superficies están indexadas por la dirección del búfer de la imagen:
+        // las de la lista anterior ya no tienen a quién dibujar y, si el búfer se
+        // libera, su dirección podría reusarse para otra imagen.
+        self.annot.image_surfaces.borrow_mut().clear();
         self.annot.draft.borrow_mut().take();
         self.annot.note_drag.borrow_mut().take();
         self.annot.hover.borrow_mut().take();
