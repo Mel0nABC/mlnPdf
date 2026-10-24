@@ -26,6 +26,7 @@ mod tests {
     use crate::ui::actions::*;
     use std::rc::Rc;
     use crate::engine::geometry::*;
+    use crate::engine::render::render_page_surface;
     use crate::engine::annotation::{
         Annotation, Corner, FontChoice, IMAGE_BOX_FRACTION, ImageNote, ImagePixels, MarkKind,
         NOTE_COLOR, TextMark, TextNote, TextRun,
@@ -1889,6 +1890,43 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             "la imagen se pinta entera y no un solo píxel: {green_box:?}"
         );
 
+        // El defecto reportado por el lector: poppler pinta las anotaciones que
+        // trae el archivo, así que la nuestra se dibujaba dos veces —la del
+        // archivo y la de la capa— y al borrarla seguía en el raster hasta
+        // guardar y recargar. La página se rasteriza desde el documento del
+        // visor y no puede tener píxeles de la imagen propia: solo la capa la
+        // dibuja.
+        let (raster_width, raster) = page_raster_pixels(&viewer, 0);
+        assert!(
+            pixel_box(raster_width, &raster, |[red, green, blue]| {
+                green > 200 && red < 60 && blue < 60
+            })
+            .is_none(),
+            "poppler no puede pintar la imagen propia: la dibuja solo la capa"
+        );
+
+        // Y al borrarla de la capa no queda nada que la dibuje: es lo que el
+        // lector veía como «se siguen mostrando». Después se deshace para que el
+        // resto de la prueba siga con las cuatro anotaciones del archivo.
+        viewer.select_annotation(Some("mlnpdf-reabrir-imagen".to_string()));
+        assert!(
+            viewer.delete_selected_annotation(),
+            "la imagen que volvió del archivo se puede borrar"
+        );
+        let after_delete = annotation_pixels(&viewer, 0, reopen_side, reopen_side);
+        assert!(
+            pixel_box(reopen_side, &after_delete, |[red, green, blue]| {
+                green > 200 && red < 60 && blue < 60
+            })
+            .is_none(),
+            "borrada de la capa, la imagen ya no se dibuja en ningún lado"
+        );
+        assert!(
+            viewer.has_pending_marks(),
+            "borrarla queda pendiente de guardar"
+        );
+        assert!(viewer.undo(), "deshacer devuelve la imagen que se borró");
+
         // S2: lo que vuelve se puede volver a editar. La nota de texto recupera su
         // acción de editar y el texto del archivo es el punto de partida de
         // deshacer.
@@ -2181,6 +2219,29 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             }
         }
         pixels
+    }
+
+    /// Rasteriza una página con poppler desde el documento del visor, sobre fondo
+    /// blanco, y devuelve el ancho y los píxeles como `[r, g, b]`. Es el raster
+    /// que el lector dibuja: cualquier anotación que poppler pinte aparece aquí.
+    fn page_raster_pixels(viewer: &Viewer, page: usize) -> (usize, Vec<[u8; 3]>) {
+        let document = viewer.doc.document.borrow();
+        let document = document.as_ref().expect("el visor tiene un documento");
+        let poppler_page = document.page(page as i32).expect("la página existe");
+        let (mut surface, _, _) = render_page_surface(&poppler_page, 1.0, false, 0, &[])
+            .expect("la página se rasteriza");
+        let width = usize::try_from(surface.width()).expect("ancho");
+        let height = usize::try_from(surface.height()).expect("alto");
+        let stride = usize::try_from(surface.stride()).expect("stride");
+        let data = surface.data().expect("píxeles");
+        let mut pixels = Vec::with_capacity(width * height);
+        for row in 0..height {
+            for column in 0..width {
+                let offset = row * stride + column * 4;
+                pixels.push([data[offset + 2], data[offset + 1], data[offset]]);
+            }
+        }
+        (width, pixels)
     }
 
     /// Dibuja la capa de anotaciones de una página en una superficie aparte y

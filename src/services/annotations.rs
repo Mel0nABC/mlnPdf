@@ -620,6 +620,10 @@ fn temporary_path(target: &Path) -> PathBuf {
 /// Un PDF protegido devuelve una lista vacía en vez de un error: en ese archivo
 /// no se pueden escribir anotaciones, así que no hay nada que reconstruir y el
 /// visor tiene que poder abrirlo igual.
+///
+/// La apertura usa `open_for_editing`, que además prepara la copia a rasterizar;
+/// esta lectura directa queda para las pruebas y para cualquier otro uso.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn read_annotations(path: &Path) -> Result<Vec<(String, Annotation)>, String> {
     let document = Document::load(path)
         .map_err(|error| format!("no se pudo abrir el PDF para leer sus anotaciones: {error}"))?;
@@ -627,34 +631,82 @@ pub fn read_annotations(path: &Path) -> Result<Vec<(String, Annotation)>, String
     if document.is_encrypted() || document.was_encrypted() {
         return Ok(Vec::new());
     }
+    Ok(owned_annotations(&document))
+}
 
+/// Recorre el documento cargado y reconstruye solo las anotaciones propias, en
+/// orden de página y de aparición, con su `/NM`. Es la parte que comparten la
+/// lectura del archivo y la copia que se rasteriza al abrirlo.
+fn owned_annotations(document: &Document) -> Vec<(String, Annotation)> {
     let mut annotations = Vec::new();
     // `get_pages` viene ordenado por número de página, que es el orden en el que
     // el visor apila las anotaciones.
     for (number, page_id) in document.get_pages() {
         // Una página sin tamaño legible no puede ubicar nada: se saltea entera en
         // vez de romper la lectura del resto del documento.
-        let Ok(page_box) = page_box(&document, page_id) else {
+        let Ok(page_box) = page_box(document, page_id) else {
             continue;
         };
         let page = number.saturating_sub(1) as usize;
-        for object in page_annotations(&document, page_id) {
-            let Some(id) = annotation_name(&document, &object) else {
+        for object in page_annotations(document, page_id) {
+            let Some(id) = annotation_name(document, &object) else {
                 continue;
             };
             if !id.starts_with(ANNOTATION_PREFIX) {
                 continue;
             }
-            let Some(dictionary) = annotation_dictionary(&document, &object) else {
+            let Some(dictionary) = annotation_dictionary(document, &object) else {
                 continue;
             };
-            let Some(annotation) = read_annotation(&document, dictionary, page, page_box) else {
+            let Some(annotation) = read_annotation(document, dictionary, page, page_box) else {
                 continue;
             };
             annotations.push((id, annotation));
         }
     }
-    Ok(annotations)
+    annotations
+}
+
+/// Abre el archivo para editarlo: devuelve las anotaciones propias que trae y,
+/// cuando hay alguna, una copia del documento en memoria sin ellas.
+///
+/// Existe porque poppler pinta las anotaciones que el archivo tiene. Desde que el
+/// visor relee lo guardado, la misma anotación se dibujaría dos veces: una por
+/// poppler (la del archivo) y otra por la capa del visor. Al borrarla
+/// desaparecería de la capa pero la del archivo seguiría en el raster hasta
+/// guardar y recargar.
+///
+/// Por eso la copia que se rasteriza no lleva las nuestras, con su `/NM`; las de
+/// otros programas se quedan y se siguen viendo.
+///
+/// El archivo real no se toca: el guardado sigue escribiendo en la ruta original.
+/// Un PDF cifrado devuelve `(Vec::new(), None)`: ahí no hay nada nuestro y no se
+/// puede escribir, así que poppler lo abre desde el archivo con su contraseña.
+/// Sin anotaciones propias tampoco se copia, para no pagar el costo en memoria.
+pub fn open_for_editing(
+    path: &Path,
+) -> Result<(Vec<(String, Annotation)>, Option<Vec<u8>>), String> {
+    let mut document = Document::load(path)
+        .map_err(|error| format!("no se pudo abrir el PDF para leer sus anotaciones: {error}"))?;
+    // Mismo criterio que la escritura: si el archivo vino cifrado, no se toca y
+    // no hay nada propio que sacar de la copia.
+    if document.is_encrypted() || document.was_encrypted() {
+        return Ok((Vec::new(), None));
+    }
+
+    let annotations = owned_annotations(&document);
+    if annotations.is_empty() {
+        return Ok((Vec::new(), None));
+    }
+
+    let ids: Vec<String> = annotations.iter().map(|(id, _)| id.clone()).collect();
+    drop_annotations(&mut document, &ids);
+
+    let mut bytes = Vec::new();
+    document
+        .save_to(&mut bytes)
+        .map_err(|error| format!("no se pudo preparar el PDF para editarlo: {error}"))?;
+    Ok((annotations, Some(bytes)))
 }
 
 /// Anotaciones colgadas de una página, en el orden en que están en `/Annots`: la
@@ -2510,6 +2562,71 @@ mod tests {
                 .len(),
             3,
             "las ajenas siguen en el archivo"
+        );
+    }
+
+    #[test]
+    fn opening_for_editing_returns_a_copy_without_our_annotations() {
+        let source = scratch("open-source.pdf");
+        let path = scratch("open.pdf");
+        std::fs::write(&source, foreign_square_fixture()).expect("escribir el fixture");
+        let current = vec![owned(
+            "mlnpdf-abrir-propia",
+            Annotation::Mark(TextMark::underline(
+                0,
+                vec![(20.0, 20.0, 60.0, 30.0)],
+                (0.0, 0.0, 0.0),
+            )),
+        )];
+        write_annotations(&source, &path, &current, &[]).expect("escribir el subrayado propio");
+
+        let (read, bytes) = open_for_editing(&path).expect("abrir para editar");
+        assert_eq!(read.len(), 1, "solo vuelve la propia: {read:?}");
+        assert_eq!(read[0].0, "mlnpdf-abrir-propia");
+
+        let bytes = bytes.expect("con anotaciones propias hay una copia para rasterizar");
+        let copy = Document::load_mem(&bytes).expect("la copia es un PDF válido");
+        let page_id = *copy.get_pages().get(&1).expect("página 1");
+        let names: Vec<String> = copy
+            .get_page_annotations(page_id)
+            .expect("anotaciones")
+            .iter()
+            .map(|annotation| {
+                annotation
+                    .get(b"NM")
+                    .ok()
+                    .and_then(|name| name.as_str().ok())
+                    .map(|name| String::from_utf8_lossy(name).into_owned())
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "otro-programa".to_string(),
+                "otro-programa-subrayado".to_string()
+            ],
+            "la copia conserva las ajenas y ya no tiene la propia"
+        );
+
+        // El archivo real no se toca: la copia es solo para rasterizar.
+        assert_eq!(
+            read_annotations(&path).expect("releer el archivo").len(),
+            1,
+            "la anotación propia sigue en el archivo"
+        );
+    }
+
+    #[test]
+    fn opening_for_editing_without_our_annotations_makes_no_copy() {
+        let path = scratch("open-foreign-only.pdf");
+        std::fs::write(&path, foreign_square_fixture()).expect("escribir el fixture");
+
+        let (read, bytes) = open_for_editing(&path).expect("abrir para editar");
+        assert!(read.is_empty(), "no hay anotaciones nuestras: {read:?}");
+        assert!(
+            bytes.is_none(),
+            "sin anotaciones propias no hace falta una copia"
         );
     }
 

@@ -154,6 +154,9 @@ pub(crate) struct MarkToolUi {
 /// The open document and everything derived from it.
 pub(crate) struct DocumentState {
     pub(crate)     document: RefCell<Option<poppler::Document>>,
+    /// Bytes de la copia sin nuestras anotaciones que poppler rasteriza. Tienen
+    /// que vivir tanto como el documento: `from_data` no los copia.
+    pub(crate)     raster_bytes: RefCell<Option<Vec<u8>>>,
     pub(crate)     current_path: RefCell<Option<PathBuf>>,
     pub(crate)     recent: RefCell<Vec<PathBuf>>,
     /// Row geometry of the rendered pages, single or two-page per row.
@@ -588,6 +591,7 @@ impl Viewer {
             },
             doc: DocumentState {
                 document: RefCell::new(None),
+                raster_bytes: RefCell::new(None),
                 current_path: RefCell::new(None),
                 recent: RefCell::new(load_session().recent),
                 layout: RefCell::new(PageLayout::default()),
@@ -1184,12 +1188,30 @@ impl Viewer {
     }
 
     pub(crate) fn open_with_password(&self, path: &Path, password: Option<&str>) -> Result<(), String> {
-        let document = open_document_with_password(path, password)?;
+        // poppler pinta las anotaciones que el archivo tiene. Si además las pinta
+        // la capa del visor, la misma anotación se ve dos veces y al borrarla
+        // sigue en el raster hasta guardar y recargar. Por eso se rasteriza una
+        // copia sin las nuestras; `path` sigue siendo el archivo real para el
+        // guardado, la sesión y la monitorización.
+        let (loaded, raster) = match open_for_editing(path) {
+            Ok(result) => result,
+            // Si lopdf no puede leerlo, poppler tampoco tendría anotaciones
+            // nuestras que quitar: se abre el archivo como hasta ahora.
+            Err(_) => (Vec::new(), None),
+        };
+        let document = match raster.as_deref() {
+            Some(bytes) => poppler::Document::from_data(bytes, password)
+                .map_err(|error| format!("El archivo no es un PDF válido: {error}"))?,
+            None => open_document_with_password(path, password)?,
+        };
         if document.n_pages() == 0 {
             return Err("El documento no tiene páginas.".to_string());
         }
 
+        // El documento viejo se suelta antes que los bytes de su copia: poppler
+        // guarda un puntero a ellos, no una copia.
         *self.doc.document.borrow_mut() = Some(document);
+        *self.doc.raster_bytes.borrow_mut() = raster;
         *self.doc.current_path.borrow_mut() = Some(path.to_path_buf());
         // Las anotaciones pertenecen al documento anterior.
         self.clear_edits();
@@ -1199,8 +1221,7 @@ impl Viewer {
         // reemplaza esas anotaciones en lugar de duplicarlas. Si el archivo no se
         // puede leer se abre sin anotaciones y nada se pierde, porque tampoco hay
         // nada pendiente que guardar.
-        let loaded: Vec<Edit> = read_annotations(path)
-            .unwrap_or_default()
+        let loaded: Vec<Edit> = loaded
             .into_iter()
             .map(|(id, value)| Edit { id, value })
             .collect();
@@ -6082,6 +6103,7 @@ impl Viewer {
 
     fn close_document_now(&self) {
         *self.doc.document.borrow_mut() = None;
+        *self.doc.raster_bytes.borrow_mut() = None;
         *self.doc.current_path.borrow_mut() = None;
         self.doc.slots.borrow_mut().clear();
         clear_pages(&self.ui.pages);
