@@ -7118,9 +7118,18 @@ impl Viewer {
 
     /// Jumps to a page with matches and, when the view is not rotated, scrolls to
     /// the match itself.
+    /// Lleva la vista a la página de un resultado: la página se centra en la
+    /// ventana y su miniatura se centra en el panel, así el resultado queda en el
+    /// medio y no pegado al borde de arriba.
     pub(crate) fn focus_hit(&self, page: usize, direction: i32) {
-        self.goto_page(page);
+        self.goto_page_centered(page);
+        self.center_thumbnail(page);
+        self.center_hit(page, direction);
+    }
 
+    /// Si la página no cabe en la ventana, centrar la página dejaría el resultado
+    /// fuera de la vista, así que en ese caso se centra el resultado.
+    fn center_hit(&self, page: usize, direction: i32) {
         if self.view.rotation.get().rem_euclid(360) != 0 {
             return;
         }
@@ -7128,13 +7137,24 @@ impl Viewer {
         if hits.is_empty() {
             return;
         }
-        let hit = if direction >= 0 { hits[0] } else { hits[hits.len() - 1] };
+        let hit = if direction >= 0 {
+            hits[0]
+        } else {
+            hits[hits.len() - 1]
+        };
 
         let zoom = self.view.zoom.get();
-        let offset = self.doc.layout.borrow().page_offset(page) + hit.1 * zoom - f64::from(PAGE_GAP);
+        let layout = self.doc.layout.borrow();
         let adjustment = self.ui.scroller.vadjustment();
+        if layout.row_height(page) <= adjustment.page_size() {
+            // La página entera se ve: con centrarla alcanza.
+            return;
+        }
+        let offset = layout.page_offset(page) + hit.1 * zoom;
+        drop(layout);
+
         let maximum = (adjustment.upper() - adjustment.page_size()).max(0.0);
-        adjustment.set_value(offset.max(0.0).min(maximum));
+        adjustment.set_value((offset - adjustment.page_size() / 2.0).clamp(0.0, maximum));
     }
 
     /// Desktop notification for long operations.

@@ -1728,6 +1728,56 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
                 "la página elegida queda centrada en la ventana"
             );
         }
+
+        // El resultado de una búsqueda lleva la vista a su página centrada en la
+        // ventana y con la miniatura centrada en el panel.
+        // El resultado de una búsqueda lleva la vista a su página centrada en la
+        // ventana y con la miniatura centrada en el panel. En este punto el
+        // documento abierto tiene una sola página.
+        let hit_page = viewer.page_count() - 1;
+        viewer.focus_hit(hit_page, 1);
+        {
+            let adjustment = viewer.ui.scroller.vadjustment();
+            let layout = viewer.doc.layout.borrow();
+            let middle = layout.page_offset(hit_page) + layout.row_height(hit_page) / 2.0;
+            let maximum = (adjustment.upper() - adjustment.page_size()).max(0.0);
+            let expected = (middle - adjustment.page_size() / 2.0).clamp(0.0, maximum);
+            drop(layout);
+            assert!(
+                (adjustment.value() - expected).abs() < 2.0,
+                "la página del resultado queda centrada: {} != {expected}",
+                adjustment.value()
+            );
+            assert_eq!(
+                viewer.nav.current.get(),
+                hit_page,
+                "la página del resultado pasa a ser la actual"
+            );
+        }
+        {
+            // La miniatura se centra cuando el panel tiene contenido desplazable.
+            // Con una sola página no hay nada que centrar y la función lo dice sin
+            // tocar el panel; el centrado real de la miniatura se ejercita al elegir
+            // una miniatura más arriba en esta misma prueba.
+            let centered = viewer.center_thumbnail(hit_page);
+            let value = viewer.ui.sidebar.vadjustment().value();
+            if centered {
+                assert!(
+                    viewer.center_thumbnail(hit_page),
+                    "centrar la miniatura del resultado es idempotente"
+                );
+                assert!(
+                    (viewer.ui.sidebar.vadjustment().value() - value).abs() < 1.0,
+                    "la miniatura del resultado ya estaba centrada"
+                );
+            } else {
+                assert_eq!(
+                    value, 0.0,
+                    "sin desplazamiento en el panel, la miniatura queda en el tope"
+                );
+            }
+        }
+        viewer.goto_page_centered(0);
         viewer.input.pointer.set(None);
 
         // Una sola herramienta armada: armar un marcado apaga insertar texto, y
