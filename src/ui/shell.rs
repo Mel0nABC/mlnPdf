@@ -6145,11 +6145,12 @@ fn page_under_content(
 /// Cursor que muestra una nota en `(x, y)`, en píxeles lógicos de la capa de la
 /// página: cuatro flechas en su borde y cursor de texto sobre su texto. La banda
 /// es fija en pantalla, así que se divide por el zoom.
-/// Cursor de cuatro flechas. En el tema Adwaita `move` es un alias del cursor
-/// normal (una flecha), así que se pide `fleur`, el nombre clásico que apunta a
-/// `all-resize`; en temas sin él se cae a `all-scroll` y, al final, a `move`.
+/// Cursor de cuatro flechas para mover. En Adwaita `move` es un alias del cursor
+/// normal (una flecha) y `fleur`/`all-resize` es una cruz grande que se lee como
+/// «ampliar»; `all-scroll` es el cursor de mover con las cuatro flechas y el
+/// cuadrado central. Se prefiere ese y se cae a los otros en temas sin él.
 pub(crate) fn move_cursor() -> Option<gdk::Cursor> {
-    ["fleur", "all-scroll", "move"]
+    ["all-scroll", "fleur", "move"]
         .into_iter()
         .find_map(|name| gdk::Cursor::from_name(name, None))
 }
