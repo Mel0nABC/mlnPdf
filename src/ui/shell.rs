@@ -9851,7 +9851,7 @@ fn context_menu_button(label: &str) -> gtk::Button {
 
 /// Icono de la aplicación, incrustado para no depender del directorio de trabajo.
 pub(crate) fn app_icon() -> gdk::Texture {
-    let bytes = glib::Bytes::from_static(include_bytes!("../../mlnpdfIcon.png"));
+    let bytes = glib::Bytes::from_static(include_bytes!("../../packaging/icons/app-icon-256.png"));
     gdk::Texture::from_bytes(&bytes).expect("el icono de la aplicación es un PNG válido")
 }
 

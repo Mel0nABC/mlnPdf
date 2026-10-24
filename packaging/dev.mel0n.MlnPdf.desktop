@@ -15,5 +15,5 @@ Categories=Office;Viewer;
 MimeType=application/pdf;
 Keywords=PDF;pdf;documento;lector;anotaciones;notas;
 StartupNotify=true
-StartupWMClass=mlnpdf
+StartupWMClass=dev.mel0n.MlnPdf
 X-GNOME-UsesNotifications=true

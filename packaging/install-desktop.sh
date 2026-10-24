@@ -17,8 +17,12 @@ bin_dir="$HOME/.local/bin"
 install -Dm755 "$bin" "$bin_dir/mlnpdf"
 install -Dm644 "$root/packaging/dev.mel0n.MlnPdf.desktop" \
     "$data/applications/dev.mel0n.MlnPdf.desktop"
-install -Dm644 "$root/packaging/mlnpdf.png" \
-    "$data/icons/hicolor/512x512/apps/mlnpdf.png"
+# Todas las medidas del tema de iconos: GNOME elige la que necesita en cada sitio
+# (barra, dock, Alt+Tab, listados) en vez de escalar una sola.
+for icon in "$root"/packaging/icons/hicolor/*/apps/mlnpdf.png; do
+    size="$(basename "$(dirname "$(dirname "$icon")")")"
+    install -Dm644 "$icon" "$data/icons/hicolor/$size/apps/mlnpdf.png"
+done
 
 if command -v update-desktop-database >/dev/null 2>&1; then
     update-desktop-database "$data/applications" >/dev/null 2>&1 || true
@@ -30,7 +34,7 @@ fi
 printf 'Instalado:\n  %s\n  %s\n  %s\n' \
     "$bin_dir/mlnpdf" \
     "$data/applications/dev.mel0n.MlnPdf.desktop" \
-    "$data/icons/hicolor/512x512/apps/mlnpdf.png"
+    "$data/icons/hicolor/*/apps/mlnpdf.png"
 
 case ":$PATH:" in
     *":$bin_dir:"*) ;;

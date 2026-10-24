@@ -40,7 +40,9 @@ ficha de cada caja en [crates.io](https://crates.io/).
 
 ## Notas
 
-- El icono `mlnpdfIcon.png` es del proyecto y va con la misma licencia que el
+- El icono del proyecto vive en `packaging/icons/`: el máster `mlnpdfIcon.png`,
+  las medidas del tema en `hicolor/` y la copia embebida `app-icon-256.png`. Va
+  con la misma licencia que el
   código.
 - La lista de bibliotecas del sistema corresponde a las que el proyecto enlaza
   hoy; si se añade una dependencia nueva, hay que ampliar esta tabla.

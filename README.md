@@ -199,11 +199,27 @@ cargo build --release
 ```
 
 Copia el binario a `~/.local/bin/mlnpdf`, el lanzador a
-`~/.local/share/applications/dev.mel0n.MlnPdf.desktop` y el icono de 512 px a
-`~/.local/share/icons/hicolor/512x512/apps/mlnpdf.png`. No necesita root. Con el
-lanzador, MlnPdf aparece en el menú de aplicaciones, en el dock con su icono y en
-«Abrir con» para los PDF. Si el icono no aparece al instante, cierra la sesión o
-ejecuta `gtk-update-icon-cache -f -t ~/.local/share/icons/hicolor`.
+`~/.local/share/applications/dev.mel0n.MlnPdf.desktop` y el icono a
+`~/.local/share/icons/hicolor/` en todas sus medidas (16, 24, 32, 48, 64, 128, 256
+y 512 px). No necesita root. Con el lanzador, MlnPdf aparece en el menú de
+aplicaciones, en el dock con su icono y en «Abrir con» para los PDF.
+
+En Wayland la aplicación no puede imponer su icono: el que muestra el escritorio
+sale del lanzador instalado, emparejado por el identificador `dev.mel0n.MlnPdf`.
+Por eso, si lanzas el binario directamente (`./target/release/mlnpdf`) sin haber
+ejecutado antes el script, verás el icono genérico en la barra del sistema, aunque
+el de la cabecera y el de «Acerca de» sí sean los del proyecto. Si el icono no
+aparece al instante, cierra la sesión o ejecuta
+`gtk-update-icon-cache -f -t ~/.local/share/icons/hicolor`.
+
+Los iconos viven en `packaging/icons/`: el máster `mlnpdfIcon.png`, las medidas del
+tema en `hicolor/<medida>x<medida>/apps/mlnpdf.png` y la copia que se embebe en el
+binario para la cabecera y «Acerca de», `app-icon-256.png`. Para regenerarlos desde
+el máster (necesita ImageMagick):
+
+```bash
+./packaging/make-icons.sh
+```
 
 Convenciones del repositorio:
 
