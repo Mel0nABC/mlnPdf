@@ -2897,19 +2897,7 @@ impl Viewer {
         {
             return;
         }
-        let current = self.note_at(page, x, y).and_then(|id| {
-            let note = self.note(&id)?;
-            let size = self.doc.page_sizes.borrow().get(page).copied()?;
-            let name = note_cursor_at(
-                &note,
-                size,
-                self.view.rotation.get(),
-                self.view.zoom.get(),
-                x,
-                y,
-            );
-            Some((id, name))
-        });
+        let current = self.note_cursor_hit(page, x, y);
         let mut hover = self.annot.hover.borrow_mut();
         if *hover == current {
             return;
@@ -2924,6 +2912,29 @@ impl Viewer {
     pub(crate) fn clear_note_cursor(&self, page: usize, overlay: &gtk::Overlay) {
         self.annot.hover.borrow_mut().take();
         self.apply_note_cursor(page, overlay, None);
+    }
+
+    /// Nota bajo el puntero o dentro de su banda de borde, con el cursor que le
+    /// corresponde. La banda se extiende hacia afuera del rectángulo para que el
+    /// trazo del contorno, que queda a caballo del borde, también cuente como
+    /// zona de mover.
+    fn note_cursor_hit(&self, page: usize, x: f64, y: f64) -> Option<(String, &'static str)> {
+        let zoom = self.view.zoom.get();
+        if zoom <= 0.0 {
+            return None;
+        }
+        let size = self.doc.page_sizes.borrow().get(page).copied()?;
+        let rotation = self.view.rotation.get();
+        let point = (x / zoom, y / zoom);
+        let band = NOTE_CURSOR_BORDER / zoom;
+        let edits = self.annot.edits.borrow();
+        edits.iter().rev().find_map(|edit| match &edit.value {
+            Annotation::Note(note) if note.page == page => {
+                let rect = note_view_rect(note, size, rotation);
+                cursor_in_note_band(rect, point, band).map(|cursor| (edit.id.clone(), cursor))
+            }
+            _ => None,
+        })
     }
 
     /// Pone el cursor en todas las capas de la página. El lienzo de la selección
@@ -6118,33 +6129,41 @@ fn page_under_content(
 /// Cursor que muestra una nota en `(x, y)`, en píxeles lógicos de la capa de la
 /// página: cuatro flechas en su borde y cursor de texto sobre su texto. La banda
 /// es fija en pantalla, así que se divide por el zoom.
-fn note_cursor_at(
-    note: &TextNote,
-    page: (f64, f64),
-    rotation: i32,
-    zoom: f64,
-    x: f64,
-    y: f64,
-) -> &'static str {
-    if zoom <= 0.0 {
-        return "text";
-    }
+/// Rectángulo de la nota en la vista orientada, en puntos con zoom 1.
+fn note_view_rect(note: &TextNote, page: (f64, f64), rotation: i32) -> (f64, f64, f64, f64) {
     let (x1, y1) = forward_rotation(note.at, page, rotation);
     let (x2, y2) = forward_rotation(
         (note.at.0 + note.width, note.at.1 + note.height),
         page,
         rotation,
     );
-    let (left, right) = (x1.min(x2), x1.max(x2));
-    let (top, bottom) = (y1.min(y2), y1.max(y2));
-    let point = (x / zoom, y / zoom);
-    let band = NOTE_CURSOR_BORDER / zoom;
-    let distance_x = (point.0 - left).max(0.0).min((right - point.0).max(0.0));
-    let distance_y = (point.1 - top).max(0.0).min((bottom - point.1).max(0.0));
-    if distance_x <= band || distance_y <= band {
-        "move"
+    (x1.min(x2), y1.min(y2), x1.max(x2), y1.max(y2))
+}
+
+/// `Some("move")` when `point` falls in the border band of `rect` (inside or up
+/// to one band outside), `Some("text")` when it falls in the inner text area, and
+/// `None` when it is outside the band altogether.
+fn cursor_in_note_band(
+    rect: (f64, f64, f64, f64),
+    point: (f64, f64),
+    band: f64,
+) -> Option<&'static str> {
+    let (left, top, right, bottom) = rect;
+    if point.0 < left - band
+        || point.0 > right + band
+        || point.1 < top - band
+        || point.1 > bottom + band
+    {
+        return None;
+    }
+    if point.0 <= left + band
+        || point.0 >= right - band
+        || point.1 <= top + band
+        || point.1 >= bottom - band
+    {
+        Some("move")
     } else {
-        "text"
+        Some("text")
     }
 }
 
@@ -6531,16 +6550,19 @@ mod tests {
             20.0,
             vec![run("Nota", 12.0, NOTE_COLOR)],
         );
-        let page = (200.0, 200.0);
+        let rect = note_view_rect(&note, (200.0, 200.0), 0);
 
-        assert_eq!(note_cursor_at(&note, page, 0, 1.0, 60.0, 20.0), "text");
-        assert_eq!(note_cursor_at(&note, page, 0, 1.0, 12.0, 20.0), "move");
-        assert_eq!(note_cursor_at(&note, page, 0, 1.0, 60.0, 29.0), "move");
+        assert_eq!(cursor_in_note_band(rect, (60.0, 20.0), 5.0), Some("text"));
+        assert_eq!(cursor_in_note_band(rect, (12.0, 20.0), 5.0), Some("move"));
+        assert_eq!(cursor_in_note_band(rect, (60.0, 29.0), 5.0), Some("move"));
+        // La banda también vale 2 px afuera del rectángulo, donde cae el trazo.
+        assert_eq!(cursor_in_note_band(rect, (8.0, 20.0), 5.0), Some("move"));
+        assert_eq!(cursor_in_note_band(rect, (4.0, 20.0), 5.0), None);
 
         // A 200 % la banda sigue midiendo 5 px: en puntos de la vista son 2.5.
-        assert_eq!(note_cursor_at(&note, page, 0, 2.0, 120.0, 40.0), "text");
-        assert_eq!(note_cursor_at(&note, page, 0, 2.0, 24.0, 40.0), "move");
-        assert_eq!(note_cursor_at(&note, page, 0, 2.0, 32.0, 40.0), "text");
+        assert_eq!(cursor_in_note_band(rect, (60.0, 20.0), 2.5), Some("text"));
+        assert_eq!(cursor_in_note_band(rect, (12.0, 20.0), 2.5), Some("move"));
+        assert_eq!(cursor_in_note_band(rect, (16.0, 20.0), 2.5), Some("text"));
     }
 
     #[test]
@@ -6553,8 +6575,9 @@ mod tests {
             vec![run("Nota", 12.0, NOTE_COLOR)],
         );
         // Con /Rotate 90 la caja va de (70,10) a (90,110) en la vista.
-        assert_eq!(note_cursor_at(&note, (200.0, 100.0), 90, 1.0, 80.0, 60.0), "text");
-        assert_eq!(note_cursor_at(&note, (200.0, 100.0), 90, 1.0, 71.0, 60.0), "move");
+        let rect = note_view_rect(&note, (200.0, 100.0), 90);
+        assert_eq!(cursor_in_note_band(rect, (80.0, 60.0), 5.0), Some("text"));
+        assert_eq!(cursor_in_note_band(rect, (71.0, 60.0), 5.0), Some("move"));
     }
 
     #[test]

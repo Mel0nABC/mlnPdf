@@ -1060,6 +1060,17 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         );
         viewer.update_note_cursor(
             0,
+            current_note.at.0 - 2.0,
+            current_note.at.1 + current_note.height / 2.0,
+            &overlay,
+        );
+        assert_eq!(
+            viewer.annot.hover.borrow().clone(),
+            Some((note_id.clone(), "move")),
+            "la banda exterior del borde también muestra el cursor de mover"
+        );
+        viewer.update_note_cursor(
+            0,
             current_note.at.0 + current_note.width / 2.0,
             current_note.at.1 + current_note.height / 2.0,
             &overlay,
