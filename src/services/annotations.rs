@@ -7,9 +7,15 @@ use std::path::{Path, PathBuf};
 use lopdf::{Dictionary, Document, Object, ObjectId, Stream};
 
 use crate::engine::annotation::{
-    Annotation, FontChoice, ImageAppearance, ImageNote, ImagePixels, MarkKind, PageBox, TextNote,
-    bounds_rect, image_appearance, mark_quads, note_rect,
+    Annotation, FontChoice, ImageAppearance, ImageNote, ImagePixels, MarkKind, NOTE_COLOR, PageBox,
+    Rect, TextMark, TextNote, TextRun, bounds_rect, image_appearance, mark_quads, note_rect, parse_da,
+    quads_to_rects, user_rect_to_display,
 };
+
+/// Prefijo de `/NM` que distingue una anotación propia de la de otro programa.
+/// La lectura solo reconstruye las propias y la escritura solo reemplaza las que
+/// el visor conoce; las demás se siguen viendo porque las pinta el lector.
+const ANNOTATION_PREFIX: &str = "mlnpdf-";
 
 /// Escribe en el PDF las anotaciones propias y lo guarda en `target`; devuelve
 /// cuántas anotaciones propias quedaron escritas (las que se quitaron y las que
@@ -303,12 +309,7 @@ fn note_dictionary(note: &TextNote, page: PageBox, id: &str) -> Object {
     dictionary.set("Contents", contents(&note.text()));
     // Una nota `/FreeText` solo tiene un `/DA`, así que el primer tramo decide
     // la fuente y el color con los que el lector pinta todo el texto.
-    let fallback = FontChoice {
-        family: "Sans".to_string(),
-        size: 12.0,
-        bold: false,
-        italic: false,
-    };
+    let fallback = default_note_font();
     dictionary.set(
         "DA",
         Object::String(
@@ -601,10 +602,318 @@ fn temporary_path(target: &Path) -> PathBuf {
     target.with_file_name(format!(".{name}.mlnpdf-tmp"))
 }
 
+/// Lee del archivo las anotaciones propias y las devuelve como anotaciones en
+/// memoria, en orden de página y de aparición, con su `/NM`.
+///
+/// Se reconstruyen los cuatro tipos que escribe el visor —subrayado, resaltado,
+/// nota de texto e imagen— y solo esos: una anotación sin `/NM` o con un `/NM`
+/// ajeno es de otro programa, así que no entra en la lista y nunca se reescribe.
+///
+/// Un PDF protegido devuelve una lista vacía en vez de un error: en ese archivo
+/// no se pueden escribir anotaciones, así que no hay nada que reconstruir y el
+/// visor tiene que poder abrirlo igual.
+pub fn read_annotations(path: &Path) -> Result<Vec<(String, Annotation)>, String> {
+    let document = Document::load(path)
+        .map_err(|error| format!("no se pudo abrir el PDF para leer sus anotaciones: {error}"))?;
+    // Mismo criterio que la escritura: si el archivo vino cifrado, no se toca.
+    if document.is_encrypted() || document.was_encrypted() {
+        return Ok(Vec::new());
+    }
+
+    let mut annotations = Vec::new();
+    // `get_pages` viene ordenado por número de página, que es el orden en el que
+    // el visor apila las anotaciones.
+    for (number, page_id) in document.get_pages() {
+        // Una página sin tamaño legible no puede ubicar nada: se saltea entera en
+        // vez de romper la lectura del resto del documento.
+        let Ok(page_box) = page_box(&document, page_id) else {
+            continue;
+        };
+        let page = number.saturating_sub(1) as usize;
+        for object in page_annotations(&document, page_id) {
+            let Some(id) = annotation_name(&document, &object) else {
+                continue;
+            };
+            if !id.starts_with(ANNOTATION_PREFIX) {
+                continue;
+            }
+            let Some(dictionary) = annotation_dictionary(&document, &object) else {
+                continue;
+            };
+            let Some(annotation) = read_annotation(&document, dictionary, page, page_box) else {
+                continue;
+            };
+            annotations.push((id, annotation));
+        }
+    }
+    Ok(annotations)
+}
+
+/// Anotaciones colgadas de una página, en el orden en que están en `/Annots`: la
+/// lista puede estar escrita en la página o ser una referencia a un array
+/// aparte, igual que al quitarlas.
+fn page_annotations(document: &Document, page_id: ObjectId) -> Vec<Object> {
+    let Ok(page) = document.get_dictionary(page_id) else {
+        return Vec::new();
+    };
+    match page.get(b"Annots") {
+        Ok(Object::Array(items)) => items.clone(),
+        Ok(Object::Reference(id)) => match document.get_object(*id) {
+            Ok(Object::Array(items)) => items.clone(),
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
+
+/// Diccionario de la anotación, sea uno escrito en la lista o una referencia a
+/// otro objeto.
+fn annotation_dictionary<'a>(document: &'a Document, object: &'a Object) -> Option<&'a Dictionary> {
+    resolve(document, object)?.as_dict().ok()
+}
+
+/// Reconstruye una anotación propia desde su diccionario. `None` cuando el tipo
+/// no es de los que el visor reconstruye o cuando le falta un dato sin el cual no
+/// se podría volver a editar.
+fn read_annotation(
+    document: &Document,
+    dictionary: &Dictionary,
+    page: usize,
+    page_box: PageBox,
+) -> Option<Annotation> {
+    let subtype = resolve(document, dictionary.get(b"Subtype").ok()?)?
+        .as_name()
+        .ok()?;
+    match subtype {
+        b"Underline" => read_mark(document, dictionary, page, page_box, MarkKind::Underline),
+        b"Highlight" => read_mark(document, dictionary, page, page_box, MarkKind::Highlight),
+        b"FreeText" => read_note(document, dictionary, page, page_box),
+        b"Stamp" => read_image(document, dictionary, page, page_box),
+        _ => None,
+    }
+}
+
+/// Marcado leído de `/QuadPoints` y `/C`: cada línea vuelve a su rectángulo en el
+/// espacio de la página.
+fn read_mark(
+    document: &Document,
+    dictionary: &Dictionary,
+    page: usize,
+    page_box: PageBox,
+    kind: MarkKind,
+) -> Option<Annotation> {
+    let points = numbers_of(document, dictionary, b"QuadPoints")?;
+    if points.is_empty() || !points.len().is_multiple_of(8) {
+        return None;
+    }
+    let quads: Vec<[f64; 8]> = points
+        .chunks_exact(8)
+        .map(|quad| {
+            let mut corners = [0.0; 8];
+            corners.copy_from_slice(quad);
+            corners
+        })
+        .collect();
+    let rects = quads_to_rects(&quads, page_box);
+    let [red, green, blue] = color_of(document, dictionary);
+    Some(Annotation::Mark(TextMark::new(
+        page,
+        rects,
+        (red, green, blue),
+        kind,
+    )))
+}
+
+/// Nota de texto leída de su `/Rect`, su `/Contents` y su `/DA`. Una nota lleva un
+/// solo `/DA`, así que vuelve como un único tramo con la fuente y el color que el
+/// archivo guarda para todo el texto: es el límite del formato.
+fn read_note(
+    document: &Document,
+    dictionary: &Dictionary,
+    page: usize,
+    page_box: PageBox,
+) -> Option<Annotation> {
+    let rect = user_rect_to_display(rect_of(document, dictionary, b"Rect")?, page_box);
+    let (font, color) = note_style(document, dictionary);
+    Some(Annotation::Note(TextNote::new(
+        page,
+        (rect.0, rect.1),
+        rect.2 - rect.0,
+        rect.3 - rect.1,
+        vec![TextRun {
+            text: contents_text(dictionary).unwrap_or_default(),
+            font,
+            color,
+        }],
+    )))
+}
+
+/// Imagen leída de su `/Rect` y de la apariencia `/AP /N`, que es el form XObject
+/// con el que el lector dibuja el sello.
+fn read_image(
+    document: &Document,
+    dictionary: &Dictionary,
+    page: usize,
+    page_box: PageBox,
+) -> Option<Annotation> {
+    let rect = user_rect_to_display(rect_of(document, dictionary, b"Rect")?, page_box);
+    let pixels = appearance_pixels(document, dictionary)?;
+    Some(Annotation::Image(ImageNote::new(
+        page,
+        (rect.0, rect.1),
+        rect.2 - rect.0,
+        rect.3 - rect.1,
+        pixels,
+    )))
+}
+
+/// Píxeles de la apariencia `/AP /N` de un sello: el form XObject dibuja el
+/// XObject de imagen `/Im0` en `DeviceRGB`, con el alfa aparte en un `/SMask` en
+/// escala de grises (un byte por píxel).
+///
+/// `None` cuando falta la apariencia, la imagen o el tamaño: una anotación a
+/// medias se saltea sin romper la lectura del resto.
+fn appearance_pixels(document: &Document, dictionary: &Dictionary) -> Option<ImagePixels> {
+    let appearance = resolve(document, dictionary.get(b"AP").ok()?)?;
+    let normal = resolve(document, appearance.as_dict().ok()?.get(b"N").ok()?)?;
+    let form = normal.as_stream().ok()?;
+    let resources = resolve(document, form.dict.get(b"Resources").ok()?)?;
+    let xobjects = resolve(document, resources.as_dict().ok()?.get(b"XObject").ok()?)?;
+    let image = resolve(document, xobjects.as_dict().ok()?.get(b"Im0").ok()?)?.as_stream().ok()?;
+
+    let width = u32::try_from(image.dict.get(b"Width").ok()?.as_i64().ok()?).ok()?;
+    let height = u32::try_from(image.dict.get(b"Height").ok()?.as_i64().ok()?).ok()?;
+    let count = width as usize * height as usize;
+
+    // Los píxeles van sin comprimir y en el orden del PDF, que es el mismo con el
+    // que los escribió `image_stream`.
+    let color = image.decompressed_content().ok()?;
+    if color.len() < count * 3 {
+        return None;
+    }
+    let mask = image
+        .dict
+        .get(b"SMask")
+        .ok()
+        .and_then(|value| resolve(document, value))
+        .and_then(|value| value.as_stream().ok())
+        .and_then(|stream| stream.decompressed_content().ok());
+    if let Some(mask) = &mask
+        && mask.len() < count
+    {
+        return None;
+    }
+
+    let mut data = Vec::with_capacity(count * 4);
+    for index in 0..count {
+        let red = color[index * 3];
+        let green = color[index * 3 + 1];
+        let blue = color[index * 3 + 2];
+        // Sin `/SMask` la imagen es opaca; con máscara, el alfa es su byte.
+        let alpha = mask.as_ref().map_or(255, |mask| mask[index]);
+        data.extend_from_slice(&[
+            premultiply(blue, alpha),
+            premultiply(green, alpha),
+            premultiply(red, alpha),
+            alpha,
+        ]);
+    }
+    ImagePixels::new(width, height, data)
+}
+
+/// Componente con el alfa ya multiplicado, como lo guarda cairo en una superficie
+/// `ARGB32`: es el orden en el que el motor guarda los píxeles.
+fn premultiply(component: u8, alpha: u8) -> u8 {
+    let scaled = (u32::from(component) * u32::from(alpha) + 127) / 255;
+    scaled.min(255) as u8
+}
+
+/// Números de una lista del diccionario, resolviendo la referencia si la lista
+/// está en otro objeto.
+fn numbers_of(document: &Document, dictionary: &Dictionary, key: &[u8]) -> Option<Vec<f64>> {
+    let values = resolve(document, dictionary.get(key).ok()?)?
+        .as_array()
+        .ok()?;
+    values
+        .iter()
+        .map(|value| value.as_float().ok().map(f64::from))
+        .collect()
+}
+
+/// `/Rect` de la anotación en espacio de usuario, sin ordenar: quien la convierte
+/// a la página toma el mínimo y el máximo de sus esquinas.
+fn rect_of(document: &Document, dictionary: &Dictionary, key: &[u8]) -> Option<Rect> {
+    let numbers = numbers_of(document, dictionary, key)?;
+    if numbers.len() != 4 {
+        return None;
+    }
+    Some((numbers[0], numbers[1], numbers[2], numbers[3]))
+}
+
+/// Color `/C` de una anotación, en `0..=1`. Sin color, o con un número de
+/// componentes que no sea tres, queda el negro con el que empieza toda nota.
+fn color_of(document: &Document, dictionary: &Dictionary) -> [f64; 3] {
+    match numbers_of(document, dictionary, b"C") {
+        Some(components) if components.len() == 3 => [
+            components[0].clamp(0.0, 1.0),
+            components[1].clamp(0.0, 1.0),
+            components[2].clamp(0.0, 1.0),
+        ],
+        _ => NOTE_COLOR,
+    }
+}
+
+/// Fuente y color de una nota: los que están en su `/DA` y, si falta o no se
+/// reconoce, los mismos valores por omisión con los que `note_dictionary` escribe
+/// una nota sin fuente propia.
+fn note_style(document: &Document, dictionary: &Dictionary) -> (FontChoice, [f64; 3]) {
+    let parsed = dictionary
+        .get(b"DA")
+        .ok()
+        .and_then(|value| resolve(document, value))
+        .and_then(|value| value.as_str().ok())
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .and_then(parse_da);
+    parsed.unwrap_or_else(|| (default_note_font(), NOTE_COLOR))
+}
+
+/// Fuente con la que se escribe —y con la que se relee— una nota que no eligió
+/// ninguna: la misma que usa `note_dictionary` cuando la nota no tiene tramos.
+fn default_note_font() -> FontChoice {
+    FontChoice {
+        family: "Sans".to_string(),
+        size: 12.0,
+        bold: false,
+        italic: false,
+    }
+}
+
+/// Texto de `/Contents`, sea literal ASCII o hexadecimal UTF-16BE con BOM, que es
+/// como lo escribe `contents`. `None` cuando la anotación no tiene texto.
+fn contents_text(dictionary: &Dictionary) -> Option<String> {
+    match dictionary.get(b"Contents").ok()? {
+        Object::String(bytes, lopdf::StringFormat::Hexadecimal) => {
+            if bytes.starts_with(&[0xFE, 0xFF]) {
+                let units: Vec<u16> = bytes[2..]
+                    .chunks_exact(2)
+                    .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+                    .collect();
+                Some(String::from_utf16_lossy(&units))
+            } else {
+                Some(String::from_utf8_lossy(bytes).into_owned())
+            }
+        }
+        Object::String(bytes, lopdf::StringFormat::Literal) => {
+            Some(String::from_utf8_lossy(bytes).into_owned())
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::annotation::{TextMark, TextRun};
+    use crate::engine::annotation::BaseFont;
     use lopdf::{Stream, dictionary};
 
     /// Directorio de trabajo de las pruebas, dentro del proyecto.
@@ -701,22 +1010,15 @@ mod tests {
         write_annotations(source, target, &current, &[])
     }
 
-    /// Texto de `/Contents`, sea literal ASCII o hexadecimal UTF-16BE.
+    /// Texto de `/Contents`, leído con el mismo decodificador que usa la lectura
+    /// del archivo: literal ASCII o hexadecimal UTF-16BE con BOM.
     fn contents_text(annotation: &Dictionary) -> String {
-        match annotation.get(b"Contents").expect("la nota lleva su texto") {
-            Object::String(bytes, lopdf::StringFormat::Hexadecimal) => {
-                assert_eq!(&bytes[..2], &[0xFE, 0xFF], "el hexadecimal lleva BOM");
-                let units: Vec<u16> = bytes[2..]
-                    .chunks_exact(2)
-                    .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
-                    .collect();
-                String::from_utf16(&units).expect("UTF-16BE válido")
-            }
-            Object::String(bytes, lopdf::StringFormat::Literal) => {
-                String::from_utf8(bytes.clone()).expect("un literal ASCII es UTF-8 válido")
-            }
-            other => panic!("Contents no es una cadena: {other:?}"),
+        if let Some(Object::String(bytes, lopdf::StringFormat::Hexadecimal)) =
+            annotation.get(b"Contents").ok()
+        {
+            assert!(bytes.starts_with(&[0xFE, 0xFF]), "el hexadecimal lleva BOM");
         }
+        super::contents_text(annotation).expect("la nota lleva su texto")
     }
 
     /// Números de `/QuadPoints` o de cualquier lista del diccionario.
@@ -1123,7 +1425,8 @@ mod tests {
 
         let mut data = Vec::new();
         for _ in 0..4 {
-            data.extend_from_slice(&[0, 0, 255, 128]);
+            // BGRA premultiplicado: rojo puro al 50 %, que es (128, 0, 0, 128).
+            data.extend_from_slice(&[0, 0, 128, 128]);
         }
         let pixels = ImagePixels::new(2, 2, data).expect("píxeles con alfa");
         let image = ImageNote::new(0, (10.0, 10.0), 20.0, 20.0, pixels);
@@ -1761,6 +2064,347 @@ mod tests {
             names,
             vec!["mlnpdf-prueba-4".to_string(), "mlnpdf-prueba-5".to_string()],
             "cada anotación propia lleva su /NM"
+        );
+    }
+
+    /// Compara un rectángulo leído con el que se pidió guardar: el archivo guarda
+    /// reales de 32 bits, así que la diferencia se mide en centésimas de punto.
+    fn assert_same_rect(got: Rect, want: Rect) {
+        for (got, want) in [
+            (got.0, want.0),
+            (got.1, want.1),
+            (got.2, want.2),
+            (got.3, want.3),
+        ] {
+            assert!(
+                (got - want).abs() <= 0.01,
+                "el rectángulo leído {got:?} no es el guardado {want:?}"
+            );
+        }
+    }
+
+    /// Escribe `annotations` en un archivo nuevo y las vuelve a leer del archivo,
+    /// que es lo que hace el visor al reabrir el PDF. Devuelve la ruta del archivo
+    /// escrito y lo leído.
+    fn round_trip(
+        name: &str,
+        page: Vec<u8>,
+        annotations: &[(String, Annotation)],
+    ) -> (PathBuf, Vec<(String, Annotation)>) {
+        let source = scratch(&format!("{name}.pdf"));
+        let target = scratch(&format!("{name}-out.pdf"));
+        std::fs::write(&source, page).expect("escribir el PDF");
+        write_annotations(&source, &target, annotations, &[]).expect("escribir las anotaciones");
+        let read = read_annotations(&target).expect("releer las anotaciones del archivo");
+        (target, read)
+    }
+
+    /// El marcado de una anotación leída, con el resto del modelo intacto.
+    fn read_mark_of(entry: &(String, Annotation)) -> TextMark {
+        match &entry.1 {
+            Annotation::Mark(mark) => mark.clone(),
+            other => panic!("se esperaba un marcado y se leyó {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_underline_and_a_highlight_come_back_with_their_page_rects_and_color() {
+        let rects = vec![(20.0, 20.0, 120.0, 40.0), (20.0, 60.0, 80.0, 75.0)];
+        let current = vec![
+            owned(
+                "mlnpdf-ida-subrayado",
+                Annotation::Mark(TextMark::underline(0, rects.clone(), (1.0, 0.25, 0.0))),
+            ),
+            owned(
+                "mlnpdf-ida-resaltado",
+                Annotation::Mark(TextMark::highlight(0, rects.clone(), (0.0, 0.5, 1.0))),
+            ),
+        ];
+
+        let (_, read) = round_trip("rt-marks", fixture([0.0, 0.0, 200.0, 100.0], 0), &current);
+        assert_eq!(read.len(), 2, "vuelven las dos anotaciones: {read:?}");
+        assert_eq!(read[0].0, "mlnpdf-ida-subrayado");
+        assert_eq!(read[1].0, "mlnpdf-ida-resaltado");
+
+        let underline = read_mark_of(&read[0]);
+        assert_eq!(underline.page, 0, "misma página");
+        assert_eq!(underline.kind, MarkKind::Underline, "mismo tipo");
+        assert_eq!(underline.color, [1.0, 0.25, 0.0], "mismo color");
+        assert_eq!(underline.rects.len(), rects.len(), "una línea por rectángulo");
+        for (got, want) in underline.rects.iter().zip(&rects) {
+            assert_same_rect(*got, *want);
+        }
+
+        let highlight = read_mark_of(&read[1]);
+        assert_eq!(highlight.page, 0);
+        assert_eq!(highlight.kind, MarkKind::Highlight);
+        assert_eq!(highlight.color, [0.0, 0.5, 1.0]);
+        for (got, want) in highlight.rects.iter().zip(&rects) {
+            assert_same_rect(*got, *want);
+        }
+    }
+
+    #[test]
+    fn an_underline_on_a_rotated_page_comes_back_on_the_same_lines() {
+        // La prueba que caza una inversa mal hecha: con `/Rotate` 90 el archivo
+        // guarda los quads con los ejes intercambiados y la lectura tiene que
+        // deshacer exactamente la misma cuenta que hizo la escritura.
+        let rects = vec![(20.0, 20.0, 60.0, 40.0), (80.0, 50.0, 130.0, 60.0)];
+        let current = vec![owned(
+            "mlnpdf-ida-girado",
+            Annotation::Mark(TextMark::underline(0, rects.clone(), (0.0, 0.0, 1.0))),
+        )];
+
+        let (_, read) = round_trip("rt-rotated", fixture([0.0, 0.0, 200.0, 100.0], 90), &current);
+        assert_eq!(read.len(), 1, "vuelve el subrayado: {read:?}");
+        let mark = read_mark_of(&read[0]);
+        assert_eq!(mark.kind, MarkKind::Underline);
+        assert_eq!(mark.rects.len(), rects.len());
+        for (got, want) in mark.rects.iter().zip(&rects) {
+            assert_same_rect(*got, *want);
+        }
+    }
+
+    #[test]
+    fn a_note_comes_back_with_its_text_font_size_and_colour() {
+        // Texto con acentos para que viaje como hexadecimal UTF-16BE y el ancho y
+        // el alto de la nota para comprobar que la caja sale del `/Rect`.
+        let note = TextNote::new(
+            0,
+            (20.0, 10.0),
+            60.0,
+            15.0,
+            vec![TextRun {
+                text: "Nota con acentos: ñandú (y) paréntesis".to_string(),
+                font: FontChoice {
+                    family: "Noto Sans Mono".to_string(),
+                    size: 12.5,
+                    bold: true,
+                    italic: false,
+                },
+                color: [1.0, 0.0, 0.5],
+            }],
+        );
+        let current = vec![owned("mlnpdf-ida-nota", Annotation::Note(note.clone()))];
+
+        let (path, read) = round_trip("rt-note", fixture([0.0, 0.0, 200.0, 100.0], 0), &current);
+        assert_eq!(read.len(), 1, "vuelve la nota: {read:?}");
+        let Annotation::Note(back) = &read[0].1 else {
+            panic!("se esperaba una nota y se leyó {:?}", read[0].1);
+        };
+        assert_eq!(back.page, 0);
+        assert_eq!(back.text(), note.text(), "el texto viaja entero");
+        assert!((back.at.0 - 20.0).abs() <= 0.01 && (back.at.1 - 10.0).abs() <= 0.01);
+
+        let font = back.font().expect("la nota vuelve con su fuente");
+        assert_eq!(
+            font.base_font(),
+            note.font().expect("fuente de la nota").base_font(),
+            "la familia vuelve a caer en la misma fuente base"
+        );
+        assert_eq!(font.base_font(), BaseFont::Courier, "Noto Sans Mono es Courier");
+        assert!((font.size - 12.5).abs() <= 1e-9, "mismo tamaño");
+        assert_eq!((font.bold, font.italic), (true, false), "mismo estilo");
+        assert_eq!(back.color(), [1.0, 0.0, 0.5], "mismo color");
+
+        // El ancho y el alto de la nota son los lados de su `/Rect` en el archivo.
+        let document = Document::load(&path).expect("cargar el resultado");
+        let page_id = *document.get_pages().get(&1).expect("página 1");
+        let annotation = document
+            .get_page_annotations(page_id)
+            .expect("anotaciones")[0]
+            .clone();
+        let rect = numbers(&annotation, b"Rect");
+        assert!(
+            (rect[2] - rect[0] - back.width).abs() <= 0.01
+                && (rect[3] - rect[1] - back.height).abs() <= 0.01,
+            "la nota mide {:?}x{:?} y su /Rect mide {}x{}",
+            back.width,
+            back.height,
+            rect[2] - rect[0],
+            rect[3] - rect[1]
+        );
+    }
+
+    #[test]
+    fn an_opaque_image_comes_back_with_its_pixels_and_its_box() {
+        let image = ImageNote::new(0, (40.0, 50.0), 80.0, 40.0, red_pixels(8, 4));
+        let current = vec![owned(
+            "mlnpdf-ida-imagen",
+            Annotation::Image(image.clone()),
+        )];
+
+        let (_, read) = round_trip(
+            "rt-image",
+            fixture([0.0, 0.0, 300.0, 200.0], 0),
+            &current,
+        );
+        assert_eq!(read.len(), 1, "vuelve la imagen: {read:?}");
+        let Annotation::Image(back) = &read[0].1 else {
+            panic!("se esperaba una imagen y se leyó {:?}", read[0].1);
+        };
+        assert_eq!(back.page, 0);
+        assert_eq!(
+            (back.pixels.width, back.pixels.height),
+            (8, 4),
+            "el tamaño en píxeles no cambia"
+        );
+        assert!((back.at.0 - 40.0).abs() <= 0.01 && (back.at.1 - 50.0).abs() <= 0.01);
+        assert!(
+            (back.width - 80.0).abs() <= 0.01 && (back.height - 40.0).abs() <= 0.01,
+            "la caja vuelve como se guardó"
+        );
+        assert!(!back.pixels.has_transparency(), "una foto opaca no lleva alfa");
+        for pixel in back.pixels.data.chunks_exact(4) {
+            assert_eq!(pixel, [0, 0, 255, 255], "el rojo opaco sigue siendo rojo");
+        }
+        assert_eq!(back.pixels, image.pixels, "los píxeles vuelven iguales");
+    }
+
+    #[test]
+    fn a_translucent_image_keeps_its_alpha() {
+        // El alfa viaja en el `/SMask`; al leerlo se vuelve a premultiplicar, así
+        // que la transparencia tiene que sobrevivir y el color no teñirse.
+        let mut data = Vec::new();
+        for _ in 0..4 {
+            // BGRA premultiplicado: rojo puro al 50 %, que es (128, 0, 0, 128).
+            data.extend_from_slice(&[0, 0, 128, 128]);
+        }
+        let pixels = ImagePixels::new(2, 2, data).expect("píxeles con alfa");
+        let image = ImageNote::new(0, (10.0, 10.0), 20.0, 20.0, pixels);
+        let current = vec![owned(
+            "mlnpdf-ida-transparente",
+            Annotation::Image(image.clone()),
+        )];
+
+        let (_, read) = round_trip(
+            "rt-alpha",
+            fixture([0.0, 0.0, 300.0, 200.0], 0),
+            &current,
+        );
+        assert_eq!(read.len(), 1, "vuelve la imagen: {read:?}");
+        let Annotation::Image(back) = &read[0].1 else {
+            panic!("se esperaba una imagen y se leyó {:?}", read[0].1);
+        };
+        assert!(back.pixels.has_transparency(), "la transparencia sobrevive");
+        assert_eq!(back.pixels.alpha(), vec![128; 4], "el alfa vuelve entero");
+        assert_eq!(
+            back.pixels.rgb(),
+            vec![255, 0, 0, 255, 0, 0, 255, 0, 0, 255, 0, 0],
+            "el color no se tiñe al premultiplicar"
+        );
+        assert_eq!(back.pixels, image.pixels, "los píxeles vuelven iguales");
+    }
+
+    /// PDF con dos anotaciones de otro programa: un `/Square` con `/NM` ajeno y,
+    /// además, un `/Underline` ajeno. El segundo tiene el mismo tipo que los
+    /// nuestros, así que solo el prefijo de su `/NM` lo deja fuera de la lista.
+    fn foreign_square_fixture() -> Vec<u8> {
+        let mut document = Document::load_mem(&fixture([0.0, 0.0, 200.0, 100.0], 0))
+            .expect("cargar el fixture");
+        let page_id = *document.get_pages().get(&1).expect("página 1");
+        let square = Object::Dictionary(dictionary! {
+            "Type" => "Annot",
+            "Subtype" => "Square",
+            "NM" => Object::string_literal("otro-programa"),
+            "Rect" => Object::Array(vec![10.into(), 10.into(), 60.into(), 20.into()]),
+        });
+        let underline = Object::Dictionary(dictionary! {
+            "Type" => "Annot",
+            "Subtype" => "Underline",
+            "NM" => Object::string_literal("otro-programa-subrayado"),
+            "Rect" => Object::Array(vec![10.into(), 10.into(), 60.into(), 20.into()]),
+            "QuadPoints" => Object::Array(vec![
+                10.into(), 90.into(), 60.into(), 90.into(),
+                10.into(), 80.into(), 60.into(), 80.into(),
+            ]),
+            "C" => Object::Array(vec![0.into(), 0.into(), 1.into()]),
+        });
+        document
+            .get_dictionary_mut(page_id)
+            .expect("página")
+            .set("Annots", Object::Array(vec![square, underline]));
+
+        let mut bytes = Vec::new();
+        document.save_to(&mut bytes).expect("serializar el fixture");
+        bytes
+    }
+
+    #[test]
+    fn an_annotation_from_another_program_stays_out_of_the_list() {
+        let path = scratch("rt-foreign.pdf");
+        std::fs::write(&path, foreign_square_fixture()).expect("escribir el fixture");
+
+        let read = read_annotations(&path).expect("leer un archivo con anotaciones ajenas");
+        assert!(
+            read.is_empty(),
+            "la anotación ajena no entra en la lista editable: {read:?}"
+        );
+    }
+
+    #[test]
+    fn reading_keeps_the_own_annotations_next_to_the_foreign_ones() {
+        // La anotación ajena se sigue viendo porque la pinta el lector, pero no
+        // aparece en la lista y el archivo la conserva al guardar.
+        let source = scratch("rt-mixed.pdf");
+        let path = scratch("rt-mixed-out.pdf");
+        std::fs::write(&source, foreign_square_fixture()).expect("escribir el fixture");
+        let current = vec![owned(
+            "mlnpdf-ida-propia",
+            Annotation::Mark(TextMark::underline(0, vec![(20.0, 20.0, 60.0, 30.0)], (0.0, 0.0, 0.0))),
+        )];
+
+        write_annotations(&source, &path, &current, &[]).expect("escribir el marcado");
+        let read = read_annotations(&path).expect("releer");
+
+        assert_eq!(read.len(), 1, "solo la propia vuelve: {read:?}");
+        assert_eq!(read[0].0, "mlnpdf-ida-propia");
+        let document = Document::load(&path).expect("cargar el resultado");
+        let page_id = *document.get_pages().get(&1).expect("página 1");
+        assert_eq!(
+            document
+                .get_page_annotations(page_id)
+                .expect("anotaciones")
+                .len(),
+            3,
+            "las ajenas siguen en el archivo"
+        );
+    }
+
+    #[test]
+    fn writing_back_what_was_read_does_not_duplicate_anything() {
+        let source = scratch("rt-again.pdf");
+        let path = scratch("rt-again-out.pdf");
+        std::fs::write(&source, fixture([0.0, 0.0, 200.0, 100.0], 0)).expect("escribir el PDF");
+        let current = vec![
+            owned("mlnpdf-ida-rep", mark(vec![(10.0, 10.0, 60.0, 20.0)])),
+            owned("mlnpdf-ida-rep-nota", note_with("Se relee")),
+            owned(
+                "mlnpdf-ida-rep-imagen",
+                Annotation::Image(ImageNote::new(0, (40.0, 50.0), 20.0, 10.0, red_pixels(4, 2))),
+            ),
+        ];
+        write_annotations(&source, &path, &current, &[]).expect("escribir las tres");
+
+        // Lo leído es exactamente lo que el archivo tiene: el guardado siguiente
+        // no tiene nada que quitar ni que reescribir.
+        let persisted = read_annotations(&path).expect("releer las anotaciones");
+        assert_eq!(persisted.len(), 3, "vuelven las tres: {persisted:?}");
+        assert_eq!(
+            write_annotations(&path, &path, &persisted, &persisted).expect("guardar otra vez"),
+            0,
+            "sin cambios no hay nada que escribir"
+        );
+
+        let document = Document::load(&path).expect("cargar el resultado");
+        let page_id = *document.get_pages().get(&1).expect("página 1");
+        assert_eq!(
+            document
+                .get_page_annotations(page_id)
+                .expect("anotaciones")
+                .len(),
+            3,
+            "el archivo no gana anotaciones"
         );
     }
 }

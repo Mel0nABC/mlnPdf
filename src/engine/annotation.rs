@@ -81,7 +81,10 @@ impl TextMark {
         Self::new(page, rects, color, MarkKind::Highlight)
     }
 
-    fn new(page: usize, rects: Vec<Rect>, color: (f64, f64, f64), kind: MarkKind) -> Self {
+    /// Marcado con su página, sus rectángulos, su color y su tipo. Sirve tanto
+    /// para el que se acaba de dibujar como para el que se acaba de leer del
+    /// archivo. El color se recorta a `0..=1`, que es lo que admite `/C`.
+    pub fn new(page: usize, rects: Vec<Rect>, color: (f64, f64, f64), kind: MarkKind) -> Self {
         Self {
             page,
             rects,
@@ -708,6 +711,140 @@ fn user_point(point: (f64, f64), page: PageBox) -> (f64, f64) {
     (ux + page.x0, uy + page.y0)
 }
 
+/// Pasa un punto del espacio de usuario del archivo (origen abajo) al espacio de
+/// la página (origen arriba, con la rotación de `/Rotate` ya aplicada).
+///
+/// Es la inversa exacta de `user_point`, y es lo que permite reabrir el archivo:
+/// una anotación escrita en espacio de usuario vuelve al lugar de la página del
+/// que salió, en cualquiera de las cuatro rotaciones.
+pub fn user_to_display(point: (f64, f64), page: PageBox) -> (f64, f64) {
+    let (ux, uy) = (point.0 - page.x0, point.1 - page.y0);
+    let (width, height) = (page.width, page.height);
+
+    // Despejar la misma cuenta de `user_point`: en 90° y 270° los ejes están
+    // intercambiados, así que deshacerlo también los intercambia.
+    match page.rotation.rem_euclid(360) {
+        90 => (uy, ux),
+        180 => (width - ux, uy),
+        270 => (height - uy, width - ux),
+        _ => (ux, height - uy),
+    }
+}
+
+/// Rectángulo de usuario (origen abajo) → rectángulo de la página (origen
+/// arriba). Las dos esquinas opuestas se convierten por separado y después se
+/// toma el mínimo y el máximo: con `/Rotate` los ejes se intercambian y la
+/// esquina de origen deja de ser la de menor `x` y menor `y`.
+pub fn user_rect_to_display(rect: Rect, page: PageBox) -> Rect {
+    let (x1, y1) = user_to_display((rect.0, rect.1), page);
+    let (x2, y2) = user_to_display((rect.2, rect.3), page);
+    (
+        x1.min(x2),
+        y1.min(y2),
+        x1.max(x2),
+        y1.max(y2),
+    )
+}
+
+/// Quads de `/QuadPoints` de vuelta a un rectángulo por línea, en el espacio de
+/// la página. Es la inversa de `mark_quads`: cada una de las cuatro esquinas se
+/// vuelve a pasar por `user_to_display` y el rectángulo es el que las encierra,
+/// así que la línea cae en el mismo lugar del que salió.
+pub fn quads_to_rects(quads: &[[f64; 8]], page: PageBox) -> Vec<Rect> {
+    quads
+        .iter()
+        .map(|quad| {
+            let mut rect = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+            for point in quad.chunks_exact(2) {
+                let (x, y) = user_to_display((point[0], point[1]), page);
+                rect.0 = rect.0.min(x);
+                rect.1 = rect.1.min(y);
+                rect.2 = rect.2.max(x);
+                rect.3 = rect.3.max(y);
+            }
+            rect
+        })
+        .collect()
+}
+
+/// Familia y estilo de una abreviatura de `/DA` (`Helv`, `TiBo`, `CoOb`, ...):
+/// la familia es la que vuelve a caer en la misma fuente base con
+/// `FontChoice::base_font()`.
+fn da_font(name: &str) -> Option<(&'static str, bool, bool)> {
+    Some(match name {
+        "Helv" => ("Sans", false, false),
+        "HeBo" => ("Sans", true, false),
+        "HeOb" => ("Sans", false, true),
+        "HeBO" => ("Sans", true, true),
+        "TiRo" => ("Times", false, false),
+        "TiBo" => ("Times", true, false),
+        "TiIt" => ("Times", false, true),
+        "TiBI" => ("Times", true, true),
+        "Cour" => ("Mono", false, false),
+        "CoBo" => ("Mono", true, false),
+        "CoOb" => ("Mono", false, true),
+        "CoBO" => ("Mono", true, true),
+        _ => return None,
+    })
+}
+
+/// Lee el `/DA` de una nota (`/Helv 12.0 Tf 0.000 0.000 0.000 rg`) y devuelve la
+/// fuente, su tamaño y el color: es el mismo texto que arma `da_string`, así que
+/// la abreviatura se reconoce y la familia vuelve a caer en la misma fuente base
+/// con `base_font()` («Sans» para Helvetica, «Times» para Times, «Mono» para
+/// Courier).
+///
+/// Una nota `/FreeText` lleva un solo `/DA`, así que al reabrirla recupera una
+/// sola fuente y un solo color para todos sus tramos: es el límite del formato,
+/// no del lector. `None` cuando no hay una fuente reconocible en el `/DA`; el
+/// color que falta queda en negro, el mismo con el que empieza toda nota.
+pub fn parse_da(da: &str) -> Option<(FontChoice, [f64; 3])> {
+    let tokens: Vec<&str> = da.split_whitespace().collect();
+    let mut font = None;
+    let mut color = NOTE_COLOR;
+
+    for (index, token) in tokens.iter().enumerate() {
+        match *token {
+            // El nombre de la fuente va dos posiciones antes del operador `Tf`.
+            // La barra que lo marca como recurso es opcional: el PDF la pide,
+            // pero `da_string` escribe la abreviatura sola.
+            "Tf" if index >= 2 => {
+                let font_name = tokens[index - 2]
+                    .strip_prefix('/')
+                    .unwrap_or(tokens[index - 2]);
+                if let Ok(size) = tokens[index - 1].parse::<f64>() {
+                    // Un tamaño que no se puede usar dejaría la nota sin fuente.
+                    if let Some((family, bold, italic)) = da_font(font_name)
+                        && size.is_finite()
+                        && size > 0.0
+                    {
+                        font = Some(FontChoice {
+                            family: family.to_string(),
+                            size,
+                            bold,
+                            italic,
+                        });
+                    }
+                }
+            }
+            // Y las tres componentes del color, tres posiciones antes de `rg`.
+            "rg" if index >= 3 => {
+                let components = [
+                    tokens[index - 3].parse::<f64>(),
+                    tokens[index - 2].parse::<f64>(),
+                    tokens[index - 1].parse::<f64>(),
+                ];
+                if let [Ok(red), Ok(green), Ok(blue)] = components {
+                    color = [red, green, blue].map(|component| component.clamp(0.0, 1.0));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Some((font?, color))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1235,5 +1372,183 @@ mod tests {
             },
         );
         assert_eq!(turned, (20.0, 10.0, 25.0, 40.0));
+    }
+
+    #[test]
+    fn a_user_point_goes_back_to_the_page_point_it_came_from() {
+        // La inversa exacta de `user_point` en las cuatro rotaciones: es lo que
+        // permite que un marcado leído del archivo vuelva a la página del que
+        // salió, también cuando la página está girada.
+        let points = [(0.0, 0.0), (10.0, 20.0), (60.0, 30.0), (200.0, 100.0)];
+        for rotation in [0, 90, 180, 270] {
+            let page = PageBox {
+                rotation,
+                ..PLAIN
+            };
+            for point in points {
+                let back = user_to_display(user_point(point, page), page);
+                assert!(
+                    (back.0 - point.0).abs() < 1e-9 && (back.1 - point.1).abs() < 1e-9,
+                    "rotación {rotation}: {point:?} volvió en {back:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_known_user_point_lands_where_the_reader_shows_it() {
+        // El borde inferior de la página sin girar es `y=0` del archivo y queda
+        // abajo en la pantalla, a la altura de la página.
+        assert_eq!(user_to_display((10.0, 0.0), PLAIN), (10.0, 100.0));
+        assert_eq!(user_to_display((10.0, 40.0), PLAIN), (10.0, 60.0));
+
+        // Con /Rotate 90 el punto de usuario (10, 60) se ve en (60, 10): los ejes
+        // están intercambiados.
+        assert_eq!(
+            user_to_display(
+                (10.0, 60.0),
+                PageBox {
+                    rotation: 90,
+                    ..PLAIN
+                }
+            ),
+            (60.0, 10.0)
+        );
+
+        // Y el origen del CropBox se descuenta antes de deshacer la rotación.
+        let offset = PageBox {
+            x0: 10.0,
+            y0: 20.0,
+            ..PLAIN
+        };
+        assert_eq!(user_to_display((20.0, 100.0), offset), (10.0, 20.0));
+    }
+
+    #[test]
+    fn a_user_rectangle_comes_back_to_the_page_rectangle() {
+        // El rectángulo de la página pasa a usuario y vuelve igual en las cuatro
+        // rotaciones, con y sin desplazamiento del CropBox.
+        let original = (10.0, 20.0, 40.0, 25.0);
+        let probe = TextNote::new(
+            0,
+            (original.0, original.1),
+            original.2 - original.0,
+            original.3 - original.1,
+            vec![],
+        );
+        for rotation in [0, 90, 180, 270] {
+            for page in [
+                PageBox {
+                    rotation,
+                    ..PLAIN
+                },
+                PageBox {
+                    rotation,
+                    x0: 10.0,
+                    y0: 20.0,
+                    ..PLAIN
+                },
+            ] {
+                let back = user_rect_to_display(note_rect(&probe, page), page);
+                for (got, want) in [
+                    (back.0, original.0),
+                    (back.1, original.1),
+                    (back.2, original.2),
+                    (back.3, original.3),
+                ] {
+                    assert!(
+                        (got - want).abs() < 1e-9,
+                        "rotación {}: {back:?} no es {original:?}",
+                        page.rotation
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_quads_come_back_as_one_rectangle_per_line() {
+        let rects = vec![line(20.0, 30.0), (80.0, 50.0, 130.0, 60.0)];
+        for rotation in [0, 90, 180, 270] {
+            let page = PageBox {
+                rotation,
+                ..PLAIN
+            };
+            let back = quads_to_rects(&mark_quads(&rects, page), page);
+            assert_eq!(back.len(), rects.len(), "un rectángulo por línea");
+            for (got, want) in back.iter().zip(&rects) {
+                for (got, want) in [
+                    (got.0, want.0),
+                    (got.1, want.1),
+                    (got.2, want.2),
+                    (got.3, want.3),
+                ] {
+                    assert!(
+                        (got - want).abs() < 1e-9,
+                        "rotación {rotation}: {back:?} no es {rects:?}"
+                    );
+                }
+            }
+        }
+
+        assert!(
+            quads_to_rects(&[], PLAIN).is_empty(),
+            "un marcado sin quads no inventa líneas"
+        );
+    }
+
+    #[test]
+    fn the_default_appearance_gives_back_the_font_the_size_and_the_color() {
+        let (parsed, color) =
+            parse_da("/Helv 12.0 Tf 0.000 0.000 0.000 rg").expect("un /DA propio se reconoce");
+        assert_eq!(parsed.family, "Sans");
+        assert_eq!(parsed.base_font(), BaseFont::Helvetica);
+        assert_eq!(parsed.size, 12.0);
+        assert_eq!((parsed.bold, parsed.italic), (false, false));
+        assert_eq!(color, [0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn every_abbreviation_falls_back_to_the_same_base_font() {
+        let expected = [
+            ("HeBo", BaseFont::Helvetica, true, false),
+            ("HeOb", BaseFont::Helvetica, false, true),
+            ("HeBO", BaseFont::Helvetica, true, true),
+            ("TiRo", BaseFont::Times, false, false),
+            ("TiBo", BaseFont::Times, true, false),
+            ("TiIt", BaseFont::Times, false, true),
+            ("TiBI", BaseFont::Times, true, true),
+            ("Cour", BaseFont::Courier, false, false),
+            ("CoBo", BaseFont::Courier, true, false),
+            ("CoOb", BaseFont::Courier, false, true),
+            ("CoBO", BaseFont::Courier, true, true),
+        ];
+        for (abbreviation, base, bold, italic) in expected {
+            let da = format!("/{abbreviation} 9.5 Tf 0.250 0.500 1.000 rg");
+            let (parsed, color) = parse_da(&da).expect("la abreviatura se reconoce");
+            assert_eq!(parsed.base_font(), base, "{abbreviation}");
+            assert_eq!((parsed.bold, parsed.italic), (bold, italic), "{abbreviation}");
+            assert_eq!(parsed.size, 9.5, "el tamaño se lee del /DA");
+            assert_eq!(color, [0.25, 0.5, 1.0], "el color se lee del /DA");
+        }
+    }
+
+    #[test]
+    fn a_default_appearance_without_a_known_font_is_rejected() {
+        // Sin fuente reconocible no se puede reconstruir la nota: es preferible
+        // que el servicio use sus valores por omisión a inventar una familia.
+        assert_eq!(parse_da(""), None);
+        assert_eq!(parse_da("/Raro 10 Tf 0 0 0 rg"), None);
+        assert_eq!(parse_da("/Helv Tf 0 0 0 rg"), None, "falta el tamaño");
+        assert_eq!(parse_da("/Helv 0 Tf 0 0 0 rg"), None, "un tamaño cero no se usa");
+
+        // La barra de recurso es opcional: `da_string` escribe la abreviatura
+        // sola, aunque el PDF la pida con barra.
+        assert!(parse_da("Helv 10 Tf").is_some(), "sin barra también se reconoce");
+
+        // Y un /DA sin color conserva el negro con el que empieza toda nota.
+        let (parsed, color) = parse_da("/TiRo 8.0 Tf").expect("la fuente alcanza");
+        assert_eq!(parsed.base_font(), BaseFont::Times);
+        assert_eq!(color, NOTE_COLOR);
     }
 }
