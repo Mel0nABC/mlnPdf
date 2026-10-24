@@ -67,6 +67,8 @@ ventana.
 | Selección con el ratón y copiar solo lo seleccionado | Arrastrar y `Ctrl+C` |
 | Subrayar el texto como anotación real del PDF, en el color elegido (el botón muestra ese color) | Botón al lado del zoom, `Ctrl+U`: abre el selector de color y aplica a la selección o al siguiente arrastre; un clic en el subrayado lo selecciona y `Supr` o `Eliminar` del menú contextual lo borra |
 | Resaltar el texto como rotulador, en su propio color (el botón lo muestra de fondo) | Botón al lado del zoom, `Ctrl+Shift+U`: abre el selector de color y aplica a la selección o al siguiente arrastre; un clic dentro del resaltado lo selecciona y `Supr` o `Eliminar` del menú contextual lo borra |
+| Elegir varias anotaciones a la vez y borrarlas juntas | Clic en una para elegirla y `Ctrl` + clic para sumar o quitar las demás (la última elegida es la principal, la que responde a editar texto); cada elegida muestra su contorno, y `Supr`, `Retroceso` o «Eliminar» del menú contextual borran el conjunto con un solo `Ctrl+Z` para recuperarlo |
+| Cambiar el color de lo que ya está colocado: subrayados, resaltados, tachados, lápiz, formas, notas adhesivas y sellos | Con lo que quieras recolorear elegido, `Ctrl+Alt+C`, `Edit > Cambiar color…` o «Cambiar color…» del menú contextual: el cambio alcanza a toda la selección y un solo `Ctrl+Z` devuelve los colores anteriores. Las notas de texto cambian su color por tramo en su diálogo, y las imágenes no tienen color propio |
 | Tachar el texto como anotación real del PDF, en su propio color | Botón `S` al lado de `U` y `A`, `Ctrl+Alt+U` o `Edit > Tachar`: abre el selector de color y aplica a la selección o al siguiente arrastre; un clic sobre la línea del tachado lo selecciona |
 | Dibujar a mano alzada y trazar formas, con color y grosor libre en puntos (0,5 a 20) | Botón con el icono de lápiz al lado de las otras herramientas: el menú ofrece lápiz, rectángulo, elipse, línea y flecha, con un control de grosor y una paleta de ocho colores (más «Más colores…» para uno a medida); elegir color no cierra el menú, así que después se elige la herramienta. La herramienta queda armada al soltar y encadena trazos o formas hasta `Esc` o hasta elegir otra. Atajos: `Ctrl+Alt+P` lápiz, `Ctrl+Alt+R` rectángulo, `Ctrl+Alt+E` elipse, `Ctrl+Alt+L` línea, `Ctrl+Alt+F` flecha |
 | Notas adhesivas con hilos de respuesta, escritas como anotaciones `/Text` encadenadas con `/IRT` | «Nota adhesiva» en el menú de dibujo, `Ctrl+Alt+N` o `Edit > Nota adhesiva`: el clic coloca una hoja amarilla con la esquina doblada, abre el diálogo para escribir el comentario y agregar respuestas, y en la esquina muestra la cuenta de respuestas; doble clic para volver a editarla |
@@ -122,6 +124,7 @@ ventana.
 | `Ctrl+U` / `Ctrl+Shift+U` | Subrayar / resaltar | `Ctrl+T` | Insertar una nota de texto en la página |
 | `Ctrl+Shift+I` | Insertar una imagen en la página | `Shift` + arrastrar un asa | Redimensionar la imagen conservando la proporción |
 | `Ctrl+Alt+U` | Tachar el texto seleccionado | `Ctrl+Alt+N` | Insertar una nota adhesiva |
+| `Ctrl+Alt+C` | Cambiar el color de lo seleccionado | `Ctrl` + clic | Sumar o quitar una anotación de la selección |
 | `Ctrl+Alt+P` / `R` / `E` / `L` / `F` | Lápiz / rectángulo / elipse / línea / flecha | `Ctrl+Alt+1` / `2` / `3` | Sello aprobado / revisado / borrador |
 | `Ctrl+Z` | Deshacer el último cambio | `Ctrl+Shift+Z` / `Ctrl+Y` | Rehacer el cambio deshecho |
 | `Supr` | Borrar la anotación seleccionada | `Ctrl+S` / `Ctrl+Shift+S` | Guardar / guardar como |
@@ -178,7 +181,7 @@ Probado con GTK 4.24 y poppler-glib 26.10.
 
 ```bash
 cargo build --release
-cargo test                 # 171 pruebas: motor, render, selección, búsqueda, páginas, sesión, anotaciones
+cargo test                 # 182 pruebas: motor, render, selección, búsqueda, páginas, sesión, anotaciones
 cargo test -- --ignored    # prueba de display: atajos, zoom y propiedad del viewer
 ```
 
