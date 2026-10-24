@@ -10,7 +10,7 @@ Una línea por capacidad, sin agrupar cosas distintas en una sola casilla.
 - [x] Render de todas las páginas con poppler-glib + cairo
 - [x] Scroll continuo vertical con barra del sistema
 - [x] Zoom por pasos con botones, `Ctrl` + rueda y `Ctrl` `+` / `-` / `0`, con transición animada (`ease-in-out`, 240 ms)
-- [x] Mantener la página actual al cambiar el zoom (anclaje)
+- [x] Mantener bajo el puntero el punto del documento al cambiar el zoom (anclaje por página y posición; si el puntero no está sobre la página, se ancla el centro de la vista)
 - [x] Navegación de páginas anterior/siguiente con contador, en dos barras
 - [x] Teclas `↑` retrocede y `↓` avanza de página
 - [x] Herramienta mano (`Space`) para desplazar arrastrando, con inercia al soltar: el arrastre sigue al puntero 1:1 y, al soltar, el scroll continúa con la velocidad que traía y frena solo. El cursor se mantiene durante el arrastre y `Esc` sale del modo
@@ -22,7 +22,7 @@ Una línea por capacidad, sin agrupar cosas distintas en una sola casilla.
 - [x] Rotar la vista en incrementos de 90° (`Ctrl+R`, geometría y clave de textura)
 - [x] Vista de dos páginas por fila (`View > Dos páginas`), con geometría y navegación adaptadas y ajuste automático del ancho de la fila al activarla
 - [x] Portada separada (primera página sola, luego pares)
-- [x] Panel lateral de miniaturas (`Ctrl+B`): `ListView` virtualizado con render perezoso al hacer bind, selección sincronizada con la página y desplazamiento automático hasta su fila (centrada al restaurar la sesión)
+- [x] Panel lateral de miniaturas (`Ctrl+B`): `ListView` virtualizado con render perezoso al hacer bind, selección sincronizada con la página y desplazamiento automático hasta su fila (centrada al restaurar la sesión); al elegir una miniatura, la página queda centrada en la vista
 - [ ] [BLOQUEADA: API sin title/action] Índice / marcadores navegable (bloqueado: `IndexIter` de poppler-rs no expone título ni acción; requiere FFI propio)
 - [x] Búsqueda de texto con resaltado por carácter encontrado (sin blancos) y salto a la primera coincidencia (`Ctrl+F`); `Enter` avanza al siguiente resultado y `Esc` limpia el campo
 - [x] Salto entre coincidencias (`Ctrl+G` / `Ctrl+Shift+G`) con contador `n/m` en la barra y scroll a la coincidencia
@@ -44,13 +44,13 @@ Una línea por capacidad, sin agrupar cosas distintas en una sola casilla.
 - [x] Guardar los marcados (subrayados y resaltados) y las notas de texto en el PDF abierto (`Ctrl+S`) o en una copia (`Ctrl+Shift+S`), con escritura atómica y pregunta de Descartar / Guardar / Guardar como al cerrar el documento, recargarlo, abrir otro o cerrar la ventana
 - [ ] [BLOQUEADA: escritura de PDF] Tachado de texto
 - [ ] [BLOQUEADA: escritura de PDF] Notas adhesivas (sticky notes) y comentarios con hilos de respuesta
-- [x] Texto libre sobre la página (`Ctrl+T`, botón `T` o `Edit > Insertar texto…`), escrito como anotación `/FreeText` con `/Contents`, `/Rect` y `/DA`: un diálogo modal pide el texto y la fuente (selector de fuente de GTK, arranca en «Sans 12») y el siguiente clic fija la esquina de la nota; la familia elegida se aproxima a una de las 14 estándar del PDF (`/Helv`, `/TiRo`, `/Cour` con su estilo), el ancho sale de medir con Pango en puntos y la nota se dibuja en negro sobre la capa de la página
+- [x] Texto libre sobre la página (`Ctrl+T`, botón `T` o `Edit > Insertar texto…`), escrito como anotación `/FreeText` con `/Contents`, `/Rect` y `/DA`: un diálogo modal pide el texto (editor multilínea), la fuente y el color; ambos se aplican al texto seleccionado, o a todo el texto si no hay selección, y el siguiente clic fija la esquina de la nota; la familia elegida se aproxima a una de las 14 estándar del PDF (`/Helv`, `/TiRo`, `/Cour` con su estilo), el ancho y el alto salen de medir con Pango en puntos y cada tramo se dibuja con su fuente y su color sobre la capa de la página
 - [ ] [BLOQUEADA: escritura de PDF] Dibujo a mano alzada (lápiz) con grosor y color
 - [ ] [BLOQUEADA: escritura de PDF] Formas: rectángulo, elipse, línea, flecha
 - [ ] [BLOQUEADA: escritura de PDF] Sellos (aprobado, revisado, borrador) e imágenes pegadas
 - [ ] [BLOQUEADA: escritura de PDF] Firmas manuscritas reutilizables
 - [ ] [BLOQUEADA: escritura de PDF] Inspector de anotaciones: listar, filtrar y saltar entre ellas (borrar ya se hace desde la página)
-- [x] Editar las anotaciones ya creadas, también después de guardarlas: un clic sobre la nota la selecciona (contorno punteado), arrastrarla la mueve, `Supr` / `Retroceso` la borra, el doble clic o `Edit > Editar texto de la nota` abre el diálogo con su texto y su fuente precargados (se vuelve a medir con Pango) y el clic derecho abre el menú con `Editar texto` y `Borrar`; el cursor sobre una nota es `grab` y `Esc` deselecciona. Cada anotación propia se escribe con un `/NM` de la sesión, así que el guardado reemplaza o quita sólo las del visor y las de otros programas quedan intactas
+- [x] Editar las anotaciones ya creadas, también después de guardarlas: un clic sobre la nota la selecciona (contorno punteado que rodea el texto), arrastrarla la mueve, `Supr` / `Retroceso` la borra (clicar la página suelta el foco de los campos de texto para que la tecla llegue a la nota), el doble clic o `Edit > Editar texto de la nota` abre el diálogo con su texto, su fuente y su color precargados (se vuelve a medir con Pango) y el clic derecho abre el menú con `Editar texto`, `Borrar` y `Mover con el ratón`, que arma el cursor de cuatro flechas; el cursor sobre una nota es `move` y `Esc` deselecciona. Cada anotación propia se escribe con un `/NM` de la sesión, así que el guardado reemplaza o quita sólo las del visor y las de otros programas quedan intactas
 - [ ] [BLOQUEADA: escritura de PDF] Guardar anotaciones en el PDF (guardado incremental)
 - [ ] [BLOQUEADA: escritura de PDF] Guardar como / aplanar anotaciones (flatten) y exportar copia limpia
 - [ ] [BLOQUEADA: escritura de PDF] Importar y exportar anotaciones en FDF / XFDF

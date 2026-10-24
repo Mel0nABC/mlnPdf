@@ -47,13 +47,13 @@ ventana.
 | Capacidad | Cómo se usa |
 |---|---|
 | Scroll continuo con render por demanda | Rueda, barra del sistema, `PageUp` / `PageDown` |
-| Zoom por pasos con transición animada de 240 ms | Botones, `Ctrl` + rueda, `Ctrl` `+` / `-` / `0` |
+| Zoom por pasos con transición animada de 240 ms, anclado al puntero | Botones, `Ctrl` + rueda, `Ctrl` `+` / `-` / `0`: el punto bajo el puntero se queda quieto (si el puntero no está sobre la página, se ancla el centro de la vista) |
 | Ajustar al ancho, a la página y tamaño real | `Ctrl+1` / `Ctrl+2` / `Ctrl+3` |
 | Navegación de páginas con contador | `↑` / `↓`, campo `Ir a` con `Ctrl+L` |
 | Primera y última página | `Ctrl+Inicio` / `Ctrl+Fin` |
 | Rotar la vista en pasos de 90° | `Ctrl+R` |
 | Dos páginas por fila y portada separada | `View > Dos páginas`, `View > Portada separada` |
-| Miniaturas virtualizadas | `Ctrl+B`: solo se rasteriza la fila que se dibuja |
+| Miniaturas virtualizadas | `Ctrl+B`: solo se rasteriza la fila que se dibuja; elegir una miniatura deja la página centrada |
 | Historial de navegación (100 entradas) | `Alt+←` / `Alt+→` |
 | Pantalla completa y modo presentación | `F11`, `F5` (`Esc` sale) |
 
@@ -67,8 +67,9 @@ ventana.
 | Selección con el ratón y copiar solo lo seleccionado | Arrastrar y `Ctrl+C` |
 | Subrayar el texto como anotación real del PDF, en el color elegido (el botón muestra ese color) | Botón al lado del zoom, `Ctrl+U`: abre el selector de color y aplica a la selección o al siguiente arrastre |
 | Resaltar el texto como rotulador, en su propio color (el botón lo muestra de fondo) | Botón al lado del zoom, `Ctrl+Shift+U`: abre el selector de color y aplica a la selección o al siguiente arrastre |
-| Insertar texto libre sobre la página, con la fuente elegida en el selector de fuente de GTK (familia aproximada a una de las 14 estándar del PDF) | Botón `T` al lado de las otras herramientas, `Ctrl+T` o `Edit > Insertar texto…`: el diálogo pide texto y fuente, y el siguiente clic fija la esquina de la nota |
-| Mover, borrar o cambiar el texto de una nota ya creada, también después de guardarla | Arrastrar la nota para moverla, `Supr` (o `Retroceso`) para borrarla, doble clic o `Edit > Editar texto de la nota` para reescribirla, y clic derecho para el menú con `Editar texto` y `Borrar` |
+| Insertar texto libre sobre la página, con la fuente y el color elegidos en los selectores de GTK (familia aproximada a una de las 14 estándar del PDF) | Botón `T` al lado de las otras herramientas, `Ctrl+T` o `Edit > Insertar texto…`: el diálogo pide texto (multilínea), fuente y color, y el siguiente clic fija la esquina de la nota |
+| Mover, borrar o cambiar el texto de una nota ya creada, también después de guardarla | Arrastrar la nota (cursor de cuatro flechas) para moverla, `Supr` (o `Retroceso`) para borrarla, doble clic o `Edit > Editar texto de la nota` para reescribirla, y clic derecho para el menú con `Editar texto`, `Borrar` y `Mover con el ratón` |
+| Cambiar la fuente o el color de solo una parte de la nota | En el diálogo de edición, seleccionar el texto y elegir la fuente o el color; sin selección, se aplica a toda la nota |
 | Deshacer y rehacer con instantáneas, de a un cambio | `Ctrl+Z` / `Ctrl+Shift+Z` (o `Ctrl+Y`), `Edit > Deshacer` / `Rehacer` |
 | Metadatos del documento | `Ctrl+D` |
 
@@ -165,7 +166,7 @@ Probado con GTK 4.24 y poppler-glib 26.10.
 
 ```bash
 cargo build --release
-cargo test                 # 85 pruebas: motor, render, selección, búsqueda, páginas, sesión, anotaciones
+cargo test                 # 97 pruebas: motor, render, selección, búsqueda, páginas, sesión, anotaciones
 cargo test -- --ignored    # prueba de display: atajos, zoom y propiedad del viewer
 ```
 
