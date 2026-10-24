@@ -321,6 +321,44 @@ impl ShapeKind {
     }
 }
 
+/// Opacidad mínima de un relleno. Una opacidad cero dejaría el interior
+/// invisible y sin forma de volver a agarrarlo con el clic, así que el mínimo
+/// es un poco mayor que cero.
+pub const FILL_ALPHA_MIN: f64 = 0.05;
+
+/// Recorta la opacidad de un relleno a `FILL_ALPHA_MIN..=1`. Un valor que no es
+/// un número no puede llegar al archivo: cae en el relleno opaco, que es el
+/// respaldo de los archivos sin opacidad.
+pub fn clamp_fill_alpha(alpha: f64) -> f64 {
+    if alpha.is_finite() {
+        alpha.clamp(FILL_ALPHA_MIN, 1.0)
+    } else {
+        1.0
+    }
+}
+
+/// Relleno del interior de una forma: su propio color, independiente del color
+/// del contorno, y su opacidad.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ShapeFill {
+    /// Color RGB con componentes en `0..=1`, como los toma `/IC`.
+    pub color: [f64; 3],
+    /// Opacidad en `FILL_ALPHA_MIN..=1`, recortada al construir el relleno.
+    pub alpha: f64,
+}
+
+impl ShapeFill {
+    /// Relleno con su color y su opacidad. El color se recorta a `0..=1` y la
+    /// opacidad a `FILL_ALPHA_MIN..=1`, que es lo que admite el `ExtGState` de
+    /// la apariencia y lo que se puede volver a elegir con el ratón.
+    pub fn new(color: [f64; 3], alpha: f64) -> Self {
+        Self {
+            color: color.map(|component| component.clamp(0.0, 1.0)),
+            alpha: clamp_fill_alpha(alpha),
+        }
+    }
+}
+
 /// Una forma dibujada sobre la página. Para la línea y la flecha, `from` y `to`
 /// son los extremos; para el rectángulo y la elipse, dos esquinas opuestas.
 #[derive(Clone, Debug, PartialEq)]
@@ -333,10 +371,10 @@ pub struct Shape {
     pub color: [f64; 3],
     /// Grosor en puntos, recortado a `STROKE_MIN_WIDTH..=STROKE_MAX_WIDTH`.
     pub width: f64,
-    /// True cuando el interior se pinta con el mismo color del trazo. Solo el
-    /// rectángulo y la elipse tienen interior; en la línea y la flecha el
-    /// relleno no existe.
-    pub filled: bool,
+    /// Relleno del interior, con su color y su opacidad, o `None` cuando la forma
+    /// va hueca. Solo el rectángulo y la elipse tienen interior; en la línea y la
+    /// flecha el relleno no existe.
+    pub fill: Option<ShapeFill>,
 }
 
 impl Shape {
@@ -358,17 +396,18 @@ impl Shape {
             to,
             color: color.map(|component| component.clamp(0.0, 1.0)),
             width: clamp_stroke_width(width),
-            filled: false,
+            fill: None,
         }
     }
 
-    /// La misma forma con el relleno indicado. El interior usa el mismo color que
-    /// el trazo, así que no hay un segundo color que guardar. La geometría, el
-    /// color, el grosor y la página se copian tal como estaban; la línea y la
-    /// flecha no tienen interior, así que `with_fill(true)` las deja igual.
-    pub fn with_fill(&self, filled: bool) -> Shape {
+    /// La misma forma con el relleno indicado, o sin él cuando llega `None`. El
+    /// relleno trae su propio color, así que no depende del color del contorno.
+    /// La geometría, el color, el grosor y la página se copian tal como estaban;
+    /// la línea y la flecha no tienen interior, así que `with_fill(Some(..))` las
+    /// deja igual.
+    pub fn with_fill(&self, fill: Option<ShapeFill>) -> Shape {
         let mut shape = self.clone();
-        shape.filled = filled && self.can_be_filled();
+        shape.fill = if self.can_be_filled() { fill } else { None };
         shape
     }
 
@@ -1255,7 +1294,8 @@ impl Annotation {
 
     /// La misma anotación con su color propio cambiado, recortado a `0..=1` que
     /// es lo que admite `/C`. No toca nada más: página, geometría, texto,
-    /// grosor, puntos y tipo se conservan tal como estaban.
+    /// grosor, puntos y tipo se conservan tal como estaban. En una forma cambia
+    /// solo el contorno: el relleno conserva su color y su opacidad.
     ///
     /// Una anotación sin color propio vuelve como una copia igual, así el
     /// llamador puede aplicar el cambio a toda la selección sin casos
@@ -2862,7 +2902,7 @@ mod tests {
             (ShapeKind::Arrow, false),
         ] {
             let shape = Shape::new(0, kind, (10.0, 20.0), (50.0, 60.0), [0.1, 0.2, 0.3], 2.0);
-            assert!(!shape.filled, "{kind:?} nace sin relleno");
+            assert_eq!(shape.fill, None, "{kind:?} nace sin relleno");
             assert_eq!(shape.can_be_filled(), fillable, "{kind:?} y su interior");
         }
     }
@@ -2877,8 +2917,9 @@ mod tests {
             [0.2, 0.4, 0.6],
             3.0,
         );
-        let filled = rectangle.with_fill(true);
-        assert!(filled.filled, "el rectángulo se rellena");
+        let fill = ShapeFill::new([0.9, 0.1, 0.2], 0.4);
+        let filled = rectangle.with_fill(Some(fill));
+        assert_eq!(filled.fill, Some(fill), "el rectángulo se rellena");
         assert_eq!(filled.page, rectangle.page, "la página no cambia");
         assert_eq!(filled.kind, rectangle.kind, "el tipo no cambia");
         assert_eq!(
@@ -2888,20 +2929,79 @@ mod tests {
         );
         assert_eq!(
             filled.color, rectangle.color,
-            "el relleno usa el mismo color que el trazo"
+            "el color del contorno no cambia al rellenar"
         );
         assert!(
             (filled.width - rectangle.width).abs() < 1e-9,
             "el grosor no cambia"
         );
-        assert!(!filled.with_fill(false).filled, "quitar el relleno lo apaga");
+        assert_eq!(
+            filled.with_fill(None).fill,
+            None,
+            "quitar el relleno lo apaga"
+        );
 
         for kind in [ShapeKind::Line, ShapeKind::Arrow] {
             let line = Shape::new(0, kind, (10.0, 20.0), (50.0, 60.0), [0.0, 0.0, 0.0], 2.0);
             assert!(!line.can_be_filled(), "{kind:?} no tiene interior");
-            assert_eq!(line.with_fill(true), line, "{kind:?} se queda igual");
-            assert!(!line.with_fill(true).filled, "{kind:?} no se rellena");
+            assert_eq!(
+                line.with_fill(Some(fill)),
+                line,
+                "{kind:?} se queda igual"
+            );
+            assert_eq!(
+                line.with_fill(Some(fill)).fill,
+                None,
+                "{kind:?} no se rellena"
+            );
+            assert_eq!(
+                line.with_fill(None),
+                line,
+                "{kind:?} sin relleno también se queda igual"
+            );
         }
+    }
+
+    #[test]
+    fn a_shape_fill_clamps_its_opacity_and_its_colour() {
+        // Una opacidad cero dejaría el relleno invisible y sin forma de
+        // recuperarlo con el clic, así que el mínimo es 0,05; por arriba, el
+        // máximo es un relleno opaco.
+        assert_eq!(ShapeFill::new([0.1, 0.2, 0.3], 0.0).alpha, 0.05);
+        assert_eq!(ShapeFill::new([0.1, 0.2, 0.3], -2.0).alpha, 0.05);
+        assert_eq!(ShapeFill::new([0.1, 0.2, 0.3], 3.0).alpha, 1.0);
+        assert_eq!(ShapeFill::new([0.1, 0.2, 0.3], 0.4).alpha, 0.4);
+        // Un alfa que no es un número no puede llegar al archivo: el relleno
+        // queda opaco, que es el respaldo de los archivos sin opacidad.
+        assert_eq!(ShapeFill::new([0.1, 0.2, 0.3], f64::NAN).alpha, 1.0);
+
+        let clamped = ShapeFill::new([-0.5, 0.5, 2.0], 1.0);
+        assert_eq!(clamped.color, [0.0, 0.5, 1.0], "el color se recorta");
+    }
+
+    #[test]
+    fn recolouring_a_shape_keeps_its_fill() {
+        let fill = ShapeFill::new([0.9, 0.8, 0.1], 0.4);
+        let shape = Shape::new(
+            0,
+            ShapeKind::Ellipse,
+            (10.0, 20.0),
+            (50.0, 60.0),
+            [0.2, 0.4, 0.6],
+            2.0,
+        )
+        .with_fill(Some(fill));
+
+        let recolorada = Annotation::Shape(shape.clone()).recolored((0.1, 0.2, 0.3));
+        let Annotation::Shape(back) = recolorada else {
+            panic!("la forma tiene que seguir siendo una forma");
+        };
+        assert_eq!(back.color, [0.1, 0.2, 0.3], "el contorno cambia de color");
+        assert_eq!(
+            back.fill,
+            Some(fill),
+            "el relleno conserva su color y su opacidad"
+        );
     }
 
     #[test]

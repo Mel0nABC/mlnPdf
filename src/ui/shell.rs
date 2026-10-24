@@ -82,6 +82,22 @@ pub(crate) const STROKE_PALETTE: [(&str, (f64, f64, f64)); 8] = [
 /// de dibujo entre `STROKE_MIN_WIDTH` y `STROKE_MAX_WIDTH`.
 pub(crate) const STROKE_WIDTH: f64 = 2.0;
 
+/// Color con el que empieza el relleno de una forma. Es independiente del color
+/// del trazo y arranca con el mismo rojo para que una forma rellena se vea como
+/// hasta ahora.
+pub(crate) const FILL_COLOR: (f64, f64, f64) = STROKE_COLOR;
+
+/// Opacidad con la que empieza el relleno, en porcentaje: opaca, como el relleno
+/// de siempre. La barra del popover la baja hasta `FILL_OPACITY_MIN`.
+pub(crate) const FILL_OPACITY: f64 = 100.0;
+
+/// Opacidad mínima que ofrece la barra del relleno, en porcentaje. Por debajo el
+/// interior no se vería ni se podría volver a agarrar con el clic.
+pub(crate) const FILL_OPACITY_MIN: f64 = 10.0;
+
+/// Paso de la barra de opacidad, en puntos porcentuales.
+pub(crate) const FILL_OPACITY_STEP: f64 = 5.0;
+
 /// Width in logical pixels of the border band of a note where the cursor turns
 /// into the four-arrow move cursor, measured towards the inside of the note.
 const NOTE_CURSOR_BORDER: f64 = 5.0;
@@ -187,10 +203,20 @@ pub(crate) struct UiHandles {
     /// Grosor en puntos que comparten el lápiz y las formas; se recuerda entre
     /// trazos.
     pub(crate)     stroke_width: gtk::SpinButton,
+    /// Sección de relleno del popover de dibujo: la casilla «Rellenar», el color
+    /// de relleno y la opacidad. Se recuerda entre trazos y se deshabilita entera
+    /// en las herramientas que no tienen interior.
+    pub(crate)     stroke_fill_section: gtk::Box,
     /// Casilla «Rellenar» del popover de dibujo: el interior del rectángulo y de
-    /// la elipse se pinta con el color del trazo. Se recuerda entre trazos y se
-    /// deshabilita en las herramientas que no tienen interior.
+    /// la elipse se pinta con el color de relleno y su opacidad.
     pub(crate)     stroke_fill: gtk::CheckButton,
+    /// Color de relleno: su propia fila de muestras, independiente de la del
+    /// trazo, y el color recordado entre formas.
+    pub(crate)     stroke_fill_color: FillColorUi,
+    /// Barra de la opacidad del relleno, de `FILL_OPACITY_MIN` a 100 %.
+    pub(crate)     stroke_fill_opacity: gtk::Scale,
+    /// Etiqueta con el porcentaje de la opacidad del relleno.
+    pub(crate)     stroke_fill_opacity_label: gtk::Label,
     /// Selector de color del trazo, también recordado entre trazos.
     pub(crate)     stroke_color: StrokeColorUi,
     /// Los tres botones de la sección «Sellos» del popover de dibujo, en el orden
@@ -221,6 +247,39 @@ pub(crate) struct StrokeColorUi {
     /// Dibujo de cada muestra: lleva el contorno de la que está elegida, así que
     /// se repinta al cambiar de color.
     pub(crate) preset_marks: [gtk::DrawingArea; STROKE_PALETTE.len()],
+}
+
+/// Selector del color de relleno: su propia fila de muestras, independiente de
+/// la del trazo, la muestra que enseña el color y la opacidad elegidos, y el
+/// color recordado entre formas.
+#[derive(Clone)]
+pub(crate) struct FillColorUi {
+    /// Muestra del color de relleno con su opacidad; se repinta al cambiarlos.
+    pub(crate) swatch: gtk::DrawingArea,
+    /// Color RGB en `0..=1`, el mismo que viaja en `/IC`.
+    pub(crate) value: Rc<Cell<(f64, f64, f64)>>,
+    /// Botones de la paleta del relleno, en el orden de `STROKE_PALETTE`.
+    pub(crate) presets: [gtk::Button; STROKE_PALETTE.len()],
+    /// Dibujo de cada muestra: lleva el contorno de la que está elegida, así que
+    /// se repinta al cambiar de color.
+    pub(crate) preset_marks: [gtk::DrawingArea; STROKE_PALETTE.len()],
+}
+
+/// Los widgets del popover de dibujo que la ventana necesita recordar.
+#[derive(Clone)]
+pub(crate) struct StrokeMenuUi {
+    pub(crate) button: gtk::MenuButton,
+    pub(crate) tools: [gtk::Button; 5],
+    pub(crate) width: gtk::SpinButton,
+    pub(crate) fill_section: gtk::Box,
+    pub(crate) fill: gtk::CheckButton,
+    pub(crate) fill_color: FillColorUi,
+    pub(crate) fill_opacity: gtk::Scale,
+    pub(crate) fill_opacity_label: gtk::Label,
+    pub(crate) color: StrokeColorUi,
+    /// Botón de la nota adhesiva, que comparte el popover.
+    pub(crate) sticky: gtk::Button,
+    pub(crate) stamps: [gtk::Button; 3],
 }
 
 /// The open document and everything derived from it.
@@ -321,9 +380,10 @@ pub(crate) struct StrokeTool {
     pub(crate) color: (f64, f64, f64),
     /// Grosor en puntos, dentro de `STROKE_MIN_WIDTH..=STROKE_MAX_WIDTH`.
     pub(crate) width: f64,
-    /// True cuando la forma se guarda con su interior pintado. La casilla
-    /// «Rellenar» lo decide y solo lo admiten el rectángulo y la elipse.
-    pub(crate) filled: bool,
+    /// Relleno con el que se guarda la forma: su color y su opacidad, tomados de
+    /// los controles del popover. `None` cuando la casilla «Rellenar» está
+    /// desmarcada o cuando la herramienta no tiene interior.
+    pub(crate) fill: Option<ShapeFill>,
 }
 
 impl StrokeTool {
@@ -375,7 +435,7 @@ impl StrokeDrag {
                     self.tool.rgb(),
                     self.tool.width,
                 )
-                .with_fill(self.tool.filled),
+                .with_fill(self.tool.fill),
             )),
         }
     }
@@ -645,17 +705,19 @@ impl Viewer {
         accessible_label(&image_button, "Insertar imagen en la página");
 
         // Quinta herramienta: dibujar. Un solo botón abre el popover con el
-        // lápiz, las cuatro formas, el grosor libre, el color, la nota adhesiva y
-        // los sellos predefinidos.
-        let (
-            stroke_button,
-            stroke_tools,
-            stroke_width,
-            stroke_fill,
-            stroke_color,
-            sticky_button,
-            stamp_buttons,
-        ) = build_stroke_menu();
+        // lápiz, las cuatro formas, el grosor libre, el color del trazo, el
+        // relleno con su color y su opacidad, la nota adhesiva y los sellos
+        // predefinidos.
+        let stroke_menu = build_stroke_menu();
+        let StrokeMenuUi {
+            button: stroke_button,
+            tools: stroke_tools,
+            width: stroke_width,
+            color: stroke_color,
+            sticky: sticky_button,
+            stamps: stamp_buttons,
+            ..
+        } = stroke_menu.clone();
 
         let title = gtk::Label::new(Some(WINDOW_TITLE));
 
@@ -816,7 +878,11 @@ impl Viewer {
                 stroke_button: stroke_button.clone(),
                 stroke_tools: stroke_tools.clone(),
                 stroke_width: stroke_width.clone(),
-                stroke_fill: stroke_fill.clone(),
+                stroke_fill_section: stroke_menu.fill_section.clone(),
+                stroke_fill: stroke_menu.fill.clone(),
+                stroke_fill_color: stroke_menu.fill_color.clone(),
+                stroke_fill_opacity: stroke_menu.fill_opacity.clone(),
+                stroke_fill_opacity_label: stroke_menu.fill_opacity_label.clone(),
                 stroke_color: stroke_color.clone(),
                 stamp_buttons: stamp_buttons.clone(),
             },
@@ -1016,6 +1082,34 @@ impl Viewer {
                     }
                 });
             }
+        }
+        {
+            // El color del relleno tiene su propia fila de muestras: elegir una no
+            // toca el color del trazo y no cierra el menú.
+            for (index, (_, rgb)) in STROKE_PALETTE.iter().enumerate() {
+                let weak = Rc::downgrade(&viewer);
+                let rgb = *rgb;
+                viewer.ui.stroke_fill_color.presets[index].connect_clicked(move |_| {
+                    if let Some(viewer) = weak.upgrade() {
+                        viewer.set_fill_color(rgb);
+                    }
+                });
+            }
+        }
+        {
+            // La barra de opacidad del relleno actualiza su etiqueta y su muestra,
+            // y su valor se lee al empezar cada forma: se recuerda entre usos.
+            let weak = Rc::downgrade(&viewer);
+            let label = viewer.ui.stroke_fill_opacity_label.clone();
+            viewer
+                .ui
+                .stroke_fill_opacity
+                .connect_value_changed(move |scale| {
+                    label.set_label(&fill_percent_label(scale.value()));
+                    if let Some(viewer) = weak.upgrade() {
+                        viewer.ui.stroke_fill_color.swatch.queue_draw();
+                    }
+                });
         }
         {
             // El color a medida sí necesita el diálogo de GTK: su botón lo abre
@@ -2478,16 +2572,16 @@ impl Viewer {
 
         // El grosor, el color y el relleno salen de los controles del popover,
         // que conservan lo último que se eligió para el trazo siguiente. El
-        // relleno solo se aplica a las formas que lo admiten, y la casilla queda
+        // relleno solo se aplica a las formas que lo admiten, y la sección queda
         // deshabilitada en las que no.
         let rgba = self.ui.stroke_color.value.get();
         let fillable = kind.can_be_filled();
-        self.ui.stroke_fill.set_sensitive(fillable);
+        self.ui.stroke_fill_section.set_sensitive(fillable);
         let tool = StrokeTool {
             kind,
             color: rgba,
             width: clamp_stroke_width(self.ui.stroke_width.value()),
-            filled: fillable && self.ui.stroke_fill.is_active(),
+            fill: (fillable && self.ui.stroke_fill.is_active()).then(|| self.configured_fill()),
         };
         *self.annot.stroke_tool.borrow_mut() = Some(tool);
         self.refresh_page_cursor();
@@ -2561,6 +2655,29 @@ impl Viewer {
         self.ui.stroke_color.value.set(color);
         self.ui.stroke_color.swatch.queue_draw();
         for mark in &self.ui.stroke_color.preset_marks {
+            mark.queue_draw();
+        }
+    }
+
+    /// Relleno configurado ahora en el popover: el color de la fila de muestras
+    /// del relleno y el porcentaje de su barra de opacidad, recortados por
+    /// `ShapeFill::new`. Es lo que usan tanto la herramienta armada como el menú
+    /// contextual de una forma ya colocada.
+    pub(crate) fn configured_fill(&self) -> ShapeFill {
+        let color = self.ui.stroke_fill_color.value.get();
+        ShapeFill::new(
+            [color.0, color.1, color.2],
+            self.ui.stroke_fill_opacity.value() / 100.0,
+        )
+    }
+
+    /// Guarda el color del relleno y repinta su muestra y las muestras de su
+    /// paleta, que marcan cuál está elegida. Es independiente del color del
+    /// trazo: cambiar uno no toca el otro.
+    pub(crate) fn set_fill_color(&self, color: (f64, f64, f64)) {
+        self.ui.stroke_fill_color.value.set(color);
+        self.ui.stroke_fill_color.swatch.queue_draw();
+        for mark in &self.ui.stroke_fill_color.preset_marks {
             mark.queue_draw();
         }
     }
@@ -4252,7 +4369,9 @@ impl Viewer {
                     .iter()
                     .find(|edit| edit.id == *id)
                     .and_then(|edit| match &edit.value {
-                        Annotation::Shape(shape) if shape.can_be_filled() => Some(shape.filled),
+                        Annotation::Shape(shape) if shape.can_be_filled() => {
+                            Some(shape.fill.is_some())
+                        }
                         _ => None,
                     })
             })
@@ -4261,10 +4380,13 @@ impl Viewer {
 
     /// Rellena o quita el relleno de todas las formas elegidas que lo admiten, con
     /// una sola instantánea de deshacer: el cambio del conjunto se deshace de una
-    /// vez, como el color y el borrado. La línea, la flecha y las demás
-    /// anotaciones no cambian. Devuelve si cambió algo; un conjunto que ya está
-    /// como se pide no toca nada.
+    /// vez, como el color y el borrado. Al rellenar se aplica el color y la
+    /// opacidad que el popover tiene configurados ahora; al quitar, el interior
+    /// desaparece. La línea, la flecha y las demás anotaciones no cambian.
+    /// Devuelve si cambió algo; un conjunto que ya está como se pide no toca
+    /// nada.
     pub(crate) fn set_selection_fill(&self, filled: bool) -> bool {
+        let fill = filled.then(|| self.configured_fill());
         let selected = self.selected_ids();
         let changing: Vec<String> = {
             let edits = self.annot.edits.borrow();
@@ -4275,8 +4397,8 @@ impl Viewer {
                         .iter()
                         .find(|edit| edit.id == **id)
                         .is_some_and(|edit| match &edit.value {
-                            Annotation::Shape(shape) => {
-                                shape.can_be_filled() && shape.filled != filled
+                            Annotation::Shape(shape) if shape.can_be_filled() => {
+                                shape.fill != fill
                             }
                             _ => false,
                         })
@@ -4294,7 +4416,7 @@ impl Viewer {
                 continue;
             }
             if let Annotation::Shape(shape) = &mut edit.value {
-                *shape = shape.with_fill(filled);
+                *shape = shape.with_fill(fill);
             }
         }
         for page in pages {
@@ -4750,10 +4872,12 @@ impl Viewer {
         let Some(point) = self.view_to_pdf(page, x, y) else {
             return false;
         };
-        // La casilla se vuelve a leer al empezar el trazo: cambiar el relleno
-        // entre dos formas no obliga a volver a armar la herramienta, y la línea
-        // y la flecha lo ignoran porque no tienen interior.
-        tool.filled = tool.kind.can_be_filled() && self.ui.stroke_fill.is_active();
+        // El relleno se vuelve a leer al empezar el trazo, con su color y su
+        // opacidad: cambiar cualquiera de los dos entre dos formas no obliga a
+        // volver a armar la herramienta, y la línea y la flecha lo ignoran porque
+        // no tienen interior.
+        tool.fill = (tool.kind.can_be_filled() && self.ui.stroke_fill.is_active())
+            .then(|| self.configured_fill());
         // El gesto dibuja: no selecciona texto ni deja una anotación elegida.
         if self.sel.selection.borrow_mut().take().is_some() {
             self.sel.selection_rects.borrow_mut().clear();
@@ -8607,7 +8731,6 @@ fn draw_shape(
     let to = forward_rotation(shape.to, page, rotation);
     let (x1, y1) = (from.0 * zoom, from.1 * zoom);
     let (x2, y2) = (to.0 * zoom, to.1 * zoom);
-    prepare_stroke(context, shape.color, shape.width, zoom);
 
     match shape.kind {
         ShapeKind::Rectangle => {
@@ -8617,10 +8740,8 @@ fn draw_shape(
                 (x1 - x2).abs(),
                 (y1 - y2).abs(),
             );
-            if shape.filled {
-                // `fill_preserve` deja el camino para trazar el borde encima.
-                let _ = context.fill_preserve();
-            }
+            paint_shape_fill(context, shape);
+            prepare_stroke(context, shape.color, shape.width, zoom);
             let _ = context.stroke();
         }
         ShapeKind::Ellipse => {
@@ -8637,13 +8758,13 @@ fn draw_shape(
                 (height / 2.0).max(f64::MIN_POSITIVE),
             );
             context.arc(0.0, 0.0, 1.0, 0.0, std::f64::consts::TAU);
-            if shape.filled {
-                let _ = context.fill_preserve();
-            }
+            paint_shape_fill(context, shape);
             let _ = context.restore();
+            prepare_stroke(context, shape.color, shape.width, zoom);
             let _ = context.stroke();
         }
         ShapeKind::Line | ShapeKind::Arrow => {
+            prepare_stroke(context, shape.color, shape.width, zoom);
             // La punta se calcula con los extremos ya pasados por la rotación de la
             // vista; en pantalla solo falta el zoom. La línea llega hasta la base
             // del triángulo y no hasta el vértice: si llegara al vértice, el trazo
@@ -8672,6 +8793,18 @@ fn draw_shape(
             }
         }
     }
+}
+
+/// Pinta el interior de la forma con el color de su relleno y su opacidad,
+/// dejando el camino para trazar el contorno encima. Sin relleno no hace nada: el
+/// camino queda listo para trazarse como una forma hueca.
+fn paint_shape_fill(context: &cairo::Context, shape: &Shape) {
+    let Some(fill) = shape.fill else {
+        return;
+    };
+    context.set_source_rgba(fill.color[0], fill.color[1], fill.color[2], fill.alpha);
+    // `fill_preserve` deja el camino para que el borde quede nítido.
+    let _ = context.fill_preserve();
 }
 
 /// Pinta la superficie de una imagen dentro de su caja.
@@ -9438,15 +9571,7 @@ fn stamp_shortcut(kind: StampKind) -> &'static str {
 /// libre en puntos, la casilla de relleno, la paleta de colores, el color a
 /// medida, la nota adhesiva y los tres sellos. Devuelve las piezas que el visor
 /// tiene que conectar y recordar.
-fn build_stroke_menu() -> (
-    gtk::MenuButton,
-    [gtk::Button; 5],
-    gtk::SpinButton,
-    gtk::CheckButton,
-    StrokeColorUi,
-    gtk::Button,
-    [gtk::Button; 3],
-) {
+fn build_stroke_menu() -> StrokeMenuUi {
     let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
     content.set_margin_top(8);
     content.set_margin_bottom(8);
@@ -9556,15 +9681,127 @@ fn build_stroke_menu() -> (
     settings.append(&color.swatch);
 
     // Casilla de relleno, debajo del grosor: el interior del rectángulo y de la
-    // elipse se pinta con el color del trazo, así que no hace falta un segundo
-    // color. Su estado se recuerda entre trazos, como el grosor y el color.
+    // elipse se pinta con el color y la opacidad que se eligen justo abajo, que
+    // son independientes de los del trazo. Su estado se recuerda entre trazos.
+    let fill_section = gtk::Box::new(gtk::Orientation::Vertical, 6);
     let fill = gtk::CheckButton::with_label("Rellenar");
-    fill.set_tooltip_text(Some("Rellenar el rectángulo y la elipse con el color del trazo"));
+    fill.set_tooltip_text(Some(
+        "Rellenar el rectángulo y la elipse con el color y la opacidad de abajo",
+    ));
     fill.set_halign(gtk::Align::Start);
     accessible_label(
         &fill,
-        "Rellenar el rectángulo y la elipse con el color del trazo",
+        "Rellenar el rectángulo y la elipse con el color y la opacidad elegidos",
     );
+
+    // Barra de opacidad del relleno: de 10 % a 100 % en pasos de 5. Se recuerda
+    // entre formas y su etiqueta dice siempre el porcentaje elegido.
+    let fill_opacity_label = gtk::Label::new(Some(&fill_percent_label(FILL_OPACITY)));
+    fill_opacity_label.set_xalign(1.0);
+    let fill_opacity = gtk::Scale::with_range(
+        gtk::Orientation::Horizontal,
+        FILL_OPACITY_MIN,
+        FILL_OPACITY,
+        FILL_OPACITY_STEP,
+    );
+    fill_opacity.set_value(FILL_OPACITY);
+    fill_opacity.set_draw_value(false);
+    fill_opacity.set_hexpand(true);
+    fill_opacity.set_tooltip_text(Some("Opacidad del relleno"));
+    accessible_label(&fill_opacity, "Opacidad del relleno en porcentaje");
+
+    // Fila propia de muestras para el relleno, independiente de la del trazo: la
+    // misma paleta de ocho, con su propio color elegido.
+    let fill_color_value: Rc<Cell<(f64, f64, f64)>> = Rc::new(Cell::new(FILL_COLOR));
+    let fill_swatch = gtk::DrawingArea::builder()
+        .width_request(18)
+        .height_request(18)
+        .build();
+    fill_swatch.set_tooltip_text(Some("Color del relleno elegido"));
+    accessible_label(&fill_swatch, "Color del relleno elegido");
+    {
+        let fill_color_value = fill_color_value.clone();
+        let opacity = fill_opacity.clone();
+        fill_swatch.set_draw_func(move |_, context, width, height| {
+            let color = fill_color_value.get();
+            let (width, height) = (f64::from(width), f64::from(height));
+            // La muestra enseña el color con la opacidad elegida, que es cómo se
+            // va a ver el interior de la forma.
+            context.set_source_rgba(
+                color.0,
+                color.1,
+                color.2,
+                (opacity.value() / 100.0).clamp(0.0, 1.0),
+            );
+            context.rectangle(1.0, 1.0, (width - 2.0).max(1.0), (height - 2.0).max(1.0));
+            let _ = context.fill_preserve();
+            context.set_source_rgba(0.0, 0.0, 0.0, 0.6);
+            context.set_line_width(1.0);
+            let _ = context.stroke();
+        });
+    }
+
+    let fill_presets_row = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+    let mut fill_preset_buttons: Vec<gtk::Button> = Vec::with_capacity(STROKE_PALETTE.len());
+    let mut fill_preset_marks: Vec<gtk::DrawingArea> = Vec::with_capacity(STROKE_PALETTE.len());
+    for (name, rgb) in STROKE_PALETTE {
+        let mark = gtk::DrawingArea::builder()
+            .width_request(16)
+            .height_request(16)
+            .build();
+        {
+            let fill_color_value = fill_color_value.clone();
+            mark.set_draw_func(move |_, context, width, height| {
+                let (width, height) = (f64::from(width), f64::from(height));
+                context.set_source_rgb(rgb.0, rgb.1, rgb.2);
+                context.rectangle(2.0, 2.0, (width - 4.0).max(1.0), (height - 4.0).max(1.0));
+                let _ = context.fill();
+                if fill_color_value.get() == rgb {
+                    // El contorno marca cuál está elegida.
+                    context.set_source_rgb(0.15, 0.15, 0.15);
+                    context.set_line_width(2.0);
+                    context.rectangle(1.0, 1.0, (width - 2.0).max(1.0), (height - 2.0).max(1.0));
+                    let _ = context.stroke();
+                }
+            });
+        }
+        let button = gtk::Button::builder().child(&mark).tooltip_text(name).build();
+        button.add_css_class("flat");
+        accessible_label(&button, &format!("Color {name} del relleno"));
+        fill_presets_row.append(&button);
+        fill_preset_buttons.push(button);
+        fill_preset_marks.push(mark);
+    }
+    let fill_presets: [gtk::Button; STROKE_PALETTE.len()] = fill_preset_buttons
+        .try_into()
+        .expect("el relleno ofrece una muestra por cada color de la paleta");
+    let fill_preset_marks: [gtk::DrawingArea; STROKE_PALETTE.len()] = fill_preset_marks
+        .try_into()
+        .expect("cada muestra del relleno tiene su dibujo");
+    let fill_color = FillColorUi {
+        swatch: fill_swatch,
+        value: fill_color_value,
+        presets: fill_presets,
+        preset_marks: fill_preset_marks,
+    };
+
+    let fill_colors = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let fill_color_label = gtk::Label::new(Some("Color de relleno"));
+    fill_color_label.set_xalign(0.0);
+    fill_colors.append(&fill_color_label);
+    fill_colors.append(&fill_presets_row);
+    fill_colors.append(&fill_color.swatch);
+
+    let fill_opacity_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let fill_opacity_title = gtk::Label::new(Some("Opacidad"));
+    fill_opacity_title.set_xalign(0.0);
+    fill_opacity_row.append(&fill_opacity_title);
+    fill_opacity_row.append(&fill_opacity);
+    fill_opacity_row.append(&fill_opacity_label);
+
+    fill_section.append(&fill);
+    fill_section.append(&fill_colors);
+    fill_section.append(&fill_opacity_row);
 
     let colors = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     let color_label = gtk::Label::new(Some("Color"));
@@ -9575,8 +9812,8 @@ fn build_stroke_menu() -> (
 
     content.append(&tools);
     content.append(&settings);
-    content.append(&fill);
     content.append(&colors);
+    content.append(&fill_section);
 
     // La nota adhesiva comparte este popover: no es un trazo, pero también se
     // coloca con un clic sobre la página y es otra forma de anotar.
@@ -9624,7 +9861,24 @@ fn build_stroke_menu() -> (
         .build();
     accessible_label(&button, "Dibujar y formas");
 
-    (button, buttons, width, fill, color, sticky, stamp_buttons)
+    StrokeMenuUi {
+        button,
+        tools: buttons,
+        width,
+        fill_section,
+        fill,
+        fill_color,
+        fill_opacity,
+        fill_opacity_label,
+        color,
+        sticky,
+        stamps: stamp_buttons,
+    }
+}
+
+/// Texto de la etiqueta de la opacidad del relleno, en porcentaje entero.
+fn fill_percent_label(percent: f64) -> String {
+    format!("{} %", percent.round() as i64)
 }
 
 fn toolbar_gap(width: i32) -> gtk::Box {

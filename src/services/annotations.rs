@@ -11,10 +11,10 @@ use lopdf::{Dictionary, Document, Object, ObjectId, Stream};
 
 use crate::engine::annotation::{
     Annotation, FontChoice, ImageAppearance, ImageNote, ImagePixels, InkStroke, MarkKind, NOTE_COLOR,
-    PageBox, Rect, STAMP_FONT_SIZE, Shape, ShapeKind, Stamp, StampKind, StickyComment, StickyNote,
-    TextMark, TextNote, TextRun, bounds_rect, clamp_stroke_width, image_appearance, mark_quads,
-    note_rect, parse_da, quads_to_rects, stamp_rect, sticky_rect, user_point, user_rect_to_display,
-    user_to_display,
+    PageBox, Rect, STAMP_FONT_SIZE, Shape, ShapeFill, ShapeKind, Stamp, StampKind, StickyComment,
+    StickyNote, TextMark, TextNote, TextRun, bounds_rect, clamp_fill_alpha, clamp_stroke_width,
+    image_appearance, mark_quads, note_rect, parse_da, quads_to_rects, stamp_rect, sticky_rect,
+    user_point, user_rect_to_display, user_to_display,
 };
 
 /// Prefijo de `/NM` que distingue una anotación propia de la de otro programa.
@@ -141,7 +141,7 @@ pub fn write_annotations(
             Annotation::Note(note) => note_dictionary(note, page_box, id),
             Annotation::Image(image) => image_dictionary(&mut document, image, page_box, id)?,
             Annotation::Ink(stroke) => ink_dictionary(stroke, page_box, id),
-            Annotation::Shape(shape) => shape_dictionary(shape, page_box, id),
+            Annotation::Shape(shape) => shape_dictionary(&mut document, shape, page_box, id)?,
             Annotation::Stamp(stamp) => stamp_dictionary(&mut document, stamp, page_box, id)?,
             Annotation::Sticky(_) => continue,
         };
@@ -339,9 +339,17 @@ fn ink_dictionary(stroke: &InkStroke, page: PageBox, id: &str) -> Object {
 
 /// Diccionario de una forma: `/Square`, `/Circle` o `/Line` según su tipo, con su
 /// caja, su color y su grosor. La flecha es una `/Line` con la punta en `/LE`.
-/// Una forma rellena suma `/IC` con el mismo color del trazo; la que no lo está
-/// no escribe `/IC`, así el archivo no cambia.
-fn shape_dictionary(shape: &Shape, page: PageBox, id: &str) -> Object {
+///
+/// Una forma rellena escribe `/IC` con el color de su relleno, que es lo que leen
+/// los visores que arman la apariencia desde el diccionario, y además una
+/// apariencia `/AP` propia que pinta el interior con su opacidad. La que no está
+/// rellena no escribe ni `/IC` ni `/AP`, así el archivo no cambia.
+fn shape_dictionary(
+    document: &mut Document,
+    shape: &Shape,
+    page: PageBox,
+    id: &str,
+) -> Result<Object, String> {
     let from = user_point(shape.from, page);
     let to = user_point(shape.to, page);
     let rect = user_bounds([from, to].into_iter()).expect("la forma tiene dos extremos");
@@ -361,11 +369,15 @@ fn shape_dictionary(shape: &Shape, page: PageBox, id: &str) -> Object {
     dictionary.set("BS", border_width(shape.width));
     match shape.kind {
         // El rectángulo y la elipse se pintan solos: la caja dice dónde. El
-        // interior es `/IC`, el campo que el formato define para él, con el mismo
-        // color que el borde.
+        // interior es `/IC` con el color del relleno, y su opacidad viaja en la
+        // apariencia propia, para que el borde siga opaco.
         ShapeKind::Rectangle | ShapeKind::Ellipse => {
-            if shape.filled {
-                dictionary.set("IC", color_array(shape.color));
+            if let Some(fill) = shape.fill {
+                dictionary.set("IC", color_array(fill.color));
+                let form = shape_appearance_stream(document, shape, fill, rect)?;
+                let mut appearance = Dictionary::new();
+                appearance.set("N", Object::Reference(form));
+                dictionary.set("AP", Object::Dictionary(appearance));
             }
             dictionary.set("F", Object::Integer(4));
         }
@@ -389,7 +401,132 @@ fn shape_dictionary(shape: &Shape, page: PageBox, id: &str) -> Object {
             );
         }
     }
-    Object::Dictionary(dictionary)
+    Ok(Object::Dictionary(dictionary))
+}
+
+/// Nombre del estado de transparencia de la apariencia de una forma rellena: es
+/// el que el contenido invoca con `/GS0 gs`.
+const FILL_STATE: &str = "GS0";
+
+/// Constante con la que un cuarto de círculo se aproxima con una curva de Bézier
+/// cúbica. Con 0.5523 el error queda por debajo de una milésima del radio, así
+/// que la elipse se ve redonda y no como un polígono.
+const BEZIER_CIRCLE: f64 = 0.5523;
+
+/// Apariencia de una forma rellena: un form XObject cuyo `/BBox` es el mismo
+/// rectángulo en espacio de usuario y cuyos `/Resources` llevan el estado de
+/// transparencia `/GS0` con `/ca` = la opacidad del relleno y `/CA` = 1.
+///
+/// La apariencia es lo que hace que el interior sea translúcido sin volver
+/// translúcido el borde: los lectores que no la lean ven el relleno opaco del
+/// color de `/IC`, que es un respaldo aceptable.
+fn shape_appearance_stream(
+    document: &mut Document,
+    shape: &Shape,
+    fill: ShapeFill,
+    rect: Rect,
+) -> Result<ObjectId, String> {
+    let content = shape_fill_content(shape, fill, rect);
+
+    let mut state = Dictionary::new();
+    state.set("ca", real(fill.alpha));
+    state.set("CA", real(1.0));
+    let mut states = Dictionary::new();
+    states.set(FILL_STATE, Object::Dictionary(state));
+    let mut resources = Dictionary::new();
+    resources.set("ExtGState", Object::Dictionary(states));
+
+    let mut dictionary = Dictionary::new();
+    dictionary.set("Type", Object::Name(b"XObject".to_vec()));
+    dictionary.set("Subtype", Object::Name(b"Form".to_vec()));
+    let (x1, y1, x2, y2) = rect;
+    dictionary.set(
+        "BBox",
+        Object::Array(vec![real(x1), real(y1), real(x2), real(y2)]),
+    );
+    dictionary.set("Resources", Object::Dictionary(resources));
+
+    add_stream(document, dictionary, content)
+}
+
+/// Contenido de la apariencia de una forma rellena: primero el interior con
+/// `rg` del color de relleno y el alfa de `/GS0`, y después el contorno con `RG`
+/// del color del trazo, su grosor y opacidad total, para que el borde quede
+/// nítido sobre el relleno translúcido.
+fn shape_fill_content(shape: &Shape, fill: ShapeFill, rect: Rect) -> Vec<u8> {
+    let path = shape_path(shape.kind, rect);
+    let [red, green, blue] = fill.color;
+    let [stroke_red, stroke_green, stroke_blue] = shape.color;
+    format!(
+        "q /{FILL_STATE} gs {} {} {} rg {path} f Q {} {} {} RG {} w {path} S",
+        number(red),
+        number(green),
+        number(blue),
+        number(stroke_red),
+        number(stroke_green),
+        number(stroke_blue),
+        number(shape.width),
+    )
+    .into_bytes()
+}
+
+/// Camino de la forma en espacio de usuario, listo para el contenido de la
+/// apariencia: el rectángulo con `re` y la elipse con cuatro curvas de Bézier que
+/// salen del extremo derecho y dan la vuelta en el sentido de las agujas del
+/// reloj.
+fn shape_path(kind: ShapeKind, rect: Rect) -> String {
+    let (x1, y1, x2, y2) = rect;
+    if kind != ShapeKind::Ellipse {
+        return format!(
+            "{} {} {} {} re",
+            number(x1),
+            number(y1),
+            number(x2 - x1),
+            number(y2 - y1)
+        );
+    }
+
+    let (center_x, center_y) = ((x1 + x2) / 2.0, (y1 + y2) / 2.0);
+    let (radius_x, radius_y) = ((x2 - x1) / 2.0, (y2 - y1) / 2.0);
+    let (handle_x, handle_y) = (radius_x * BEZIER_CIRCLE, radius_y * BEZIER_CIRCLE);
+    let point = |x: f64, y: f64| format!("{} {}", number(x), number(y));
+
+    // Cuatro cuartos: del extremo derecho al inferior, al izquierdo, al superior
+    // y de vuelta al derecho, que es donde empezó el camino.
+    let arcs = [
+        (
+            (center_x + radius_x, center_y + handle_y),
+            (center_x + handle_x, center_y + radius_y),
+            (center_x, center_y + radius_y),
+        ),
+        (
+            (center_x - handle_x, center_y + radius_y),
+            (center_x - radius_x, center_y + handle_y),
+            (center_x - radius_x, center_y),
+        ),
+        (
+            (center_x - radius_x, center_y - handle_y),
+            (center_x - handle_x, center_y - radius_y),
+            (center_x, center_y - radius_y),
+        ),
+        (
+            (center_x + handle_x, center_y - radius_y),
+            (center_x + radius_x, center_y - handle_y),
+            (center_x + radius_x, center_y),
+        ),
+    ];
+
+    let mut path = format!("{} m", point(center_x + radius_x, center_y));
+    for (start, control, end) in arcs {
+        path.push_str(&format!(
+            " {} {} {} c",
+            point(start.0, start.1),
+            point(control.0, control.1),
+            point(end.0, end.1)
+        ));
+    }
+    path.push_str(" h");
+    path
 }
 
 /// Nombre del recurso de fuente dentro de la apariencia de un sello.
@@ -1423,15 +1560,61 @@ fn read_shape(
     );
     // Solo el rectángulo y la elipse tienen interior, y una forma se rellena
     // cuando el archivo trae `/IC`; sin `/IC` se lee sin relleno, que es como
-    // quedaron las formas guardadas antes de que existiera el relleno.
-    Some(Annotation::Shape(shape.with_fill(interior(document, dictionary))))
+    // quedaron las formas guardadas antes de que existiera el relleno. La
+    // opacidad sale de la apariencia propia y, sin ella, el relleno es opaco.
+    Some(Annotation::Shape(shape.with_fill(interior_fill(document, dictionary))))
 }
 
-/// True cuando el diccionario de una forma trae un interior `/IC` de tres
-/// componentes. Un `/IC` malformado no cuenta como relleno: la forma se lee sin
-/// él. La línea y la flecha no lo consultan, porque no tienen interior.
-fn interior(document: &Document, dictionary: &Dictionary) -> bool {
-    numbers_of(document, dictionary, b"IC").is_some_and(|components| components.len() == 3)
+/// Relleno leído de `/IC`: su color y, de la apariencia propia, su opacidad.
+/// `None` cuando el diccionario no trae un `/IC` de tres componentes: un `/IC`
+/// malformado no cuenta como relleno, la forma se lee hueca. La línea y la flecha
+/// no lo consultan, porque no tienen interior.
+fn interior_fill(document: &Document, dictionary: &Dictionary) -> Option<ShapeFill> {
+    let components = numbers_of(document, dictionary, b"IC")?;
+    if components.len() != 3 {
+        return None;
+    }
+    Some(ShapeFill::new(
+        [components[0], components[1], components[2]],
+        appearance_fill_alpha(document, dictionary),
+    ))
+}
+
+/// Opacidad del relleno según la apariencia propia de la forma: el `/ca` del
+/// `ExtGState /GS0` que usa su contenido. Sin apariencia, sin `/ca` o con un
+/// valor ilegible, el relleno es opaco, que es como se leen los archivos
+/// guardados antes de que existiera la opacidad.
+fn appearance_fill_alpha(document: &Document, dictionary: &Dictionary) -> f64 {
+    let alpha = dictionary
+        .get(b"AP")
+        .ok()
+        .and_then(|value| resolve(document, value))
+        .and_then(|value| value.as_dict().ok())
+        .and_then(|appearance| appearance.get(b"N").ok())
+        .and_then(|value| resolve(document, value))
+        .and_then(|normal| match normal {
+            // La apariencia es un form XObject, que es lo que escribimos.
+            Object::Stream(form) => form.dict.get(b"Resources").ok(),
+            // `/N` también puede ser un diccionario de estados; se usa el que
+            // traiga sus recursos, que es donde vive el estado de transparencia.
+            Object::Dictionary(states) => states.get(b"Resources").ok().or_else(|| {
+                states
+                    .as_hashmap()
+                    .values()
+                    .find_map(|state| state.as_dict().ok()?.get(b"Resources").ok())
+            }),
+            _ => None,
+        })
+        .and_then(|value| resolve(document, value))
+        .and_then(|resources| resources.as_dict().ok()?.get(b"ExtGState").ok())
+        .and_then(|value| resolve(document, value))
+        .and_then(|states| states.as_dict().ok()?.get(FILL_STATE.as_bytes()).ok())
+        .and_then(|value| resolve(document, value))
+        .and_then(|state| state.as_dict().ok()?.get(b"ca").ok())
+        .and_then(|value| resolve(document, value))
+        .and_then(|value| value.as_float().ok())
+        .map(f64::from);
+    alpha.map_or(1.0, clamp_fill_alpha)
 }
 
 /// Tipo de una `/Line` según su `/LE`: si alguno de sus finales es una flecha
@@ -3780,12 +3963,67 @@ mod tests {
         );
     }
 
+    /// `/AP /N` de una anotación: el form XObject con el contenido de la
+    /// apariencia propia.
+    fn appearance_of<'a>(document: &'a Document, annotation: &'a Dictionary) -> &'a Stream {
+        let appearance = annotation
+            .get(b"AP")
+            .expect("la forma rellena lleva una apariencia")
+            .as_dict()
+            .expect("/AP es un diccionario");
+        let normal = match appearance.get(b"N").expect("/AP /N") {
+            Object::Reference(id) => document.get_object(*id).expect("el form existe"),
+            other => other,
+        };
+        normal.as_stream().expect("la apariencia es un form XObject")
+    }
+
+    /// Contenido de la apariencia de una forma, descomprimido.
+    fn appearance_content(document: &Document, annotation: &Dictionary) -> String {
+        let content = appearance_of(document, annotation)
+            .decompressed_content()
+            .expect("descomprimir la apariencia");
+        String::from_utf8(content).expect("el contenido de la apariencia es texto")
+    }
+
+    /// `/ca` del `/GS0` de la apariencia de una forma, que es su opacidad.
+    fn appearance_alpha(document: &Document, annotation: &Dictionary) -> f64 {
+        let form = appearance_of(document, annotation);
+        let resources = form
+            .dict
+            .get(b"Resources")
+            .expect("Resources")
+            .as_dict()
+            .expect("Resources es un diccionario");
+        let states = resources
+            .get(b"ExtGState")
+            .expect("ExtGState")
+            .as_dict()
+            .expect("ExtGState es un diccionario");
+        let state = match states.get(b"GS0").expect("/GS0") {
+            Object::Reference(id) => document.get_object(*id).expect("el estado existe"),
+            other => other,
+        };
+        f64::from(
+            state
+                .as_dict()
+                .expect("el estado es un diccionario")
+                .get(b"ca")
+                .expect("ca")
+                .as_float()
+                .expect("ca es un número"),
+        )
+    }
+
     #[test]
-    fn only_a_filled_shape_writes_its_interior_colour() {
+    fn a_filled_shape_writes_its_fill_colour_its_appearance_and_its_opacity() {
         let source = scratch("fill.pdf");
         let target = scratch("fill-out.pdf");
         std::fs::write(&source, fixture([0.0, 0.0, 300.0, 200.0], 0)).expect("escribir el PDF");
 
+        // Relleno con un color distinto del contorno y una opacidad parcial: es
+        // lo que tiene que quedar en `/IC` y en el `/ca` de la apariencia.
+        let fill = ShapeFill::new([0.9, 0.1, 0.2], 0.4);
         let rectangle = Shape::new(
             0,
             ShapeKind::Rectangle,
@@ -3794,7 +4032,7 @@ mod tests {
             [0.0, 0.0, 1.0],
             2.0,
         )
-        .with_fill(true);
+        .with_fill(Some(fill));
         let plain = Shape::new(
             0,
             ShapeKind::Rectangle,
@@ -3808,10 +4046,10 @@ mod tests {
             ShapeKind::Ellipse,
             (20.0, 80.0),
             (80.0, 140.0),
-            [1.0, 0.0, 0.0],
+            [0.0, 0.5, 0.0],
             3.0,
         )
-        .with_fill(true);
+        .with_fill(Some(ShapeFill::new([1.0, 0.0, 0.0], 1.0)));
         let line = Shape::new(
             0,
             ShapeKind::Line,
@@ -3820,7 +4058,7 @@ mod tests {
             [1.0, 0.0, 1.0],
             1.5,
         )
-        .with_fill(true);
+        .with_fill(Some(fill));
 
         write_fresh(
             &source,
@@ -3839,42 +4077,110 @@ mod tests {
         let annotations = document.get_page_annotations(page_id).expect("anotaciones");
         assert_eq!(annotations.len(), 4);
 
+        // `/IC` lleva el color del relleno y `/C` el del contorno: los dos son
+        // independientes.
+        let interior = numbers(annotations[0], b"IC");
+        assert_eq!(interior.len(), 3, "el interior es un color de tres componentes");
+        for (got, want) in interior.iter().zip(fill.color) {
+            assert!(
+                (got - want).abs() < 0.01,
+                "el interior lleva el color del relleno: {interior:?}"
+            );
+        }
         assert_eq!(
-            numbers(annotations[0], b"IC"),
+            numbers(annotations[0], b"C"),
             vec![0.0, 0.0, 1.0],
-            "el interior del rectángulo lleva el mismo color que /C"
+            "el contorno conserva su color en /C"
         );
-        assert_eq!(numbers(annotations[0], b"C"), vec![0.0, 0.0, 1.0]);
+
+        // La apariencia propia: `/BBox` igual a `/Rect` y el `/GS0` con el alfa
+        // del relleno y el contorno opaco.
+        let form = appearance_of(&document, annotations[0]);
+        let bbox = form
+            .dict
+            .get(b"BBox")
+            .expect("BBox")
+            .as_array()
+            .expect("BBox es una lista")
+            .iter()
+            .map(|value| f64::from(value.as_float().expect("número")))
+            .collect::<Vec<f64>>();
+        assert_eq!(
+            bbox,
+            numbers(annotations[0], b"Rect"),
+            "el /BBox de la apariencia es el /Rect de la anotación"
+        );
+        let alpha = appearance_alpha(&document, annotations[0]);
+        assert!(
+            (alpha - 0.4).abs() < 0.01,
+            "la opacidad del relleno viaja en el /ca del ExtGState: {alpha}"
+        );
+
+        // El contenido pinta primero el interior con `rg` del color de relleno y
+        // el alfa de `/GS0`, y después el contorno con `RG` y su grosor.
+        let content = appearance_content(&document, annotations[0]);
+        assert!(
+            content.contains("/GS0 gs"),
+            "el interior usa el estado translúcido: {content}"
+        );
+        assert!(
+            content.contains("0.9 0.1 0.2 rg"),
+            "el interior se pinta con el color del relleno: {content}"
+        );
+        assert!(
+            content.contains("0 0 1 RG"),
+            "el contorno se pinta con el color del trazo: {content}"
+        );
+        assert!(
+            content.contains("2 w"),
+            "el contorno lleva el grosor de la forma: {content}"
+        );
+        assert!(
+            content.contains(" re "),
+            "el rectángulo se dibuja con `re`: {content}"
+        );
+
+        // La elipse se dibuja con curvas de Bézier, no con un rectángulo.
+        let ellipse_content = appearance_content(&document, annotations[2]);
+        assert!(
+            ellipse_content.contains(" c "),
+            "la elipse se dibuja con curvas de Bézier: {ellipse_content}"
+        );
+        assert!(
+            !ellipse_content.contains(" re "),
+            "la elipse no se dibuja como una caja: {ellipse_content}"
+        );
+
+        // Sin relleno no hay ni `/IC` ni `/AP`, y la línea no los escribe aunque
+        // se le pida relleno: su tipo no tiene interior.
         assert!(
             annotations[1].get(b"IC").is_err(),
             "una forma sin relleno no escribe /IC"
         );
         assert!(
+            annotations[1].get(b"AP").is_err(),
+            "una forma sin relleno no escribe /AP"
+        );
+        assert!(
             annotations[1].get(b"C").is_ok(),
             "el color del trazo se sigue escribiendo en /C"
         );
-        assert_eq!(
-            numbers(annotations[2], b"IC"),
-            vec![1.0, 0.0, 0.0],
-            "la elipse rellena también lleva su interior"
-        );
-        assert!(
-            annotations[3].get(b"IC").is_err(),
-            "la línea no escribe /IC aunque se le pida relleno"
-        );
+        assert!(annotations[3].get(b"IC").is_err(), "la línea no escribe /IC");
+        assert!(annotations[3].get(b"AP").is_err(), "la línea no escribe /AP");
     }
 
     #[test]
-    fn a_filled_rectangle_and_ellipse_come_back_filled() {
+    fn a_fill_with_its_own_colour_and_its_opacity_comes_back_whole() {
+        let fill = ShapeFill::new([0.2, 0.6, 0.9], 0.4);
         let filled = Shape::new(
             0,
             ShapeKind::Rectangle,
             (20.0, 80.0),
             (80.0, 120.0),
-            [0.0, 0.0, 1.0],
+            [0.0, 0.0, 0.0],
             2.0,
         )
-        .with_fill(true);
+        .with_fill(Some(fill));
         let plain = Shape::new(
             0,
             ShapeKind::Rectangle,
@@ -3891,7 +4197,7 @@ mod tests {
             [1.0, 0.0, 0.0],
             3.0,
         )
-        .with_fill(true);
+        .with_fill(Some(fill));
         let current = vec![
             owned("mlnpdf-ida-relleno", Annotation::Shape(filled)),
             owned("mlnpdf-ida-sin-relleno", Annotation::Shape(plain)),
@@ -3908,20 +4214,47 @@ mod tests {
             Annotation::Shape(shape) => shape.clone(),
             other => panic!("se esperaba una forma y se leyó {other:?}"),
         };
-        assert!(shape_of(&read[0]).filled, "el rectángulo vuelve relleno");
+
+        let back = shape_of(&read[0]);
+        let read_fill = back.fill.expect("el rectángulo vuelve relleno");
+        for (got, want) in read_fill.color.iter().zip(fill.color) {
+            assert!(
+                (got - want).abs() < 0.01,
+                "el color del relleno vuelve igual: {read_fill:?}"
+            );
+        }
         assert!(
-            !shape_of(&read[1]).filled,
+            (read_fill.alpha - 0.4).abs() < 0.01,
+            "la opacidad del relleno vuelve igual: {read_fill:?}"
+        );
+        assert_eq!(
+            back.color, [0.0, 0.0, 0.0],
+            "el color del contorno vuelve separado del relleno"
+        );
+
+        assert_eq!(
+            shape_of(&read[1]).fill,
+            None,
             "sin /IC la forma vuelve sin relleno"
         );
+
+        let read_ellipse = shape_of(&read[2]);
+        assert_eq!(
+            read_ellipse.kind,
+            ShapeKind::Ellipse,
+            "la elipse vuelve y sigue siendo una elipse"
+        );
         assert!(
-            shape_of(&read[2]).filled && shape_of(&read[2]).kind == ShapeKind::Ellipse,
-            "la elipse vuelve rellena y sigue siendo una elipse"
+            read_ellipse.fill.is_some_and(|fill| (fill.alpha - 0.4).abs() < 0.01),
+            "la elipse vuelve rellena y con su opacidad"
         );
     }
 
-    /// PDF con cuatro anotaciones propias escritas a mano: un `/Square` con su
-    /// interior `/IC`, uno sin él, uno con un `/IC` malformado y una `/Line` con
-    /// `/IC`, que su tipo no admite.
+    /// PDF con seis anotaciones propias escritas a mano: un `/Square` con su
+    /// interior `/IC` y sin apariencia, uno sin relleno, uno con un `/IC`
+    /// malformado, una `/Line` con `/IC`, que su tipo no admite, un `/Circle` con
+    /// `/IC` y una apariencia que declara su opacidad en `/GS0`, y otro `/Square`
+    /// con una apariencia cuyo estado no trae `/ca`.
     fn interior_fixture() -> Vec<u8> {
         let mut document = Document::load_mem(&fixture([0.0, 0.0, 200.0, 200.0], 0))
             .expect("cargar el fixture");
@@ -3959,10 +4292,64 @@ mod tests {
             "C" => Object::Array(vec![0.into(), 0.into(), 0.into()]),
             "IC" => Object::Array(vec![1.into(), 0.into(), 0.into()]),
         });
+        // Apariencia de otro programa: `/N` es un diccionario con sus recursos y
+        // el estado `/GS0` con la opacidad del relleno.
+        let mut state = Dictionary::new();
+        state.set("ca", Object::Real(0.25));
+        state.set("CA", Object::Real(1.0));
+        let mut states = Dictionary::new();
+        states.set("GS0", Object::Dictionary(state));
+        let mut resources = Dictionary::new();
+        resources.set("ExtGState", Object::Dictionary(states));
+        let mut normal = Dictionary::new();
+        normal.set("Resources", Object::Dictionary(resources));
+        let mut appearance = Dictionary::new();
+        appearance.set("N", Object::Dictionary(normal));
+        let translucent = Object::Dictionary(dictionary! {
+            "Type" => "Annot",
+            "Subtype" => "Circle",
+            "NM" => Object::string_literal("mlnpdf-relleno-translucido"),
+            "Rect" => Object::Array(vec![70.into(), 80.into(), 120.into(), 130.into()]),
+            "C" => Object::Array(vec![0.into(), 0.into(), 0.into()]),
+            "IC" => Object::Array(vec![0.into(), 0.into(), 1.into()]),
+            "AP" => Object::Dictionary(appearance),
+            "F" => Object::Integer(4),
+        });
+        // Apariencia sin `/ca`: el relleno tiene que leerse opaco.
+        let mut opaque_state = Dictionary::new();
+        opaque_state.set("CA", Object::Real(1.0));
+        let mut opaque_states = Dictionary::new();
+        opaque_states.set("GS0", Object::Dictionary(opaque_state));
+        let mut opaque_resources = Dictionary::new();
+        opaque_resources.set("ExtGState", Object::Dictionary(opaque_states));
+        let mut opaque_normal = Dictionary::new();
+        opaque_normal.set("Resources", Object::Dictionary(opaque_resources));
+        let mut opaque_appearance = Dictionary::new();
+        opaque_appearance.set("N", Object::Dictionary(opaque_normal));
+        let without_alpha = Object::Dictionary(dictionary! {
+            "Type" => "Annot",
+            "Subtype" => "Square",
+            "NM" => Object::string_literal("mlnpdf-relleno-sin-alfa"),
+            "Rect" => Object::Array(vec![130.into(), 80.into(), 180.into(), 130.into()]),
+            "C" => Object::Array(vec![0.into(), 0.into(), 0.into()]),
+            "IC" => Object::Array(vec![0.into(), 1.into(), 0.into()]),
+            "AP" => Object::Dictionary(opaque_appearance),
+            "F" => Object::Integer(4),
+        });
         document
             .get_dictionary_mut(page_id)
             .expect("página")
-            .set("Annots", Object::Array(vec![filled, plain, malformed, line]));
+            .set(
+                "Annots",
+                Object::Array(vec![
+                    filled,
+                    plain,
+                    malformed,
+                    line,
+                    translucent,
+                    without_alpha,
+                ]),
+            );
 
         let mut bytes = Vec::new();
         document.save_to(&mut bytes).expect("serializar el fixture");
@@ -3975,36 +4362,56 @@ mod tests {
         std::fs::write(&path, interior_fixture()).expect("escribir el fixture");
 
         let read = read_annotations(&path).expect("leer las anotaciones propias");
-        assert_eq!(read.len(), 4, "vuelven las cuatro anotaciones: {read:?}");
+        assert_eq!(read.len(), 6, "vuelven las seis anotaciones: {read:?}");
         let shape_of = |index: usize| match &read[index].1 {
             Annotation::Shape(shape) => shape.clone(),
             other => panic!("se esperaba una forma y se leyó {other:?}"),
         };
-        assert!(
-            shape_of(0).filled,
-            "un /IC de tres componentes marca la forma como rellena"
+        let fill_of = |index: usize| shape_of(index).fill;
+
+        let first = fill_of(0).expect("un /IC de tres componentes marca la forma rellena");
+        assert_eq!(first.color, [1.0, 0.0, 0.0], "el color de relleno sale de /IC");
+        assert_eq!(
+            first.alpha, 1.0,
+            "sin apariencia el relleno se lee opaco, como los archivos de antes"
         );
-        assert!(!shape_of(1).filled, "sin /IC la forma se lee sin relleno");
-        assert!(!shape_of(2).filled, "un /IC malformado no cuenta como relleno");
+        assert_eq!(fill_of(1), None, "sin /IC la forma se lee sin relleno");
+        assert_eq!(
+            fill_of(2),
+            None,
+            "un /IC malformado no cuenta como relleno"
+        );
         assert_eq!(shape_of(3).kind, ShapeKind::Line, "la cuarta es una línea");
-        assert!(
-            !shape_of(3).filled,
+        assert_eq!(
+            fill_of(3),
+            None,
             "la línea se lee sin relleno aunque el archivo traiga /IC"
+        );
+
+        let translucent = fill_of(4).expect("el /Circle trae su interior");
+        assert_eq!(
+            translucent.color,
+            [0.0, 0.0, 1.0],
+            "el color del relleno sale de /IC"
+        );
+        assert!(
+            (translucent.alpha - 0.25).abs() < 0.01,
+            "la opacidad sale del /ca del ExtGState de la apariencia: {translucent:?}"
+        );
+
+        let without_alpha = fill_of(5).expect("el /Square también trae su interior");
+        assert_eq!(
+            without_alpha.alpha, 1.0,
+            "una apariencia sin /ca deja el relleno opaco"
         );
     }
 
-    /// Cuenta los píxeles rojos estrictamente dentro de `box`, sin la banda de
-    /// `inset` píxeles del borde, en la página rasterizada con poppler.
-    fn red_pixels_inside(
-        bytes: &[u8],
-        size: (f64, f64),
-        page_box: (i32, i32, i32, i32),
-        inset: i32,
-    ) -> usize {
+    /// Página rasterizada con poppler sobre papel blanco.
+    fn poppler_page(bytes: &[u8], size: (f64, f64)) -> cairo::ImageSurface {
         let document = poppler::Document::from_data(bytes, None).expect("poppler abre el PDF");
         let page = document.page(0).expect("página 0");
 
-        let mut surface = cairo::ImageSurface::create(
+        let surface = cairo::ImageSurface::create(
             cairo::Format::ARgb32,
             size.0.ceil() as i32,
             size.1.ceil() as i32,
@@ -4017,7 +4424,31 @@ mod tests {
             page.render(&context);
         }
         surface.flush();
+        surface
+    }
 
+    /// Color de un píxel de la superficie, en orden RGB.
+    fn surface_pixel(surface: &mut cairo::ImageSurface, x: i32, y: i32) -> [u8; 3] {
+        let stride = usize::try_from(surface.stride()).expect("stride");
+        let data = surface.data().expect("píxeles");
+        let offset = y as usize * stride + x as usize * 4;
+        [data[offset + 2], data[offset + 1], data[offset]]
+    }
+
+    /// True cuando el píxel es del rojo del relleno de las pruebas, no del papel.
+    fn is_filled_red(pixel: [u8; 3]) -> bool {
+        pixel[0] > 150 && pixel[1] < 120 && pixel[2] < 120
+    }
+
+    /// Cuenta los píxeles rojos estrictamente dentro de `box`, sin la banda de
+    /// `inset` píxeles del borde, en la página rasterizada con poppler.
+    fn red_pixels_inside(
+        bytes: &[u8],
+        size: (f64, f64),
+        page_box: (i32, i32, i32, i32),
+        inset: i32,
+    ) -> usize {
+        let mut surface = poppler_page(bytes, size);
         let stride = usize::try_from(surface.stride()).expect("stride");
         let data = surface.data().expect("píxeles");
         let (x0, y0) = (page_box.0 + inset, page_box.1 + inset);
@@ -4027,7 +4458,7 @@ mod tests {
             for column in x0..x1 {
                 let offset = row as usize * stride + column as usize * 4;
                 let (blue, green, red) = (data[offset], data[offset + 1], data[offset + 2]);
-                if red > 150 && green < 120 && blue < 120 {
+                if is_filled_red([red, green, blue]) {
                     found += 1;
                 }
             }
@@ -4076,7 +4507,9 @@ mod tests {
         write_fresh(
             &source,
             &filled_target,
-            &[Annotation::Shape(rectangle.with_fill(true))],
+            &[Annotation::Shape(
+                rectangle.with_fill(Some(ShapeFill::new([1.0, 0.0, 0.0], 1.0))),
+            )],
         )
         .expect("la forma rellena tiene que escribirse");
         let filled = red_pixels_inside(
@@ -4088,6 +4521,89 @@ mod tests {
         assert!(
             filled > 1000,
             "poppler pinta el interior de la forma rellena: {filled} píxeles"
+        );
+    }
+
+    #[test]
+    fn poppler_blends_the_translucent_fill_with_the_paper() {
+        // La prueba de que la opacidad llega al archivo y se entrelaza: el mismo
+        // rectángulo con relleno rojo al 40 % sobre papel blanco tiene que dar un
+        // rojo intermedio entre el rojo puro y el blanco, no el rojo puro de un
+        // relleno opaco.
+        let source = scratch("fill-alpha.pdf");
+        let target = scratch("fill-alpha-out.pdf");
+        std::fs::write(&source, fixture([0.0, 0.0, 300.0, 200.0], 0)).expect("escribir el PDF");
+
+        let rectangle = Shape::new(
+            0,
+            ShapeKind::Rectangle,
+            (40.0, 80.0),
+            (160.0, 160.0),
+            [0.0, 0.0, 0.0],
+            2.0,
+        )
+        .with_fill(Some(ShapeFill::new([1.0, 0.0, 0.0], 0.4)));
+        write_fresh(&source, &target, &[Annotation::Shape(rectangle)])
+            .expect("la forma translúcida tiene que escribirse");
+
+        let mut surface = poppler_page(&std::fs::read(&target).expect("resultado"), (300.0, 200.0));
+        let [red, green, blue] = surface_pixel(&mut surface, 100, 120);
+        assert!(
+            red > 200,
+            "el interior conserva el rojo del relleno: {red}"
+        );
+        assert!(
+            (100..=200).contains(&green),
+            "el relleno al 40 % deja ver el papel en el verde: {green}"
+        );
+        assert!(
+            (100..=200).contains(&blue),
+            "el azul también se mezcla con el papel: {blue}"
+        );
+    }
+
+    #[test]
+    fn poppler_paints_a_filled_ellipse_round() {
+        // Una elipse rellena ocupa π/4 de su caja: si se pintara como un
+        // rectángulo la fracción sería 1, y un polígono tosco se alejaría del
+        // valor. Las esquinas de la caja quedan del color del papel.
+        let source = scratch("fill-round.pdf");
+        let target = scratch("fill-round-out.pdf");
+        std::fs::write(&source, fixture([0.0, 0.0, 300.0, 200.0], 0)).expect("escribir el PDF");
+
+        let ellipse = Shape::new(
+            0,
+            ShapeKind::Ellipse,
+            (40.0, 40.0),
+            (160.0, 160.0),
+            [0.0, 0.0, 0.0],
+            1.0,
+        )
+        .with_fill(Some(ShapeFill::new([1.0, 0.0, 0.0], 1.0)));
+        write_fresh(&source, &target, &[Annotation::Shape(ellipse)])
+            .expect("la elipse rellena tiene que escribirse");
+
+        let bytes = std::fs::read(&target).expect("resultado");
+        let mut surface = poppler_page(&bytes, (300.0, 200.0));
+        assert!(
+            is_filled_red(surface_pixel(&mut surface, 100, 100)),
+            "el centro de la elipse se pinta"
+        );
+        assert!(
+            !is_filled_red(surface_pixel(&mut surface, 44, 44)),
+            "la esquina de la caja queda fuera de la elipse"
+        );
+
+        // La fracción pintada de la caja, sin su banda de borde, es la de un
+        // círculo inscrito: π/4 ≈ 0,785. La tolerancia cubre el redondeo de los
+        // píxeles y el borde, que se pinta de negro.
+        let inset = 2;
+        let painted = red_pixels_inside(&bytes, (300.0, 200.0), (40, 40, 160, 160), inset);
+        let area = i32::pow(160 - 40 - 2 * inset, 2) as f64;
+        let fraction = painted as f64 / area;
+        assert!(
+            (0.70..=0.85).contains(&fraction),
+            "la elipse ocupa π/4 de su caja y no la llena: {fraction}"
         );
     }
 

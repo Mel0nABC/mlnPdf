@@ -33,8 +33,8 @@ mod tests {
     use crate::engine::annotation::{
         Annotation, Corner, DoubleClickAction, FontChoice, IMAGE_BOX_FRACTION, ImageNote,
         ImagePixels, InkStroke, MarkKind, NOTE_COLOR, STAMP_SIZE, STICKY_COLOR, STICKY_SIDE,
-        STROKE_MAX_WIDTH, STROKE_MIN_WIDTH, Shape, ShapeKind, Stamp, StampKind, StickyNote,
-        TextMark, TextNote, TextRun, double_click_action,
+        STROKE_MAX_WIDTH, STROKE_MIN_WIDTH, Shape, ShapeFill, ShapeKind, Stamp, StampKind,
+        StickyNote, TextMark, TextNote, TextRun, double_click_action,
     };
     use crate::services::annotations::{open_for_editing, read_annotations, write_annotations};
     use crate::ui::shell::*;
@@ -3813,12 +3813,17 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         assert!(viewer.undo(), "mover un extremo se deshace de una vez");
         assert_eq!(shape_of(&viewer, &handle_arrow), arrow);
 
-        // S5 (T9): el relleno del rectángulo y de la elipse. La casilla está en el
-        // popover de dibujo, debajo del grosor, y se recuerda entre trazos.
+        // S6 y S7 (T12): el relleno tiene color propio y opacidad. La casilla, su
+        // propia fila de muestras y la barra de opacidad viven en el popover de
+        // dibujo, y las tres cosas se recuerdan entre trazos.
         viewer.discard_edits();
         viewer.apply_zoom(1.0);
         viewer.clear_selection();
         let fill_check = viewer.ui.stroke_fill.clone();
+        let fill_section = viewer.ui.stroke_fill_section.clone();
+        let fill_color = viewer.ui.stroke_fill_color.clone();
+        let fill_opacity = viewer.ui.stroke_fill_opacity.clone();
+        let fill_opacity_label = viewer.ui.stroke_fill_opacity_label.clone();
         assert_eq!(
             fill_check.label().as_deref(),
             Some("Rellenar"),
@@ -3826,8 +3831,8 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         );
         assert_eq!(
             fill_check.tooltip_text().as_deref(),
-            Some("Rellenar el rectángulo y la elipse con el color del trazo"),
-            "la casilla explica qué rellena y con qué color"
+            Some("Rellenar el rectángulo y la elipse con el color y la opacidad de abajo"),
+            "la casilla dice con qué se rellena"
         );
         assert_eq!(
             check_button(stroke_popover.upcast_ref::<gtk::Widget>()),
@@ -3838,13 +3843,57 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             !fill_check.is_active(),
             "arranca desmarcada: el relleno es opcional"
         );
+        assert_eq!(
+            fill_color.value.get(),
+            FILL_COLOR,
+            "el color del relleno es propio y arranca con su valor"
+        );
+        assert!((fill_opacity.value() - FILL_OPACITY).abs() < 0.01);
+        assert_eq!(
+            fill_opacity_label.label().to_string(),
+            "100 %",
+            "la etiqueta dice el porcentaje de la opacidad"
+        );
+        let adjustment = fill_opacity.adjustment();
+        assert!((adjustment.lower() - FILL_OPACITY_MIN).abs() < 0.01);
+        assert!((adjustment.upper() - FILL_OPACITY).abs() < 0.01);
+        assert!((adjustment.step_increment() - FILL_OPACITY_STEP).abs() < 0.01);
+        assert_eq!(
+            fill_color.presets.len(),
+            STROKE_PALETTE.len(),
+            "el relleno tiene su propia fila de muestras"
+        );
 
-        // Con el rectángulo armado la casilla se habilita; la forma se guarda con
-        // relleno y su interior se pinta con el color del trazo.
+        // El color del relleno se elige en su propia fila y no toca el del trazo;
+        // la barra de opacidad baja hasta el 40 % y su etiqueta lo muestra.
+        let stroke_colour = viewer.ui.stroke_color.value.get();
+        fill_color.presets[6].emit_by_name::<()>("clicked", &[]);
+        assert_eq!(
+            fill_color.value.get(),
+            STROKE_PALETTE[6].1,
+            "la muestra del relleno elige su color"
+        );
+        assert_eq!(
+            viewer.ui.stroke_color.value.get(),
+            stroke_colour,
+            "el color del trazo no cambia al elegir el del relleno"
+        );
+        fill_opacity.set_value(40.0);
+        assert_eq!(
+            fill_opacity_label.label().to_string(),
+            "40 %",
+            "la etiqueta sigue a la barra"
+        );
+
+        // El relleno configurado viaja a la forma: color propio y opacidad 40 %.
+        let fill = ShapeFill::new(
+            [STROKE_PALETTE[6].1.0, STROKE_PALETTE[6].1.1, STROKE_PALETTE[6].1.2],
+            0.4,
+        );
         viewer.start_stroke_tool(StrokeKind::Shape(ShapeKind::Rectangle));
         assert!(
-            fill_check.is_sensitive(),
-            "con el rectángulo armado la casilla se habilita"
+            fill_section.is_sensitive(),
+            "con el rectángulo armado la sección de relleno se habilita"
         );
         fill_check.set_active(true);
         assert!(
@@ -3858,27 +3907,48 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         assert!(viewer.stroke_drag_end(), "soltar cierra la forma");
         let filled_rect_id = edit_id(&viewer, 0);
         let filled_rect = shape_of(&viewer, &filled_rect_id);
-        assert!(filled_rect.filled, "la forma se guarda con relleno");
+        assert_eq!(
+            filled_rect.fill,
+            Some(fill),
+            "la forma se guarda con el color y la opacidad configurados"
+        );
+        assert_eq!(
+            filled_rect.color,
+            [stroke_colour.0, stroke_colour.1, stroke_colour.2],
+            "el contorno conserva el color del trazo, distinto del relleno"
+        );
         assert_eq!(
             (filled_rect.from, filled_rect.to),
             ((30.0, 30.0), (120.0, 100.0)),
             "el relleno no cambia la geometría de la forma"
         );
+
         let side = 200usize;
-        // El interior se pinta con el color del propio trazo, sea cual sea el que
-        // el popover tenga elegido en este punto de la prueba.
-        let same_colour = |pixel: [u8; 3], shape: &Shape| {
-            pixel
-                .iter()
-                .zip(shape.color)
-                .all(|(channel, want)| (f64::from(*channel) - want * 255.0).abs() <= 2.0)
+        // Mezcla del color sobre el papel blanco: es lo que tiene que quedar en el
+        // interior cuando el relleno es translúcido.
+        let mixed_with_paper = |pixel: [u8; 3], color: [f64; 3], alpha: f64| {
+            pixel.iter().zip(color).all(|(channel, want)| {
+                let blend = want * alpha + (1.0 - alpha);
+                (f64::from(*channel) - blend * 255.0).abs() <= 4.0
+            })
         };
-        let filled_pixels = annotation_pixels(&viewer, 0, side, side);
-        let filled_interior = filled_pixels[65 * side + 75];
+        let painted = annotation_pixels(&viewer, 0, side, side);
+        let interior = painted[65 * side + 75];
         assert!(
-            same_colour(filled_interior, &filled_rect),
-            "el interior del rectángulo relleno se pinta con el color del trazo: \
-             {filled_interior:?}"
+            mixed_with_paper(interior, fill.color, fill.alpha),
+            "el interior es la mezcla del color de relleno con el papel: {interior:?}"
+        );
+        assert!(
+            interior[1] > 150,
+            "el interior no se pinta con el color del trazo: {interior:?}"
+        );
+        let border = painted[30 * side + 75];
+        assert!(
+            border
+                .iter()
+                .zip(filled_rect.color)
+                .all(|(channel, want)| (f64::from(*channel) - want * 255.0).abs() <= 4.0),
+            "el contorno se pinta con el color del trazo y opacidad total: {border:?}"
         );
 
         // La misma forma con la casilla desmarcada: solo el borde, el interior
@@ -3896,20 +3966,22 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         assert!(viewer.stroke_drag_end(), "soltar cierra la forma");
         viewer.escape_pressed();
         let plain_rect_id = edit_id(&viewer, 1);
-        assert!(
-            !shape_of(&viewer, &plain_rect_id).filled,
+        assert_eq!(
+            shape_of(&viewer, &plain_rect_id).fill,
+            None,
             "sin la casilla la forma no se rellena"
         );
         let plain_pixels = annotation_pixels(&viewer, 0, side, side);
-        let plain_interior = plain_pixels[145 * side + 75];
         assert!(
-            plain_interior.iter().all(|channel| *channel > 240),
-            "sin relleno el interior queda del color del papel: {plain_interior:?}"
+            plain_pixels[145 * side + 75]
+                .iter()
+                .all(|channel| *channel > 240),
+            "sin relleno el interior queda del color del papel: {:?}",
+            plain_pixels[145 * side + 75]
         );
 
-        // La elipse rellena es una elipse de verdad: el centro se pinta y la
-        // esquina de su caja queda del color del papel, así que el relleno no es
-        // un rectángulo ni un polígono tosco.
+        // La elipse rellena es una elipse de verdad y también lleva la opacidad
+        // configurada: el centro se pinta y la esquina de su caja no.
         viewer.start_stroke_tool(StrokeKind::Shape(ShapeKind::Ellipse));
         fill_check.set_active(true);
         assert!(
@@ -3923,11 +3995,15 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         assert!(viewer.stroke_drag_end(), "soltar cierra la elipse");
         viewer.escape_pressed();
         let filled_ellipse = shape_of(&viewer, &edit_id(&viewer, 2));
-        assert!(filled_ellipse.filled, "la elipse se guarda con relleno");
+        assert_eq!(
+            filled_ellipse.fill,
+            Some(fill),
+            "la elipse se guarda con el relleno configurado"
+        );
         let ellipse_pixels = annotation_pixels(&viewer, 0, side, side);
         assert!(
-            same_colour(ellipse_pixels[60 * side + 160], &filled_ellipse),
-            "el centro de la elipse rellena se pinta"
+            mixed_with_paper(ellipse_pixels[60 * side + 160], fill.color, fill.alpha),
+            "el centro de la elipse rellena se pinta con la mezcla del relleno"
         );
         assert!(
             ellipse_pixels[35 * side + 135]
@@ -3938,8 +4014,8 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         );
         fill_check.set_active(false);
 
-        // La casilla se deshabilita en las herramientas sin interior y vuelve a
-        // habilitarse en la elipse, que sí lo tiene. Su estado se recuerda.
+        // La sección se deshabilita en las herramientas sin interior y vuelve a
+        // habilitarse en las que lo tienen; su estado se recuerda.
         for (kind, sensitive) in [
             (StrokeKind::Shape(ShapeKind::Line), false),
             (StrokeKind::Shape(ShapeKind::Arrow), false),
@@ -3949,19 +4025,25 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         ] {
             viewer.start_stroke_tool(kind);
             assert_eq!(
-                fill_check.is_sensitive(),
+                fill_section.is_sensitive(),
                 sensitive,
-                "la casilla y la herramienta {kind:?}"
+                "la sección de relleno y la herramienta {kind:?}"
             );
         }
+        assert!(!fill_check.is_active(), "el estado de la casilla se recuerda");
+        assert_eq!(
+            fill_color.value.get(),
+            STROKE_PALETTE[6].1,
+            "el color del relleno se recuerda"
+        );
         assert!(
-            !fill_check.is_active(),
-            "el estado de la casilla se recuerda entre herramientas"
+            (fill_opacity.value() - 40.0).abs() < 0.01,
+            "la opacidad del relleno se recuerda"
         );
         viewer.escape_pressed();
 
-        // El menú contextual de una forma ya colocada ofrece «Rellenar», y un solo
-        // deshacer lo revierte.
+        // «Rellenar» del menú contextual aplica el color y la opacidad que el
+        // popover tiene configurados ahora, con una sola instantánea de deshacer.
         viewer.select_annotation(Some(plain_rect_id.clone()));
         let fill_anchor = viewer.doc.slots.borrow()[0].canvas.clone();
         let plain_menu =
@@ -3975,9 +4057,10 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             .expect("el menú ofrece el botón de relleno");
         let undo_before = viewer.annot.undo_stack.borrow().len();
         fill_button.emit_by_name::<()>("clicked", &[]);
-        assert!(
-            shape_of(&viewer, &plain_rect_id).filled,
-            "el botón rellena la forma ya dibujada"
+        assert_eq!(
+            shape_of(&viewer, &plain_rect_id).fill,
+            Some(fill),
+            "el botón rellena la forma ya dibujada con el relleno configurado"
         );
         assert_eq!(
             viewer.annot.undo_stack.borrow().len(),
@@ -3986,17 +4069,18 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         );
         let refilled = annotation_pixels(&viewer, 0, side, side);
         assert!(
-            same_colour(refilled[145 * side + 75], &shape_of(&viewer, &plain_rect_id)),
-            "el interior se repinta con el relleno"
+            mixed_with_paper(refilled[145 * side + 75], fill.color, fill.alpha),
+            "el interior se repinta con la mezcla del relleno configurado"
         );
         assert!(viewer.undo(), "un solo deshacer quita el relleno");
-        assert!(
-            !shape_of(&viewer, &plain_rect_id).filled,
+        assert_eq!(
+            shape_of(&viewer, &plain_rect_id).fill,
+            None,
             "deshacer deja la forma como estaba, sin relleno"
         );
         drop(plain_menu);
 
-        // Con la forma rellena el menú ofrece quitar el relleno.
+        // «Quitar relleno» deja la forma hueca, también con una sola instantánea.
         viewer.select_annotation(Some(filled_rect_id.clone()));
         let filled_menu =
             viewer.open_annotation_menu(filled_rect_id.clone(), &fill_anchor, 20.0, 20.0);
@@ -4005,24 +4089,51 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             filled_labels.iter().any(|label| label == "Quitar relleno"),
             "el menú de la forma rellena ofrece «Quitar relleno»: {filled_labels:?}"
         );
-        filled_menu.popdown();
+        let unfill_button =
+            labeled_button(filled_menu.upcast_ref::<gtk::Widget>(), "Quitar relleno")
+                .expect("el menú ofrece quitar el relleno");
+        let undo_before = viewer.annot.undo_stack.borrow().len();
+        unfill_button.emit_by_name::<()>("clicked", &[]);
+        assert_eq!(
+            shape_of(&viewer, &filled_rect_id).fill,
+            None,
+            "«Quitar relleno» deja la forma hueca"
+        );
+        assert_eq!(
+            viewer.annot.undo_stack.borrow().len(),
+            undo_before + 1,
+            "quitar el relleno deja una sola instantánea"
+        );
+        assert!(viewer.undo(), "un solo deshacer devuelve el relleno");
+        assert_eq!(
+            shape_of(&viewer, &filled_rect_id).fill,
+            Some(fill),
+            "deshacer devuelve el relleno con su color y su opacidad"
+        );
+        drop(filled_menu);
 
-        // En una línea el botón no aparece: su tipo no tiene interior.
-        let bare_line = "mlnpdf-relleno-linea".to_string();
-        viewer.annot.edits.borrow_mut().push(Edit {
-            id: bare_line.clone(),
-            value: Annotation::Shape(Shape::new(
-                0,
-                ShapeKind::Line,
-                (20.0, 180.0),
-                (120.0, 180.0),
-                [0.0, 0.0, 0.0],
-                2.0,
-            )),
-        });
+        // En una línea no hay interior: dibujarla con la casilla marcada no la
+        // rellena y su menú no ofrece ninguna de las dos acciones.
+        viewer.start_stroke_tool(StrokeKind::Shape(ShapeKind::Line));
+        fill_check.set_active(true);
+        assert!(
+            viewer.stroke_drag_begin(0, 20.0, 180.0),
+            "el arrastre empieza la línea"
+        );
+        assert!(
+            viewer.stroke_drag_update(0, 100.0, 0.0),
+            "el arrastre alarga la línea"
+        );
+        assert!(viewer.stroke_drag_end(), "soltar cierra la línea");
+        viewer.escape_pressed();
+        let bare_line = edit_id(&viewer, 3);
+        assert_eq!(
+            shape_of(&viewer, &bare_line).fill,
+            None,
+            "una línea no se rellena aunque la casilla esté marcada"
+        );
         viewer.select_annotation(Some(bare_line.clone()));
-        let line_anchor = viewer.doc.slots.borrow()[0].canvas.clone();
-        let line_menu = viewer.open_annotation_menu(bare_line.clone(), &line_anchor, 20.0, 20.0);
+        let line_menu = viewer.open_annotation_menu(bare_line.clone(), &fill_anchor, 20.0, 20.0);
         let line_labels = button_labels(line_menu.upcast_ref::<gtk::Widget>());
         assert!(
             !line_labels
@@ -4031,10 +4142,10 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             "en una línea el menú no ofrece relleno: {line_labels:?}"
         );
         line_menu.popdown();
+        fill_check.set_active(false);
 
-        // El relleno alcanza a todas las formas elegidas que lo admiten, con una
-        // sola instantánea: con la línea y el rectángulo elegidos, el rectángulo se
-        // rellena y la línea queda como está.
+        // Con el rectángulo y la línea elegidos, el relleno alcanza a la forma que
+        // lo admite y deja una sola instantánea, como antes.
         viewer.select_annotation(Some(plain_rect_id.clone()));
         viewer.toggle_annotation_selection(&bare_line);
         assert_eq!(
@@ -4042,17 +4153,19 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             vec![plain_rect_id.clone(), bare_line.clone()],
             "las dos formas quedan elegidas"
         );
-        let both_menu = viewer.open_annotation_menu(bare_line.clone(), &line_anchor, 20.0, 20.0);
+        let both_menu = viewer.open_annotation_menu(bare_line.clone(), &fill_anchor, 20.0, 20.0);
         let both_fill = labeled_button(both_menu.upcast_ref::<gtk::Widget>(), "Rellenar")
             .expect("el conjunto ofrece rellenar la forma que lo admite");
         let undo_before_both = viewer.annot.undo_stack.borrow().len();
         both_fill.emit_by_name::<()>("clicked", &[]);
-        assert!(
-            shape_of(&viewer, &plain_rect_id).filled,
-            "el rectángulo del conjunto se rellena"
+        assert_eq!(
+            shape_of(&viewer, &plain_rect_id).fill,
+            Some(fill),
+            "el rectángulo del conjunto se rellena con el relleno configurado"
         );
-        assert!(
-            !shape_of(&viewer, &bare_line).filled,
+        assert_eq!(
+            shape_of(&viewer, &bare_line).fill,
+            None,
             "la línea del conjunto sigue sin interior"
         );
         assert_eq!(
@@ -4064,15 +4177,35 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             viewer.undo(),
             "el relleno del conjunto se deshace de una vez"
         );
-        assert!(
-            !shape_of(&viewer, &plain_rect_id).filled,
+        assert_eq!(
+            shape_of(&viewer, &plain_rect_id).fill,
+            None,
             "deshacer deja las dos formas como estaban"
         );
         drop(both_menu);
 
-        // El estado queda como estaba: sin formas, sin selección y con la casilla
-        // desmarcada.
+        // El cambio de color de la anotación cambia solo el contorno: el relleno
+        // conserva su color y su opacidad.
+        viewer.select_annotation(Some(filled_rect_id.clone()));
+        assert!(viewer.recolor_selection((0.0, 0.0, 0.0)));
+        let recolored = shape_of(&viewer, &filled_rect_id);
+        assert_eq!(
+            recolored.color,
+            [0.0, 0.0, 0.0],
+            "el contorno toma el color nuevo"
+        );
+        assert_eq!(
+            recolored.fill,
+            Some(fill),
+            "el relleno no cambia al recolorear la forma"
+        );
+        assert!(viewer.undo(), "el cambio de color se deshace de una vez");
+
+        // El estado queda como estaba: sin formas, sin selección, la casilla
+        // desmarcada y el relleno con su color y su opacidad de fábrica.
         fill_check.set_active(false);
+        viewer.set_fill_color(FILL_COLOR);
+        fill_opacity.set_value(FILL_OPACITY);
         viewer.discard_edits();
         assert!(viewer.annot.edits.borrow().is_empty());
         assert!(viewer.selected_ids().is_empty());
