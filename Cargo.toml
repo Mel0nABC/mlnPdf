@@ -2,6 +2,8 @@
 name = "mlnpdf"
 version = "0.1.0"
 edition = "2024"
+# GPL-3.0-or-later: las versiones distribuidas tienen que seguir siendo libres.
+license = "GPL-3.0-or-later"
 
 [dependencies]
 # Published as `gtk4`; renamed to `gtk` (gtk-rs convention).

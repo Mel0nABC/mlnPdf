@@ -219,18 +219,35 @@ título ni acción.
 visible, así que un documento enorme puede tardar un instante en responder), la
 interfaz no es traducible todavía, no hay archivo `.desktop` ni registro MIME, y
 las pruebas automatizadas cubren el motor y el arranque, no cada comando de la
-interfaz. Los marcados (subrayado y resaltado) y las notas de texto se guardan
-reescribiendo el PDF completo (no es un guardado incremental) y se escriben sin
-*appearance stream* (`/AP`), así que el aspecto exacto lo decide cada lector; la
-nota usa una fuente estándar aproximada (`/Helv`, `/TiRo`, `/Cour`) y su texto va
-en una sola línea (sin ajuste automático). Las anotaciones creadas en la sesión se
-pueden mover, borrar y reescribir incluso después de guardarlas, porque cada una
-lleva su `/NM`; al volver a abrir el archivo, en cambio, el visor no reconstruye
-sus anotaciones desde el PDF, así que las anteriores quedan como anotaciones de
-solo lectura de cualquier otro programa. `Ctrl+Z` alcanza a los últimos 20
-cambios de la sesión, no a lo que se hizo antes de cerrar el documento.
+interfaz. Los marcados (subrayado y resaltado), las notas de texto y las imágenes
+se guardan reescribiendo el PDF completo (no es un guardado incremental) y se
+escriben sin *appearance stream* en los dos primeros casos (`/AP`), así que el
+aspecto exacto lo decide cada lector; la nota usa una fuente estándar aproximada
+(`/Helv`, `/TiRo`, `/Cour`) y su texto va en una sola línea (sin ajuste
+automático), y al reabrirla vuelve con una sola fuente y un solo color porque el
+formato `/FreeText` solo admite un `/DA`. Las anotaciones propias llevan su `/NM`,
+así que al volver a abrir el archivo se releen y siguen siendo editables; las de
+otros programas se ven pero no se reescriben. Mientras el documento está abierto
+se guarda en memoria una copia del PDF sin las anotaciones propias, que es la que
+se rasteriza. `Ctrl+Z` alcanza a los últimos 20 cambios de la sesión, no a lo que
+se hizo antes de cerrar el documento.
 
-**Licencia:** todavía sin definir.
+## Licencia
+
+MlnPdf se distribuye bajo la **GNU General Public License, versión 3 o posterior**
+(`GPL-3.0-or-later`). El texto completo está en [LICENSE](LICENSE).
+
+    Copyright (C) 2026 Mel0nABC <alex@alex.es>
+
+Esto significa que puedes usar, estudiar, modificar y redistribuir el programa,
+siempre que las versiones que distribuyas sigan siendo libres bajo la misma
+licencia y conserven el aviso de autoría. Las modificaciones que no distribuyas
+son tuyas y no tienes que publicarlas.
+
+El programa enlaza bibliotecas del sistema con sus propias licencias —poppler es
+GPL-2.0-or-later, y GTK, cairo y pango son LGPL-2.1-or-later—, así que un binario
+compilado y distribuido tiene que ser compatible con la GPL. El detalle está en
+[THIRD-PARTY.md](THIRD-PARTY.md).
 
 ## Siguiente paso
 
