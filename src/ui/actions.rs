@@ -65,8 +65,8 @@ pub const SHORTCUTS: [(&str, &str); 51] = [
     ("<Control><Alt>3", "win.insert-stamp-draft"),
     ("<Control>s", "win.save-annotations"),
     ("<Control><Shift>s", "win.save-annotations-as"),
-    // Sin `<Control>`: es la tecla de borrar la nota elegida. El visor la maneja
-    // en fase de burbuja para que los campos de texto conserven la suya.
+    // Sin `<Control>`: es la tecla de borrar las anotaciones elegidas. El visor
+    // la maneja en fase de burbuja para que los campos de texto conserven la suya.
     ("Delete", "win.note-delete"),
 ];
 
@@ -86,7 +86,7 @@ pub const SHORTCUT_HELP: [(&str, &str); 36] = [
     ("Ctrl+C", "Copiar el texto seleccionado"),
     ("Ctrl+Z", "Deshacer el último marcado sin guardar"),
     ("Ctrl+Shift+Z / Ctrl+Y", "Rehacer el marcado deshecho"),
-    ("Supr", "Borrar la anotación seleccionada"),
+    ("Supr", "Borrar las anotaciones seleccionadas"),
     ("Ctrl+U", "Subrayar el texto seleccionado"),
     ("Ctrl+Shift+U", "Resaltar el texto seleccionado"),
     ("Ctrl+Alt+U", "Tachar el texto seleccionado"),
@@ -131,7 +131,7 @@ pub fn build_menu_bar() -> gtk::PopoverMenuBar {
     edit_menu.append(Some("Deshacer"), Some("win.undo"));
     edit_menu.append(Some("Rehacer"), Some("win.redo"));
     edit_menu.append(Some("Editar texto de la nota"), Some("win.note-edit"));
-    edit_menu.append(Some("Borrar la anotación"), Some("win.note-delete"));
+    edit_menu.append(Some("Borrar las anotaciones"), Some("win.note-delete"));
     edit_menu.append(Some("Buscar…"), Some("win.search"));
     edit_menu.append(Some("Subrayar"), Some("win.underline"));
     edit_menu.append(Some("Resaltar"), Some("win.highlight"));

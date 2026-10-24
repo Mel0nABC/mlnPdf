@@ -478,7 +478,8 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             SHORTCUTS.contains(&("<Control><Alt>n", "win.sticky-note")),
             "la nota adhesiva tiene su atajo, Ctrl+Alt+N"
         );
-        // Las dos acciones que operan sobre la nota elegida van después de Rehacer.
+        // Las dos acciones que operan sobre la anotación elegida van después de
+        // Rehacer; borrar alcanza a todas las que estén en la selección.
         let rehacer = edit_labels
             .iter()
             .position(|label| label == "Rehacer")
@@ -490,8 +491,8 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         );
         assert_eq!(
             edit_labels.get(rehacer + 2).map(String::as_str),
-            Some("Borrar la anotación"),
-            "el menú Edit borra la anotación justo después de editar: {edit_labels:?}"
+            Some("Borrar las anotaciones"),
+            "el menú Edit borra las anotaciones justo después de editar: {edit_labels:?}"
         );
 
         // Help reúne los atajos y el «Acerca de»; el icono de la aplicación se
@@ -856,7 +857,7 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         let strikeout_id = edit_id(&viewer, 4);
         viewer.select_annotation(Some(strikeout_id));
         assert!(
-            viewer.delete_selected_annotation(),
+            viewer.delete_selected_annotations(),
             "el tachado se borra como cualquier marcado"
         );
         assert_eq!(viewer.annot.edits.borrow().len(), 4);
@@ -896,7 +897,7 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             "un marcado se puede borrar"
         );
         assert!(
-            viewer.delete_selected_annotation(),
+            viewer.delete_selected_annotations(),
             "Supr borra el marcado elegido"
         );
         assert_eq!(viewer.annot.edits.borrow().len(), 3);
@@ -1289,8 +1290,8 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         // Un clic sobre la nota la elige y habilita sus acciones.
         viewer.select_annotation(Some(note_id.clone()));
         assert_eq!(
-            viewer.annot.selected.borrow().clone(),
-            Some(note_id.clone()),
+            viewer.selected_ids(),
+            vec![note_id.clone()],
             "el clic sobre una nota la selecciona"
         );
         let delete_action = viewer
@@ -1329,10 +1330,10 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
 
         // Borrar: `Supr` y el menú llaman a esto mismo. Deshacer la recupera y
         // rehacer la vuelve a borrar.
-        assert!(viewer.delete_selected_annotation(), "se borra la nota elegida");
+        assert!(viewer.delete_selected_annotations(), "se borra la nota elegida");
         assert_eq!(viewer.annot.edits.borrow().len(), 6);
         assert!(
-            viewer.annot.selected.borrow().is_none(),
+            viewer.selected_ids().is_empty(),
             "borrar la nota la deselecciona"
         );
         assert!(viewer.undo(), "el borrado se deshace");
@@ -1511,7 +1512,7 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             gtk::glib::Propagation::Stop,
             "Esc deselecciona la nota"
         );
-        assert!(viewer.annot.selected.borrow().is_none());
+        assert!(viewer.selected_ids().is_empty());
 
         // Clicar la página suelta el foco de los campos: con el buscador
         // enfocado, Supr editaría el campo y nunca llegaría a la nota.
@@ -1770,8 +1771,8 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             other => panic!("la anotación tiene que ser una imagen: {other:?}"),
         };
         assert_eq!(
-            viewer.annot.selected.borrow().clone(),
-            Some(image_id.clone()),
+            viewer.selected_ids(),
+            vec![image_id.clone()],
             "la imagen recién insertada queda elegida, con sus asas"
         );
         assert_eq!(
@@ -1933,7 +1934,7 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         }
 
         assert!(
-            viewer.delete_selected_annotation(),
+            viewer.delete_selected_annotations(),
             "Supr borra la imagen elegida"
         );
         assert!(
@@ -1988,8 +1989,8 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         );
         let dropped_id = edit_id(&viewer, before);
         assert_eq!(
-            viewer.annot.selected.borrow().clone(),
-            Some(dropped_id),
+            viewer.selected_ids(),
+            vec![dropped_id],
             "la imagen soltada queda elegida, con sus asas"
         );
         let dropped = image_value(&viewer, before);
@@ -2155,7 +2156,7 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         // resto de la prueba siga con las cuatro anotaciones del archivo.
         viewer.select_annotation(Some("mlnpdf-reabrir-imagen".to_string()));
         assert!(
-            viewer.delete_selected_annotation(),
+            viewer.delete_selected_annotations(),
             "la imagen que volvió del archivo se puede borrar"
         );
         let after_delete = annotation_pixels(&viewer, 0, reopen_side, reopen_side);
@@ -2579,7 +2580,7 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         viewer.select_annotation(Some(ink_id.clone()));
         let total = viewer.annot.edits.borrow().len();
         assert!(
-            viewer.delete_selected_annotation(),
+            viewer.delete_selected_annotations(),
             "Supr borra el trazo elegido"
         );
         assert_eq!(viewer.annot.edits.borrow().len(), total - 1);
@@ -2719,8 +2720,8 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             "colocar la nota desarma la herramienta"
         );
         assert_eq!(
-            viewer.annot.selected.borrow().as_deref(),
-            Some(sticky_id.as_str()),
+            viewer.selected_ids(),
+            vec![sticky_id.clone()],
             "la nota nueva queda elegida"
         );
         let fresh = viewer.sticky(&sticky_id).expect("la nota está en la lista");
@@ -2801,7 +2802,7 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         // con su hilo, y deshacer la devuelve completa.
         viewer.select_annotation(Some(sticky_id.clone()));
         assert!(
-            viewer.delete_selected_annotation(),
+            viewer.delete_selected_annotations(),
             "Supr borra la nota elegida"
         );
         assert!(
@@ -2904,8 +2905,8 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             "el marco conserva el tamaño por omisión"
         );
         assert_eq!(
-            viewer.annot.selected.borrow().clone(),
-            Some(stamp_id.clone()),
+            viewer.selected_ids(),
+            vec![stamp_id.clone()],
             "el sello queda elegido, con su contorno"
         );
         assert!(
@@ -2986,7 +2987,7 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
         // deshacer lo recupera con su tipo y su caja.
         viewer.select_annotation(Some(stamp_id.clone()));
         assert!(
-            viewer.delete_selected_annotation(),
+            viewer.delete_selected_annotations(),
             "Supr borra el sello elegido"
         );
         assert!(
@@ -3053,10 +3054,246 @@ trailer\n<< /Root 1 0 R /Size 7 >>\n%%EOF\n";
             "el documento de la prueba sigue sin anotaciones"
         );
         assert!(
-            viewer.annot.selected.borrow().is_none(),
+            viewer.selected_ids().is_empty(),
             "no queda ningún sello elegido"
         );
         assert!(!viewer.has_pending_marks());
+
+        // S1: selección múltiple con `Ctrl`. Sobre el documento de la prueba se
+        // juntan tres anotaciones de tipos distintos (un subrayado, una forma y
+        // un sello): se eligen con `Ctrl`, cada una dibuja su contorno y `Supr`
+        // las borra de una vez, con una sola instantánea de deshacer.
+        viewer.open(&two_path).expect("volver al documento de la prueba");
+        viewer.apply_zoom(1.0);
+        assert!(
+            viewer.annot.edits.borrow().is_empty(),
+            "la selección múltiple arranca sin anotaciones"
+        );
+
+        // La página de la prueba no tiene texto, así que el subrayado entra como
+        // anotación ya construida: la selección no depende de cómo se creó cada
+        // tipo, y los otros dos sí se crean con las herramientas.
+        let multi_mark = "mlnpdf-multiseleccion-subrayado".to_string();
+        viewer.annot.edits.borrow_mut().push(Edit {
+            id: multi_mark.clone(),
+            value: Annotation::Mark(TextMark::underline(
+                0,
+                vec![(20.0, 20.0, 120.0, 40.0)],
+                (0.93, 0.67, 0.0),
+            )),
+        });
+
+        viewer.start_stroke_tool(StrokeKind::Shape(ShapeKind::Rectangle));
+        assert!(
+            viewer.stroke_drag_begin(0, 30.0, 60.0),
+            "la forma del conjunto empieza en el arrastre"
+        );
+        assert!(
+            viewer.stroke_drag_update(0, 120.0, 40.0),
+            "la forma crece con el arrastre"
+        );
+        assert!(viewer.stroke_drag_end(), "el arrastre cierra la forma");
+        viewer.escape_pressed();
+        let multi_shape = edit_id(&viewer, 1);
+
+        let multi_stamp = viewer
+            .insert_stamp(StampKind::Approved)
+            .expect("el sello del conjunto entra en la página");
+        assert_eq!(
+            viewer.annot.edits.borrow().len(),
+            3,
+            "el conjunto son tres anotaciones nuevas"
+        );
+        assert_eq!(
+            viewer.selected_ids(),
+            vec![multi_stamp.clone()],
+            "la última insertada queda elegida"
+        );
+
+        // Un clic sin `Ctrl` reemplaza la selección; `Ctrl` + clic suma y saca.
+        viewer.select_annotation(Some(multi_mark.clone()));
+        viewer.toggle_annotation_selection(&multi_shape);
+        viewer.toggle_annotation_selection(&multi_stamp);
+        assert_eq!(
+            viewer.selected_ids(),
+            vec![
+                multi_mark.clone(),
+                multi_shape.clone(),
+                multi_stamp.clone()
+            ],
+            "las tres quedan elegidas en orden de elección"
+        );
+        assert_eq!(
+            viewer.primary_selection().as_deref(),
+            Some(multi_stamp.as_str()),
+            "la última elegida es la principal"
+        );
+        viewer.toggle_annotation_selection(&multi_shape);
+        assert_eq!(
+            viewer.selected_ids(),
+            vec![multi_mark.clone(), multi_stamp.clone()],
+            "Ctrl + clic sobre una elegida la saca"
+        );
+        assert_eq!(
+            viewer.primary_selection().as_deref(),
+            Some(multi_stamp.as_str()),
+            "al sacar una, la principal es la última que queda"
+        );
+        viewer.toggle_annotation_selection(&multi_shape);
+        assert_eq!(
+            viewer.primary_selection().as_deref(),
+            Some(multi_shape.as_str()),
+            "volver a elegirla la hace principal"
+        );
+
+        // El contorno se dibuja para todas las elegidas, no solo para la última:
+        // se rasteriza la capa con una sola elegida para saber dónde cae cada
+        // contorno y después se comprueba que con las tres aparece en las tres.
+        // El documento de la prueba no tiene ninguna anotación azul, así que el
+        // azul de la capa es siempre un contorno punteado.
+        let multi_side = 200usize;
+        let is_outline = |[red, green, blue]: [u8; 3]| {
+            blue > 60
+                && blue > red.saturating_add(25)
+                && blue > green.saturating_add(25)
+        };
+        let page_of = |id: &str| {
+            viewer
+                .annot
+                .edits
+                .borrow()
+                .iter()
+                .find(|edit| edit.id == id)
+                .map(|edit| edit.value.page())
+                .expect("la anotación elegida sigue en la lista")
+        };
+        let outlines_on = |page: usize| {
+            let pixels = annotation_pixels(&viewer, page, multi_side, multi_side);
+            (pixels.iter().filter(|pixel| is_outline(**pixel)).count(), pixels)
+        };
+        let single: Vec<(usize, usize, Option<(usize, usize, usize, usize)>)> =
+            [&multi_mark, &multi_shape, &multi_stamp]
+                .iter()
+                .map(|id| {
+                    viewer.select_annotation(Some((*id).clone()));
+                    let page = page_of(id);
+                    let (count, pixels) = outlines_on(page);
+                    (
+                        page,
+                        count,
+                        pixel_box(multi_side, &pixels, |pixel| is_outline(pixel)),
+                    )
+                })
+                .collect();
+
+        viewer.select_annotation(Some(multi_mark.clone()));
+        viewer.toggle_annotation_selection(&multi_shape);
+        viewer.toggle_annotation_selection(&multi_stamp);
+        for (name, (page, _, single_box)) in [
+            ("el subrayado", single[0]),
+            ("la forma", single[1]),
+            ("el sello", single[2]),
+        ] {
+            let (x0, y0, x1, y1) =
+                single_box.unwrap_or_else(|| panic!("{name} dibuja su contorno si está elegida"));
+            let (_, painted) = outlines_on(page);
+            assert!(
+                (y0..=y1).any(|row| (x0..=x1)
+                    .any(|column| is_outline(painted[row * multi_side + column]))),
+                "{name} dibuja su contorno punteado con las tres elegidas"
+            );
+        }
+        // En la primera página hay dos de las tres: con las dos elegidas se ven
+        // los dos contornos, no solo el de la última.
+        let first_page = page_of(&multi_mark);
+        let (both_outlines, _) = outlines_on(first_page);
+        let one_outline = single
+            .iter()
+            .filter(|(page, _, _)| *page == first_page)
+            .map(|(_, count, _)| *count)
+            .max()
+            .unwrap_or(0);
+        assert!(
+            both_outlines > one_outline,
+            "con las elegidas de una página se dibujan todos sus contornos: \
+             {both_outlines} > {one_outline}"
+        );
+
+        // `Supr` borra las tres con una sola pulsación y un solo `undo` las
+        // devuelve, en una única instantánea.
+        assert!(
+            viewer.delete_selected_annotations(),
+            "Supr borra las tres anotaciones elegidas de una vez"
+        );
+        assert!(
+            viewer.annot.edits.borrow().is_empty(),
+            "se van las tres del conjunto"
+        );
+        for id in [&multi_mark, &multi_shape, &multi_stamp] {
+            assert!(
+                !viewer
+                    .annot
+                    .edits
+                    .borrow()
+                    .iter()
+                    .any(|edit| edit.id == *id),
+                "la anotación {id} se va de la lista"
+            );
+        }
+        assert!(
+            viewer.selected_ids().is_empty(),
+            "borrar el conjunto suelta la selección"
+        );
+        assert!(
+            viewer.undo(),
+            "un solo deshacer devuelve el conjunto borrado"
+        );
+        assert_eq!(
+            viewer.annot.edits.borrow().len(),
+            3,
+            "el conjunto vuelve entero"
+        );
+        for id in [&multi_mark, &multi_shape, &multi_stamp] {
+            assert!(
+                viewer
+                    .annot
+                    .edits
+                    .borrow()
+                    .iter()
+                    .any(|edit| edit.id == *id),
+                "deshacer repone la anotación {id}"
+            );
+        }
+
+        // El botón «Eliminar» del menú contextual también actúa sobre el conjunto.
+        viewer.select_annotation(Some(multi_mark.clone()));
+        viewer.toggle_annotation_selection(&multi_shape);
+        viewer.toggle_annotation_selection(&multi_stamp);
+        let set_anchor = viewer.doc.slots.borrow()[0].canvas.clone();
+        let set_menu = viewer.open_annotation_menu(multi_stamp.clone(), &set_anchor, 20.0, 20.0);
+        let delete_set = labeled_button(set_menu.upcast_ref::<gtk::Widget>(), "Eliminar")
+            .expect("el menú del sello ofrece Eliminar");
+        delete_set.emit_by_name::<()>("clicked", &[]);
+        assert!(
+            viewer.annot.edits.borrow().is_empty(),
+            "Eliminar del menú borra las tres elegidas"
+        );
+        assert!(
+            viewer.selected_ids().is_empty(),
+            "el borrado por el menú suelta la selección"
+        );
+        assert!(
+            viewer.undo(),
+            "el borrado por el menú también se deshace de una vez"
+        );
+        assert_eq!(viewer.annot.edits.borrow().len(), 3);
+
+        // El conjunto de prueba no queda pendiente: se descarta y el documento
+        // de la prueba vuelve a estar sin anotaciones.
+        viewer.discard_edits();
+        assert!(viewer.annot.edits.borrow().is_empty());
+        assert!(!viewer.has_pending_marks());
+        assert!(viewer.selected_ids().is_empty());
 
         // Pulsar la herramienta abre el selector de color del sistema. Es la
         // única parte del flujo que no se puede probar sin un clic real, así que

@@ -399,8 +399,10 @@ pub(crate) struct AnnotationState {
     /// Copia exacta de lo que el archivo tiene escrito, en el mismo orden. Es la
     /// referencia para decidir qué está pendiente y qué hay que reemplazar.
     pub(crate)     persisted: RefCell<Vec<Edit>>,
-    /// Identificador de la anotación elegida: la que responde a `Supr` y al menú.
-    pub(crate)     selected: RefCell<Option<String>>,
+    /// Identificadores de las anotaciones elegidas, en orden de elección. La
+    /// última es la principal: la que responde a «Editar texto», al diálogo de la
+    /// nota adhesiva y al arrastre; todas responden a `Supr` y al menú.
+    pub(crate)     selected: RefCell<Vec<String>>,
     /// Instantáneas anteriores a cada cambio, de la más vieja a la más nueva.
     pub(crate)     undo_stack: RefCell<Vec<Vec<Edit>>>,
     pub(crate)     redo_stack: RefCell<Vec<Vec<Edit>>>,
@@ -820,7 +822,7 @@ impl Viewer {
             annot: AnnotationState {
                 edits: RefCell::new(Vec::new()),
                 persisted: RefCell::new(Vec::new()),
-                selected: RefCell::new(None),
+                selected: RefCell::new(Vec::new()),
                 undo_stack: RefCell::new(Vec::new()),
                 redo_stack: RefCell::new(Vec::new()),
                 next_id: Cell::new(0),
@@ -1330,7 +1332,7 @@ impl Viewer {
         });
         Self::install_action(viewer, "note-edit", |viewer| viewer.prompt_note_edit());
         Self::install_action(viewer, "note-delete", |viewer| {
-            viewer.delete_selected_annotation();
+            viewer.delete_selected_annotations();
         });
         Self::install_action(viewer, "save-annotations", |viewer| viewer.save_annotations());
         Self::install_action(viewer, "save-annotations-as", |viewer| {
@@ -2684,10 +2686,19 @@ impl Viewer {
             return false;
         }
         self.annot.edits.borrow_mut().retain(|edit| edit.id != id);
-        if self.annot.selected.borrow().as_deref() == Some(id) {
-            self.select_annotation(None);
+        if self
+            .annot
+            .selected
+            .borrow()
+            .iter()
+            .any(|selected| selected == id)
+        {
+            self.annot
+                .selected
+                .borrow_mut()
+                .retain(|selected| selected != id);
+            self.refresh_edit_actions();
         }
-        self.refresh_edit_actions();
         self.queue_page_draw(sticky.page);
         true
     }
@@ -2944,7 +2955,7 @@ impl Viewer {
     /// Diálogo para cambiar el texto, la fuente y el color de la nota elegida,
     /// con lo que ya tiene precargado. `Cancelar` no cambia nada.
     pub(crate) fn prompt_note_edit(self: &Rc<Self>) {
-        let Some(id) = self.annot.selected.borrow().clone() else {
+        let Some(id) = self.primary_selection() else {
             return;
         };
         if let Some(note) = self.note(&id) {
@@ -2960,7 +2971,7 @@ impl Viewer {
     /// Diálogo del hilo de la nota adhesiva elegida, con lo que ya tiene
     /// precargado. Lo usa el doble clic, el menú contextual y la acción de editar.
     pub(crate) fn prompt_sticky_note_edit(self: &Rc<Self>) {
-        let Some(id) = self.annot.selected.borrow().clone() else {
+        let Some(id) = self.primary_selection() else {
             return;
         };
         let Some(sticky) = self.sticky(&id) else {
@@ -3645,11 +3656,13 @@ impl Viewer {
     pub(crate) fn discard_edits(&self) {
         let persisted = self.annot.persisted.borrow().clone();
         let pages = changed_pages(&self.annot.edits.borrow(), &persisted);
+        // La selección se suelta antes de tirar los cambios: así el contorno que
+        // ya no corresponde también se redibuja.
+        self.clear_selection();
         *self.annot.edits.borrow_mut() = persisted;
         self.annot.undo_stack.borrow_mut().clear();
         self.annot.redo_stack.borrow_mut().clear();
         self.annot.image_surfaces.borrow_mut().clear();
-        *self.annot.selected.borrow_mut() = None;
         self.refresh_edit_actions();
         for page in pages {
             self.queue_page_draw(page);
@@ -3713,15 +3726,22 @@ impl Viewer {
         }
     }
 
-    /// Suelta la selección cuando la anotación elegida ya no existe.
+    /// Suelta las anotaciones elegidas que ya no existen, conservando el orden
+    /// del resto.
     fn keep_visible_selection(&self) {
-        let Some(selected) = self.annot.selected.borrow().clone() else {
-            return;
+        let selected = self.selected_ids();
+        let alive: Vec<String> = {
+            let edits = self.annot.edits.borrow();
+            selected
+                .iter()
+                .filter(|id| edits.iter().any(|edit| edit.id == **id))
+                .cloned()
+                .collect()
         };
-        if self.annot.edits.borrow().iter().any(|edit| edit.id == selected) {
+        if alive.len() == selected.len() {
             return;
         }
-        *self.annot.selected.borrow_mut() = None;
+        *self.annot.selected.borrow_mut() = alive;
         self.refresh_edit_actions();
     }
 
@@ -3749,7 +3769,7 @@ impl Viewer {
         self.annot.stroke_tool.borrow_mut().take();
         self.annot.sticky_tool.set(false);
         self.annot.hover.borrow_mut().take();
-        *self.annot.selected.borrow_mut() = None;
+        self.annot.selected.borrow_mut().clear();
         self.set_text_tool(false);
         self.set_mark_mode(MarkKind::Underline, false);
         self.set_mark_mode(MarkKind::Highlight, false);
@@ -3904,22 +3924,73 @@ impl Viewer {
             })
     }
 
-    /// Elige una anotación (o ninguna) y redibuja las páginas que cambian. Sólo
-    /// una puede estar elegida: es la que responde a `Supr` y al menú.
+    /// Reemplaza la selección por `id` (o por ninguna) y redibuja las páginas
+    /// que cambian. Es lo que hace un clic sin modificadores: sólo esa queda
+    /// elegida.
     pub(crate) fn select_annotation(&self, id: Option<String>) {
-        let previous = self.annot.selected.borrow().clone();
-        if previous == id {
+        let previous = self.selected_ids();
+        let next: Vec<String> = id.into_iter().collect();
+        if previous == next {
             return;
         }
-        let pages = [
-            self.edit_page(previous.as_deref()),
-            self.edit_page(id.as_deref()),
-        ];
-        *self.annot.selected.borrow_mut() = id;
+        let mut pages = self.selection_pages(&previous);
+        pages.extend(self.selection_pages(&next));
+        pages.sort_unstable();
+        pages.dedup();
+        *self.annot.selected.borrow_mut() = next;
         self.refresh_edit_actions();
-        for page in pages.into_iter().flatten() {
+        for page in pages {
             self.queue_page_draw(page);
         }
+    }
+
+    /// Agrega la anotación `id` a la selección si no estaba y la saca si estaba:
+    /// es lo que hace `Ctrl` + clic. La que se agrega pasa a ser la principal.
+    pub(crate) fn toggle_annotation_selection(&self, id: &str) {
+        // Una anotación que ya no está no puede entrar a la selección.
+        let Some(page) = self.edit_page(Some(id)) else {
+            return;
+        };
+        {
+            let mut selected = self.annot.selected.borrow_mut();
+            if let Some(position) = selected.iter().position(|current| current == id) {
+                selected.remove(position);
+            } else {
+                selected.push(id.to_string());
+            }
+        }
+        self.refresh_edit_actions();
+        self.queue_page_draw(page);
+    }
+
+    /// Identificadores de las anotaciones elegidas, en orden de elección.
+    pub(crate) fn selected_ids(&self) -> Vec<String> {
+        self.annot.selected.borrow().clone()
+    }
+
+    /// La anotación principal: la última elegida. Es la que responde a «Editar
+    /// texto», al diálogo de la nota adhesiva y al arrastre.
+    pub(crate) fn primary_selection(&self) -> Option<String> {
+        self.annot.selected.borrow().last().cloned()
+    }
+
+    /// Suelta toda la selección y redibuja lo que hacía falta.
+    pub(crate) fn clear_selection(&self) {
+        self.select_annotation(None);
+    }
+
+    /// Páginas de las anotaciones `ids`, sin repetir: son las que hay que
+    /// redibujar cuando cambia la selección.
+    fn selection_pages(&self, ids: &[String]) -> Vec<usize> {
+        let edits = self.annot.edits.borrow();
+        ids.iter()
+            .filter_map(|id| {
+                edits
+                    .iter()
+                    .find(|edit| edit.id == *id)
+                    .map(|edit| edit.value.page())
+            })
+            .collect()
     }
 
     /// Página de la anotación `id`, si todavía está.
@@ -3933,16 +4004,18 @@ impl Viewer {
             .map(|edit| edit.value.page())
     }
 
-    /// Habilita las acciones de la anotación elegida: editar solo si es una nota
-    /// de texto o una nota adhesiva, borrar siempre que haya algo elegido.
+    /// Habilita las acciones de la anotación elegida: editar solo cuando la
+    /// principal es una nota de texto o una nota adhesiva, borrar siempre que
+    /// haya al menos una elegida.
     fn refresh_edit_actions(&self) {
-        let selected = self.annot.selected.borrow().clone();
-        let is_note = selected.as_ref().is_some_and(|id| {
+        let primary = self.primary_selection();
+        let is_note = primary.as_ref().is_some_and(|id| {
             self.annot.edits.borrow().iter().any(|edit| {
                 edit.id == *id && matches!(edit.value, Annotation::Note(_) | Annotation::Sticky(_))
             })
         });
-        for (name, enabled) in [("note-edit", is_note), ("note-delete", selected.is_some())] {
+        let has_selection = !self.annot.selected.borrow().is_empty();
+        for (name, enabled) in [("note-edit", is_note), ("note-delete", has_selection)] {
             let action = self
                 .ui
                 .window
@@ -3954,24 +4027,42 @@ impl Viewer {
         }
     }
 
-    /// Borra la anotación elegida, sea una nota o un marcado. La instantánea va
-    /// antes de tocar la lista: el borrado se deshace como cualquier otro cambio.
-    pub(crate) fn delete_selected_annotation(&self) -> bool {
-        let Some(id) = self.annot.selected.borrow().clone() else {
-            return false;
+    /// Borra todas las anotaciones elegidas, del tipo que sean. La instantánea va
+    /// antes de tocar la lista y es una sola: el borrado del conjunto se deshace
+    /// de una vez, como cualquier otro cambio, y se anuncia en plural cuando son
+    /// varias.
+    pub(crate) fn delete_selected_annotations(&self) -> bool {
+        let selected = self.selected_ids();
+        let existing: Vec<String> = {
+            let edits = self.annot.edits.borrow();
+            selected
+                .iter()
+                .filter(|id| edits.iter().any(|edit| edit.id == **id))
+                .cloned()
+                .collect()
         };
-        let Some(page) = self.edit_page(Some(&id)) else {
-            self.select_annotation(None);
+        if existing.is_empty() {
+            if !selected.is_empty() {
+                self.clear_selection();
+            }
             return false;
-        };
+        }
+        let pages = self.selection_pages(&existing);
         self.begin_edit();
-        self.annot.edits.borrow_mut().retain(|edit| edit.id != id);
-        *self.annot.selected.borrow_mut() = None;
+        self.annot
+            .edits
+            .borrow_mut()
+            .retain(|edit| !existing.contains(&edit.id));
+        self.annot.selected.borrow_mut().clear();
         self.refresh_edit_actions();
-        self.queue_page_draw(page);
-        self.ui
-            .window
-            .announce("Anotación borrada", gtk::AccessibleAnnouncementPriority::Medium);
+        for page in pages {
+            self.queue_page_draw(page);
+        }
+        self.announce_change(if existing.len() == 1 {
+            "Anotación borrada"
+        } else {
+            "Anotaciones borradas"
+        });
         true
     }
 
@@ -4149,11 +4240,11 @@ impl Viewer {
             return false;
         };
         let tolerance = IMAGE_HANDLE_SIZE / zoom;
-        // Las asas de la imagen elegida van primero: son el tirador que se ve.
-        let handle = self.annot.selected.borrow().as_deref().and_then(|id| {
-            let image = self.image(id).filter(|image| image.page == page)?;
+        // Las asas de la imagen principal van primero: son el tirador que se ve.
+        let handle = self.primary_selection().and_then(|id| {
+            let image = self.image(&id).filter(|image| image.page == page)?;
             let corner = image.corner_at(point, tolerance)?;
-            Some((id.to_string(), corner))
+            Some((id, corner))
         });
         let (id, corner) = match handle {
             Some((id, corner)) => (id, Some(corner)),
@@ -4445,8 +4536,7 @@ impl Viewer {
         }
         let point = self.view_to_pdf(page, x, y)?;
         let tolerance = IMAGE_HANDLE_SIZE / zoom;
-        let selected = self.annot.selected.borrow().clone();
-        let id = selected?;
+        let id = self.primary_selection()?;
         let image = self.image(&id).filter(|image| image.page == page)?;
         let corner = image.corner_at(point, tolerance)?;
         Some((id, resize_cursor(corner, self.view.rotation.get())))
@@ -4569,7 +4659,7 @@ impl Viewer {
                     popover.popdown();
                 }
                 if let Some(viewer) = weak.upgrade() {
-                    viewer.delete_selected_annotation();
+                    viewer.delete_selected_annotations();
                 }
             });
         }
@@ -4593,9 +4683,9 @@ impl Viewer {
         gtk::prelude::GtkWindowExt::set_focus(&self.ui.window, None::<&gtk::Widget>);
     }
 
-    /// `Supr` y `Retroceso` borran la nota elegida. El controlador va en fase de
-    /// burbuja y no hace nada cuando el foco está en un campo de texto: ahí esas
-    /// teclas borran caracteres.
+    /// `Supr` y `Retroceso` borran las anotaciones elegidas. El controlador va en
+    /// fase de burbuja y no hace nada cuando el foco está en un campo de texto:
+    /// ahí esas teclas borran caracteres.
     pub(crate) fn install_annotation_keys(viewer: &Rc<Self>) {
         let keys = gtk::EventControllerKey::new();
         keys.set_propagation_phase(gtk::PropagationPhase::Bubble);
@@ -4607,7 +4697,7 @@ impl Viewer {
             let Some(viewer) = weak.upgrade() else {
                 return glib::Propagation::Proceed;
             };
-            if viewer.text_input_focused() || !viewer.delete_selected_annotation() {
+            if viewer.text_input_focused() || !viewer.delete_selected_annotations() {
                 return glib::Propagation::Proceed;
             }
             glib::Propagation::Stop
@@ -4661,18 +4751,17 @@ impl Viewer {
 
         let zoom = self.view.zoom.get();
         let rotation = self.view.rotation.get();
-        let selected = self.annot.selected.borrow().clone();
+        let selected = self.selected_ids();
 
         for edit in edits.iter().filter(|edit| edit.value.page() == page) {
+            let chosen = selected.iter().any(|id| *id == edit.id);
             let mark = match &edit.value {
                 Annotation::Mark(mark) => mark,
                 Annotation::Note(note) => {
-                    let chosen = selected.as_deref() == Some(edit.id.as_str());
                     draw_note(context, note, size, rotation, zoom, chosen);
                     continue;
                 }
                 Annotation::Image(image) => {
-                    let chosen = selected.as_deref() == Some(edit.id.as_str());
                     self.draw_image(context, image, size, rotation, zoom, chosen);
                     continue;
                 }
@@ -4685,12 +4774,10 @@ impl Viewer {
                     continue;
                 }
                 Annotation::Sticky(sticky) => {
-                    let chosen = selected.as_deref() == Some(edit.id.as_str());
                     draw_sticky(context, sticky, size, rotation, zoom, chosen);
                     continue;
                 }
                 Annotation::Stamp(stamp) => {
-                    let chosen = selected.as_deref() == Some(edit.id.as_str());
                     draw_stamp(context, stamp, size, rotation, zoom, chosen);
                     continue;
                 }
@@ -4762,10 +4849,13 @@ impl Viewer {
             }
         }
 
-        // El contorno de la anotación elegida va al final, sobre todo lo demás.
-        if let Some(id) = selected.as_deref()
-            && let Some(edit) = edits.iter().find(|edit| edit.id == id)
-        {
+        // El contorno de cada anotación elegida va al final, sobre todo lo demás:
+        // las notas, las imágenes, las notas adhesivas y los sellos lo dibujan
+        // con su propia forma y acá quedan los marcados, los trazos y las formas.
+        for id in &selected {
+            let Some(edit) = edits.iter().find(|edit| edit.id == *id) else {
+                continue;
+            };
             match &edit.value {
                 Annotation::Mark(mark) if mark.page == page => {
                     draw_mark_selection(context, mark, size, rotation, zoom);
@@ -4894,8 +4984,8 @@ impl Viewer {
             self.set_hand_mode(false);
             return glib::Propagation::Stop;
         }
-        if self.annot.selected.borrow().is_some() {
-            self.select_annotation(None);
+        if !self.annot.selected.borrow().is_empty() {
+            self.clear_selection();
             return glib::Propagation::Stop;
         }
         glib::Propagation::Proceed
@@ -5688,19 +5778,32 @@ impl Viewer {
                 .or_else(|| viewer.image_at(page, x, y).map(|id| (id, HitKind::Image)))
                 .or_else(|| viewer.mark_at(page, x, y).map(|id| (id, HitKind::Mark)))
                 .or_else(|| viewer.stroke_at(page, x, y).map(|id| (id, HitKind::Stroke)));
+            // `Ctrl` suma o saca de la selección en vez de reemplazarla.
+            let with_ctrl = gesture
+                .current_event_state()
+                .contains(gdk::ModifierType::CONTROL_MASK);
             match (gesture.current_button(), hit) {
                 (gdk::BUTTON_SECONDARY, Some((id, _))) => {
                     viewer.release_text_focus();
-                    viewer.select_annotation(Some(id.clone()));
+                    // El clic derecho agarra la anotación: si no estaba elegida,
+                    // la selección pasa a ser esa sola, para que «Eliminar»
+                    // borre justo lo que se está viendo.
+                    if !viewer.selected_ids().iter().any(|selected| *selected == id) {
+                        viewer.select_annotation(Some(id.clone()));
+                    }
                     viewer.open_annotation_menu(id, &canvas_for_menu, x, y);
                     gesture.set_state(gtk::EventSequenceState::Claimed);
                 }
                 (gdk::BUTTON_PRIMARY, Some((id, kind))) => {
                     viewer.release_text_focus();
-                    viewer.select_annotation(Some(id));
+                    if with_ctrl {
+                        viewer.toggle_annotation_selection(&id);
+                    } else {
+                        viewer.select_annotation(Some(id));
+                    }
                     // El doble clic abre el editor solo para una nota y fuera de
                     // las herramientas de marcado, donde el clic arma un marcado.
-                    if presses >= 2 && viewer.active_mark_tool().is_none() {
+                    if presses >= 2 && !with_ctrl && viewer.active_mark_tool().is_none() {
                         match kind {
                             HitKind::Note => viewer.prompt_note_edit(),
                             HitKind::Sticky => viewer.prompt_sticky_note_edit(),
@@ -5710,7 +5813,11 @@ impl Viewer {
                 }
                 (gdk::BUTTON_PRIMARY, None) => {
                     viewer.release_text_focus();
-                    viewer.select_annotation(None);
+                    // Sin `Ctrl` el clic en vacío suelta todo; con `Ctrl` deja
+                    // la selección como está.
+                    if !with_ctrl {
+                        viewer.clear_selection();
+                    }
                 }
                 _ => {}
             }
@@ -5760,10 +5867,11 @@ impl Viewer {
         if self.input.hand_mode.get() {
             return;
         }
-        // Arrastrar para seleccionar texto (o para crear un marcado) suelta la
-        // anotación elegida: el clic simple la elige, el arrastre ya es otra cosa.
-        if self.annot.selected.borrow().is_some() {
-            self.select_annotation(None);
+        // Arrastrar para seleccionar texto (o para crear un marcado) suelta las
+        // anotaciones elegidas: el clic simple las elige, el arrastre ya es otra
+        // cosa.
+        if !self.annot.selected.borrow().is_empty() {
+            self.clear_selection();
         }
         let Some((start_x, start_y)) = self.sel.selection_start.get() else {
             return;
