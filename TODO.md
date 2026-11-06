@@ -292,3 +292,6 @@ necesita una decisión o una dependencia nueva.
   `CenterBox` por un `Box` con espaciadores expansibles.
 - Convención de commits cuando se versione: la rama por feature, commits pequeños
   con tests y docs junto al comportamiento.
+
+
+test
